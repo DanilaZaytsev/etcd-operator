@@ -123,7 +123,16 @@ ETCD_UPSTREAM=quay.io/coreos/etcd:v3.6.11
 OPERATOR_DEFAULT_MIRROR=registry.internal/mirror/etcd
 echo "--- side-loading the mirrored etcd image for the air-gap repository test"
 docker pull "$ETCD_UPSTREAM"
-docker tag "$ETCD_UPSTREAM" "$OPERATOR_DEFAULT_MIRROR:v3.6.11"
+# Re-tag by rebuilding, not by `docker tag`. `kind load docker-image` shells out
+# to `ctr images import --all-platforms`, which wants a blob for every platform
+# in the image's manifest list; a `docker tag` keeps that list, but a daemon
+# backed by the containerd image store only holds the host's own platform. The
+# import then dies with "content digest <other-platform> not found" and the
+# air-gap test never gets its image. A one-line FROM build resolves the list to
+# a single-platform image, so nothing is referenced that the host does not have.
+docker build -q -t "$OPERATOR_DEFAULT_MIRROR:v3.6.11" - <<EOF
+FROM $ETCD_UPSTREAM
+EOF
 kind load docker-image "$OPERATOR_DEFAULT_MIRROR:v3.6.11" --name "$KIND_CLUSTER_NAME"
 
 # Helm install: CRDs are templated into the release and image == OPERATOR_IMAGE
@@ -132,7 +141,12 @@ kind load docker-image "$OPERATOR_DEFAULT_MIRROR:v3.6.11" --name "$KIND_CLUSTER_
 # what exercises the chart-value -> ETCD_IMAGE_REPOSITORY env -> flag ->
 # resolveEtcdImage -> member Pod chain (the value differs from the built-in
 # EtcdImage constant, so a typo anywhere in that chain is caught).
-make deploy IMG="$IMG" HELM_EXTRA_ARGS="--set etcdImage.repository=$OPERATOR_DEFAULT_MIRROR"
+# maxConcurrentReconciles>1 for two reasons. It lets the suite's tests run in
+# parallel instead of queueing behind a single worker, and it means e2e
+# exercises the concurrent reconcile path at all — the chart default of 1 is
+# for single-cluster installs, while a multi-tenant parent runs many workers,
+# so shipping only single-worker coverage tested the shape nobody deploys.
+make deploy IMG="$IMG" HELM_EXTRA_ARGS="--set etcdImage.repository=$OPERATOR_DEFAULT_MIRROR --set manager.maxConcurrentReconciles=4"
 # Select by the chart's control-plane label rather than a fixed Deployment name.
 kubectl -n etcd-operator-system wait deploy \
     -l control-plane=controller-manager \

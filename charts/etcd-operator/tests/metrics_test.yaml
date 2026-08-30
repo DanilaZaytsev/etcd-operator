@@ -1,0 +1,135 @@
+suite: Metrics are reachable in both modes
+
+# kubeRbacProxy.enabled=false used to mean "no metrics at all": the manager
+# bound :8080, but the Service was gated on the proxy and no container port was
+# declared, so nothing could scrape it and the ServiceMonitor hard-failed. "No
+# proxy" has to mean plaintext metrics, not absent metrics — otherwise the only
+# supported way to see the operator's own metrics is to run a sidecar whose
+# upstream project is archived.
+
+templates:
+  - metrics-service.yaml
+  - servicemonitor.yaml
+  - deployment.yaml
+
+tests:
+  - it: exposes the proxy's https port by default
+    template: metrics-service.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: spec.ports[0].name
+          value: https
+      - equal:
+          path: spec.ports[0].targetPort
+          value: https
+
+  - it: still exposes a metrics Service with the proxy disabled
+    template: metrics-service.yaml
+    set:
+      kubeRbacProxy.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: spec.ports[0].name
+          value: metrics
+      - equal:
+          path: spec.ports[0].targetPort
+          value: metrics
+
+  # The Service targets the port by name, so the manager has to declare it —
+  # otherwise the Service resolves to nothing and the scrape silently fails.
+  - it: declares the manager's metrics port when there is no proxy
+    template: deployment.yaml
+    set:
+      kubeRbacProxy.enabled: false
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].ports[0].name
+          value: metrics
+      - equal:
+          path: spec.template.spec.containers[0].ports[0].containerPort
+          value: 8080
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --metrics-bind-address=:8080
+
+  - it: keeps the manager's metrics on loopback behind the proxy
+    # The whole point of the proxy is that the plaintext endpoint is not
+    # reachable from outside the Pod.
+    template: deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --metrics-bind-address=127.0.0.1:8080
+      - notExists:
+          path: spec.template.spec.containers[0].ports
+
+  - it: scrapes the proxy over https by default
+    template: servicemonitor.yaml
+    set:
+      metrics.serviceMonitor.enabled: true
+    asserts:
+      - equal:
+          path: spec.endpoints[0].scheme
+          value: https
+      - equal:
+          path: spec.endpoints[0].port
+          value: https
+      - equal:
+          path: spec.endpoints[0].bearerTokenFile
+          value: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+  - it: scrapes the manager directly when there is no proxy
+    template: servicemonitor.yaml
+    set:
+      metrics.serviceMonitor.enabled: true
+      kubeRbacProxy.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: spec.endpoints[0].scheme
+          value: http
+      - equal:
+          path: spec.endpoints[0].port
+          value: metrics
+      # No token to send over a plaintext connection.
+      - notExists:
+          path: spec.endpoints[0].bearerTokenFile
+
+  # kube-prometheus-stack selects ServiceMonitors by `release: <name>`. Without
+  # a way to add that label the object is created and silently never selected —
+  # the failure mode being that monitoring looks configured and reports nothing.
+  - it: accepts the label a Prometheus selector needs
+    template: servicemonitor.yaml
+    set:
+      metrics.serviceMonitor.enabled: true
+      metrics.serviceMonitor.additionalLabels:
+        release: kube-prometheus-stack
+    asserts:
+      - equal:
+          path: metadata.labels['release']
+          value: kube-prometheus-stack
+
+  - it: passes through scrape tuning
+    template: servicemonitor.yaml
+    set:
+      metrics.serviceMonitor.enabled: true
+      metrics.serviceMonitor.interval: 60s
+      metrics.serviceMonitor.scrapeTimeout: 10s
+    asserts:
+      - equal:
+          path: spec.endpoints[0].interval
+          value: 60s
+      - equal:
+          path: spec.endpoints[0].scrapeTimeout
+          value: 10s
+
+  - it: creates no ServiceMonitor by default
+    template: servicemonitor.yaml
+    asserts:
+      - hasDocuments:
+          count: 0

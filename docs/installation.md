@@ -1,47 +1,42 @@
-# Installation
+# Установка
 
-How to deploy the operator into a cluster. Assumes you have admin on the target cluster (the operator installs cluster-scoped CRDs and ClusterRoles) and a registry you can push to.
+Как развернуть оператора в кластере. Предполагается, что у вас есть права администратора в целевом кластере (оператор устанавливает CRD и ClusterRole уровня кластера) и реестр, в который вы можете отправлять образы.
 
-For the operator's runtime behaviour see [concepts](concepts.md); for day-2 operations see [operations](operations.md).
+О поведении оператора во время работы см. [концепции](concepts.md); о повседневной эксплуатации — [эксплуатацию](operations.md).
 
-## Prerequisites
+## Предварительные требования
 
-| Requirement | Note |
+| Требование | Примечание |
 |---|---|
-| Kubernetes | 1.29+ recommended: CEL CRD validation went GA in 1.29 and the `quantity()` CEL extension (used by two of the operator's validation rules) was added in 1.28. 1.28 *may* work in practice because the CEL gate was beta-on-by-default from 1.25, but is not covered by CI. |
-| Default `StorageClass` | Each per-member PVC uses the namespace's default `StorageClass`. Override per-cluster via `spec.storage.storageClassName` (a string naming a specific `StorageClass`, or `""` to disable dynamic provisioning entirely). Immutable post-create — Kubernetes PVCs cannot have their StorageClass swapped in place. |
-| Go (build-from-source only) | 1.25+, matches `go.mod`'s `toolchain` directive. |
-| Docker / buildx (build-from-source only) | For producing the operator image. The Dockerfile uses `golang:1.25.10` for the builder and `gcr.io/distroless/static:nonroot` for runtime. |
+| Kubernetes | Рекомендуется 1.29+: проверки CEL в CRD вышли в GA в 1.29, а расширение CEL `quantity()` (его используют два правила проверки оператора) добавлено в 1.28. На 1.28 *может* работать на практике, потому что гейт CEL был включён как бета с 1.25, но CI это не покрывает. |
+| `StorageClass` по умолчанию | PVC каждого члена берёт `StorageClass` по умолчанию для неймспейса. Переопределяется на кластер через `spec.storage.storageClassName` (строка с именем конкретного `StorageClass` либо `""`, чтобы полностью отключить динамический провижининг). Неизменяем после создания — PVC в Kubernetes не позволяют поменять StorageClass на месте. |
+| Go (только для сборки из исходников) | 1.25+, соответствует директиве `toolchain` в `go.mod`. |
+| Docker / buildx (только для сборки из исходников) | Для получения образа оператора. Dockerfile использует `golang:1.25.10` для сборки и `gcr.io/distroless/static:nonroot` для запуска. |
 
-Workload-side: every etcd Pod runs as UID 65532 with `runAsNonRoot=true`, `allowPrivilegeEscalation=false`, all capabilities dropped, and `seccompProfile=RuntimeDefault`. The Pods comply with the `restricted` PodSecurity profile. If your cluster enforces a stricter policy, see `controllers/etcdmember_controller.go`'s `buildPod` for the exact security context the operator emits and adjust accordingly.
+Со стороны нагрузки: каждый под etcd работает под UID 65532 с `runAsNonRoot=true`, `allowPrivilegeEscalation=false`, сброшенными capabilities и `seccompProfile=RuntimeDefault`. Поды соответствуют профилю PodSecurity `restricted`. Если в вашем кластере действует более строгая политика, посмотрите точный контекст безопасности, который выпускает оператор, в `buildPod` из `controllers/etcdmember_controller.go`, и скорректируйте её.
 
-## Install from a release
+## Установка из релиза
 
-Tagged releases publish a signed multi-arch operator image to GHCR and attach
-ready-to-apply install manifests to the GitHub release — no checkout, no build,
-no registry of your own. This is the recommended path for consuming a release.
+Помеченные тегом релизы публикуют подписанный мультиархитектурный образ оператора в GHCR и прикладывают к релизу на GitHub готовые к применению манифесты установки — без клонирования репозитория, без сборки, без собственного реестра. Это рекомендуемый путь.
 
 ```sh
-# Pick a released version (see https://github.com/cozystack/etcd-operator/releases).
+# Выберите выпущенную версию (см. https://github.com/cozystack/etcd-operator/releases).
 VERSION=v0.5.0
 
-# Everything (CRDs + namespace + RBAC + controller Deployment + Service):
+# Всё сразу (CRD + неймспейс + RBAC + Deployment контроллера + Service):
 kubectl apply -f https://github.com/cozystack/etcd-operator/releases/download/$VERSION/etcd-operator.yaml
 ```
 
-The manifest already points the manager (and its `OPERATOR_IMAGE`, used for
-snapshot/restore Pods) at `ghcr.io/cozystack/etcd-operator:$VERSION` — the same
-tag whose image the release published, so there is nothing to substitute.
+Манифест уже направляет менеджер (и его `OPERATOR_IMAGE`, который используется для подов снапшота и восстановления) на `ghcr.io/cozystack/etcd-operator:$VERSION` — тот самый тег, образ которого опубликовал этот релиз, так что подставлять ничего не нужно.
 
-If you split CRDs from the rest (e.g. CRDs are applied by a separate
-cluster-admin step, or server-side-applied to dodge the annotation size limit):
+Если вы разделяете CRD и остальное (например, CRD применяет отдельный шаг с правами администратора кластера или их применяют на стороне сервера, чтобы обойти ограничение на размер аннотации):
 
 ```sh
 kubectl apply --server-side -f https://github.com/cozystack/etcd-operator/releases/download/$VERSION/etcd-operator.crds.yaml
 kubectl apply             -f https://github.com/cozystack/etcd-operator/releases/download/$VERSION/etcd-operator.non-crds.yaml
 ```
 
-The image is cosign-signed (keyless). To verify before deploying:
+Образ подписан cosign (без ключа). Чтобы проверить до развёртывания:
 
 ```sh
 cosign verify ghcr.io/cozystack/etcd-operator:$VERSION \
@@ -49,22 +44,15 @@ cosign verify ghcr.io/cozystack/etcd-operator:$VERSION \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-To pull a prebuilt image without the release manifests (e.g. to feed your own
-overlay), the image ref is `ghcr.io/cozystack/etcd-operator:<tag>`.
+Чтобы взять готовый образ без манифестов релиза (например, для собственного оверлея), ссылка на образ — `ghcr.io/cozystack/etcd-operator:<tag>`.
 
-## Install with Helm
+## Установка через Helm
 
-Helm is the primary install path: the chart is the single source of truth for
-the CRDs, RBAC, and the manager Deployment (the release manifests below are just
-`helm template` of this same chart). Tagged releases publish it as an OCI Helm
-chart to GHCR (`ghcr.io/cozystack/charts/etcd-operator`), versioned from the
-same tag — the chart version is the tag without the leading `v`, and
-`appVersion` keeps the `v`. The CRDs are generated straight into the chart and
-templated into the release.
+Helm — основной путь установки: чарт является единственным источником истины для CRD, RBAC и Deployment менеджера (манифесты релиза выше — это всего лишь `helm template` того же чарта). Помеченные тегом релизы публикуют его как OCI-чарт Helm в GHCR (`ghcr.io/cozystack/charts/etcd-operator`), версионируя по тому же тегу: версия чарта — это тег без ведущего `v`, а `appVersion` сохраняет `v`. CRD генерируются прямо в чарт и рендерятся шаблонами в состав релиза.
 
 ```sh
-# Chart version == release tag without the leading 'v'
-# (see https://github.com/cozystack/etcd-operator/releases).
+# Версия чарта == тег релиза без ведущего 'v'
+# (см. https://github.com/cozystack/etcd-operator/releases).
 VERSION=0.5.0
 
 helm install etcd-operator oci://ghcr.io/cozystack/charts/etcd-operator \
@@ -72,79 +60,223 @@ helm install etcd-operator oci://ghcr.io/cozystack/charts/etcd-operator \
   --namespace etcd-operator-system --create-namespace
 ```
 
-By default the chart pulls `ghcr.io/cozystack/etcd-operator:<appVersion>` — the
-image that same release published — so a stock install has nothing to
-substitute. The chart wires that ref into **both** the manager's `image:` and
-its `OPERATOR_IMAGE` env var (the image launched for snapshot/restore Pods); the
-two must be identical, and the chart keeps them equal for you. Override the
-image via `image.repository` / `image.tag` and both follow.
+По умолчанию чарт берёт `ghcr.io/cozystack/etcd-operator:<appVersion>` — образ, опубликованный тем же релизом, — поэтому в обычной установке подставлять нечего. Чарт прописывает эту ссылку **и** в `image:` менеджера, **и** в его переменную окружения `OPERATOR_IMAGE` (образ, который запускается для подов снапшота и восстановления); они обязаны совпадать, и чарт держит их равными за вас. Переопределите образ через `image.repository` / `image.tag`, и оба значения последуют.
 
-The CRDs are **templated** into the release (not in Helm's install-only `crds/`
-directory), so `helm upgrade` keeps them current with the chart — no separate
-CRD-apply step on upgrade. They carry `helm.sh/resource-policy: keep`, so `helm
-uninstall` leaves the CRDs (and therefore your `EtcdCluster`s and their data) in
-place; deleting the CRDs is a deliberate, manual step. Set `crds.enabled=false`
-to manage CRDs out-of-band, or `crds.keep=false` to let uninstall remove them.
+CRD **рендерятся шаблонами** в состав релиза (а не лежат в каталоге `crds/`, который Helm применяет только при установке), поэтому `helm upgrade` держит их в соответствии с чартом — отдельного шага применения CRD при обновлении не нужно. Они несут `helm.sh/resource-policy: keep`, поэтому `helm uninstall` оставляет CRD (а значит, и ваши `EtcdCluster` вместе с данными) на месте; удаление CRD — осознанный ручной шаг. Поставьте `crds.enabled=false`, чтобы управлять CRD отдельно, или `crds.keep=false`, чтобы удаление релиза их убирало.
 
-Common values (`--set key=value`, or a `-f my-values.yaml`):
+Часто используемые значения (`--set ключ=значение` либо `-f my-values.yaml`):
 
-| Value | Default | Purpose |
+| Значение | Умолчание | Назначение |
 |---|---|---|
-| `image.repository` | `ghcr.io/cozystack/etcd-operator` | Operator image repo. Override to mirror or fork. |
-| `image.tag` | chart `appVersion` | Operator image tag; also becomes `OPERATOR_IMAGE` (see above). |
-| `replicaCount` | `1` | Operator replicas (leader election picks the active one). |
-| `kubeRbacProxy.enabled` | `true` | Front `/metrics` with the kube-rbac-proxy SubjectAccessReview sidecar. Set `false` to bind metrics on `:8080` directly with no proxy. |
-| `metrics.serviceMonitor.enabled` | `false` | Create a prometheus-operator `ServiceMonitor` for the metrics endpoint (needs the `monitoring.coreos.com` CRDs and `kubeRbacProxy.enabled`). |
-| `crds.enabled` / `crds.keep` | `true` / `true` | Render the CRDs with the release / annotate them so uninstall keeps them. |
-| `manager.resources` | 10m/64Mi → 500m/128Mi | Manager container requests/limits. |
-| `manager.watchNamespaces` | `[]` | Namespaces the manager watches. Empty = all (see [RBAC](#rbac)). |
-| `imagePullSecrets` | `[]` | Pull secrets for the **operator's own** image (private registry mirror). |
-| `etcdImage.repository` | `quay.io/coreos/etcd` | Operator-wide default **etcd** image repo for member Pods (always wired into `ETCD_IMAGE_REPOSITORY`). Repoint at an air-gapped mirror once; the tag is always `v<spec.version>`. |
+| `image.repository` | `ghcr.io/cozystack/etcd-operator` | Репозиторий образа оператора. Переопределите для зеркала или форка. |
+| `image.tag` | `appVersion` чарта | Тег образа оператора; он же становится `OPERATOR_IMAGE` (см. выше). |
+| `replicaCount` | `1` | Число реплик оператора (активную выбирают лидерские выборы). |
+| `kubeRbacProxy.enabled` | `true` | Закрыть `/metrics` sidecar-прокси kube-rbac-proxy с проверкой через SubjectAccessReview. Поставьте `false`, чтобы отдавать метрики прямо на `:8080` без прокси. |
+| `metrics.serviceMonitor.enabled` | `false` | Создать `ServiceMonitor` prometheus-operator для эндпоинта метрик (нужны CRD `monitoring.coreos.com`). |
+| `crds.enabled` / `crds.keep` | `true` / `true` | Рендерить CRD вместе с релизом / помечать их так, чтобы удаление релиза их оставляло. |
+| `manager.resources` | 100m/64Mi → 500m/256Mi | Запросы и лимиты контейнера менеджера. |
+| `manager.watchNamespaces` | `[]` | Неймспейсы, за которыми следит менеджер. Пусто — за всеми (см. [RBAC](#rbac)). |
+| `imagePullSecrets` | `[]` | Секреты для загрузки **собственного образа оператора** (зеркало приватного реестра). |
+| `manager.clusterDomain` | `""` (автоопределение) | DNS-суффикс кластера (`--cluster-domain`). Определяется автоматически по `/etc/resolv.conf` пода оператора; задайте явно для подов с `hostNetwork` или `dnsPolicy: None`, а также для любого суффикса, отличного от `cluster.local`. Значение попадает в SAN сертификатов cert-manager, которые выпускает оператор, поэтому неверный суффикс ломает peer TLS. |
+| `manager.maxConcurrentReconciles` | `1` | Сколько `EtcdCluster` и `EtcdMember` обрабатываются одновременно. Поднимите на родительском кластере со множеством кластеров: почти каждое reconcile делает RPC к etcd с dial timeout, поэтому при 1 один недоступный кластер задерживает за собой все остальные. |
+| `manager.seccompProfile` | `{type: RuntimeDefault}` | Профиль seccomp для пода оператора, требуется профилем PodSecurity `restricted`. Поставьте `null`, чтобы убрать поле (`{}` его **не** уберёт — Helm сливает словари). |
+| `priorityClassName` | `system-cluster-critical` | Не даёт оператору выселяться одним из первых при давлении на ноду. `""` оставляет обычный приоритет. |
+| `podDisruptionBudget.enabled` | `false` | PDB для оператора. Требует `replicaCount > 1` — над единственной репликой бюджет либо бездействует, либо блокирует любой drain её ноды. |
+| `defaultAntiAffinity` | `true` | Разносит реплики оператора по нодам при `replicaCount > 1`. Явная `affinity` побеждает. |
+| `denyMemoryStorage.enabled` | `false` | Отказывать `EtcdCluster` с `spec.storage.medium: Memory` на допуске. Для инсталляции, решившей, что каждый кластер живёт на постоянном хранилище. Нужен Kubernetes 1.30+. |
+| `memberDeletionProtection.enabled` | `true` | Отказывать в ручном удалении объектов `EtcdMember` на допуске. Нужен Kubernetes 1.30+; на более старых apiserver поставьте `false`. |
+| `metrics.serviceMonitor.additionalLabels` | `{}` | Метки, которые нужны `serviceMonitorSelector` в Prometheus (у kube-prometheus-stack это `release: <имя>`). Без совпадения ServiceMonitor создаётся и молча никогда не выбирается. |
+| `etcdImage.repository` | `quay.io/coreos/etcd` | Общеоператорское умолчание репозитория образа **etcd** для подов членов (всегда прописывается в `ETCD_IMAGE_REPOSITORY`). Один раз перенаправьте на зеркало в закрытом контуре; тег всегда `v<spec.version>`. |
 
-See `charts/etcd-operator/values.yaml` for the complete, annotated list. Verify
-the install:
+Полный список с пояснениями — в `charts/etcd-operator/values.yaml`. Проверьте установку:
 
 ```sh
 kubectl -n etcd-operator-system get deploy
 ```
 
-With release name `etcd-operator` the Deployment is named `etcd-operator`. The
-release manifests (the kubectl-apply path above) render from this same chart, so
-they produce the same name. The Deployment carries the label
-`control-plane=controller-manager`, a name-agnostic handle for scripts.
+При имени релиза `etcd-operator` Deployment называется `etcd-operator`. Манифесты релиза (путь через kubectl apply выше) рендерятся из того же чарта, поэтому имя получается тем же. На Deployment есть метка `control-plane=controller-manager` — устойчивая к имени зацепка для скриптов.
 
-## Build from source
+## Расчёт размеров оператора под множество дочерних кластеров
 
-The repo's Makefile drives a complete install via Helm. From a checkout (needs
-`helm` v3.16+ on PATH):
+Один экземпляр оператора обслуживает каждый `EtcdCluster` в своей области, а лидерские выборы означают, что работает ровно одна реплика. На родительском кластере, где живёт порядка сотни дочерних кластеров — по неймспейсу и по одному etcd на каждый, — три умолчания стоит пересмотреть.
+
+**Число одновременных reconcile — то, что действительно ломается.** Оба контроллера в установившемся режиме переобрабатывают всё каждые 30 с, а контроллер кластера на каждом проходе подключается до etcd. Здоровое подключение плюс `MemberList` — это несколько миллисекунд, поэтому 160 кластеров дают около 2,5 с работы на 30-секундное окно, что комфортно. *Недоступный* кластер — нет: dial timeout 5 с и ещё 5 с контекст `MemberList`, и при одном обработчике они последовательны.
+
+| Недоступных дочерних кластеров (из 160) | Время обхода, 1 обработчик | Время обхода, 16 обработчиков |
+|---|---|---|
+| 0 | 2,4 с | 0,2 с |
+| 3 | 32 с — **уже за пределом 30-секундного окна** | 2 с |
+| 10 | 102 с | 6,4 с |
+| 40 | 402 с | 25 с |
+
+Трёх недоступных дочерних кластеров из 160 достаточно, чтобы весь обход перестал укладываться в собственный интервал, а дальше опаздывает и reconcile каждого здорового кластера. Значение имеет не случай трёх случайных отказов, а коррелированный: отказ массива хранения уносит с собой своих дочерних кластеров — ровно тот сценарий, ради выживания в котором существует `spec.storage.pools`, — и оператор должен оставаться отзывчивым внутри него, чтобы расставить замены.
+
+```yaml
+manager:
+  maxConcurrentReconciles: 16
+```
+
+Разные кластеры не разделяют состояние, а controller-runtime никогда не обрабатывает один объект одновременно с самим собой, поэтому это параллелизм только между дочерними кластерами. Цена — больше одновременных подключений к etcd и больше трафика к apiserver.
+
+**Память.** Кэш информеров держит собственные объекты оператора: кластеры, членов, поды и PVC членов, Service, PDB — отобранные по метке, так что подов apiserver и controller-manager дочернего кластера там *нет*. 160 трёхчленных кластеров — это примерно 2000 объектов в кэше; лимит чарта в 256Mi покрывает это с запасом. Прежде чем предполагать, посмотрите на `container_memory_working_set_bytes`.
+
+**Ограничение частоты запросов к apiserver** здесь не является рычагом: controller-runtime отключает клиентский лимитер и полагается на API Priority and Fairness, поэтому форму нагрузки от этого оператора задаёт конфигурация APF в родительском кластере.
+
+### Разобранный профиль: ~160 дочерних кластеров на 80 нодах
+
+Для родительского кластера из 80 нод по 8 vCPU и 64 ГиБ, где живут 160 трёхчленных дочерних кластеров — 480 подов etcd, в среднем по шесть на ноду:
+
+```yaml
+# values для etcd-operator
+replicaCount: 2                 # резерв для переключения; работы он не делает
+podDisruptionBudget:
+  enabled: true
+manager:
+  maxConcurrentReconciles: 16
+  resources:
+    requests: {cpu: 500m, memory: 256Mi}
+    limits:   {cpu: "2",  memory: 512Mi}
+```
+
+Лимит CPU намеренно заметно выше потребности в установившемся режиме. Установившийся режим — это около 21 reconcile в секунду, каждое из которых делает немногим больше, чем Get и запись статуса; массовое событие — отказ массива, при котором разом переобрабатываются все члены всех затронутых кластеров, — это всплеск, и именно тогда душить оператора дороже всего.
+
+Во что обходятся родительскому кластеру сами поды etcd при значениях `clusterDefaults` из чарта (200m CPU и 512Mi памяти в запросах, лимит памяти 2Gi):
+
+| | Запросы | Доля родительского кластера |
+|---|---|---|
+| CPU | 96 vCPU | 15% от 640 |
+| Память | 240 ГиБ | 4,7% от 5120 |
+| Тома | 480 PVC | 9,4 ТиБ по 20 ГиБ |
+
+Две вещи, которые при такой форме стоит задать осознанно:
+
+**Используйте жёсткую anti-affinity.** `antiAffinity: hard` в `clusterDefaults`. Ей нужно всего 3 ноды, а у вас 80, то есть она выполнима 26 раз подряд, и она превращает «умерла нода» в «шесть кластеров потеряли по одному члену», вместо того чтобы оставлять планировщику свободу разместить двух членов одного кластера рядом. При мягком умолчании такое соседство маловероятно, но разрешено; при 160 кластерах маловероятное случается.
+
+**Проверьте лимит подключения томов на ноду в вашем CSI.** Шесть томов на ноду в среднем и больше после того, как отказы стянут поды, — для большинства драйверов комфортно, но это потолок на ноду, который упирается разом, а низкие лимиты живут как раз у сетевых хранилищ.
+
+### Разделение на части
+
+Если одного оператора мало — или единая точка отказа для 160 дочерних кластеров неприемлема, — установите несколько релизов с непересекающимися `manager.watchNamespaces`. Каждый ограничивает свой кэш и свои наблюдения своими неймспейсами, а политика запрета удаления `EtcdMember` ограничивает свою привязку тем же списком, поэтому два ограниченных релиза не запрещают членов друг друга. (Установка *на весь кластер* по этой же причине обязана оставаться единственной: при допуске побеждает запрет, а список разрешённых у каждого релиза называет только его собственный ServiceAccount.)
+
+## Создание кластеров тем же чартом
+
+У чарта две половины, каждая включается независимо. `operator.*` и соседние значения ставят оператора — CRD, RBAC, Deployment менеджера, политики допуска. `clusters` рендерит объекты `EtcdCluster`, которыми он управляет, каждый с необязательной `EtcdSnapshotPolicy`.
+
+Использовать обе половины в одном релизе никто не заставляет, а какая форма подойдёт, зависит от того, как жизненный цикл дочернего кластера соотносится с жизненным циклом оператора.
+
+**Один релиз на дочерний кластер** — обычная форма, когда дочерних кластеров много, потому что она держит создание, масштабирование и удаление дочернего кластера отдельно от релиза оператора:
 
 ```sh
-# 1. Build the operator image (or skip to a prebuilt registry tag).
+# Один раз, на весь кластер:
+helm install etcd-operator oci://ghcr.io/cozystack/charts/etcd-operator \
+  --version "$VERSION" -n etcd-operator-system --create-namespace
+
+# Затем на каждый дочерний кластер. CRD принадлежат релизу оператора, поэтому обе
+# половины выключаются.
+helm install tenant-a oci://ghcr.io/cozystack/charts/etcd-operator \
+  --version "$VERSION" -n tenant-a --create-namespace \
+  --set operator.enabled=false --set crds.enabled=false -f tenant-a.yaml
+```
+
+**Всё одним релизом** — проще, когда список кластеров короткий и меняется одновременно с оператором:
+
+```sh
+helm install etcd-operator oci://ghcr.io/cozystack/charts/etcd-operator \
+  --version "$VERSION" -n etcd-operator-system --create-namespace -f clusters.yaml
+```
+
+В обоих случаях `clusters` выглядит одинаково. В `clusterDefaults` лежит то, что наследует каждая запись, а сама запись называет только свои отличия — именно это не даёт сотне с лишним дочерних кластеров превратиться в сотню с лишним копий одних и тех же настроек:
+
+```yaml
+clusterDefaults:
+  version: "3.6.11"
+  antiAffinity: hard
+  storage:
+    size: 20Gi
+    pools:
+      - {name: array-a, storageClassName: san-a}
+      - {name: array-b, storageClassName: san-b}
+      - {name: array-c, storageClassName: san-c}
+  options:
+    # Сетевое хранилище: см. docs/concepts.md#тюнинг-под-сетевое-хранилище
+    heartbeatIntervalMilliseconds: 500
+    electionTimeoutMilliseconds: 2500
+  resources:
+    requests: {cpu: 500m, memory: 1Gi}
+    limits: {memory: 4Gi}
+  backup:
+    enabled: true
+    schedule: "0 */6 * * *"
+    destination:
+      s3:
+        endpoint: https://s3.example.com
+        bucket: etcd-snapshots
+        key: parent/
+        credentialsSecretRef: {name: s3-creds}
+
+clusters:
+  - name: tenant-a                 # три члена, по одному на массив
+  - name: tenant-b                 # простой допустим; про контракт одного члена
+    replicas: 1                    # см. docs/operations.md
+```
+
+### Что `helm uninstall` делает с кластерами
+
+Зависит от того, какую половину чарта несёт релиз, потому что слово означает две разные вещи:
+
+| Релиз | Что значит `helm uninstall` | Кластеры |
+|---|---|---|
+| Оператор + кластеры | «убрать оператора» | **Сохраняются** (`helm.sh/resource-policy: keep`), как и CRD. Унести вместе с оператором etcd каждого дочернего кластера и его PVC — ничьё намерение. |
+| Только кластеры (`operator.enabled=false`) | «убрать этого дочернего кластера» | **Удаляются.** Кластер *и есть* релиз; сохранение оставило бы релиз неспособным управлять единственным объектом, ради которого он существует. |
+
+Именно это выбирает `clustersKeepOnUninstall: null` (умолчание). Поставьте `true` или `false`, чтобы перекрыть решение в любую сторону.
+
+Одно следствие, о котором стоит знать в сохраняющем случае: удаление записи из `clusters` при `helm upgrade` этот кластер тоже **не** удалит — Helm пропускает всё помеченное keep. Вывод дочернего кластера из сохраняющего релиза — это осознанный `kubectl delete etcdcluster <имя> -n <ns>`.
+
+### Что чарт отказывается рендерить
+
+Помимо простого проброса значений он отклоняет несколько спецификаций, законных с точки зрения apiserver и неверных так, что это проявится только потом:
+
+| Отклоняется | Почему |
+|---|---|
+| Чётное `replicas` | Переживает столько же отказов, сколько нечётное число ниже, добавляя при этом члена в каждый кворум записи. |
+| `replicas` не кратно числу объявленных пулов | Один массив в итоге держит больше членов, чем остальные, и его потеря стоит кворума — то есть ровно тот отказ, ради предотвращения которого раскладка по пулам и существует. Считается по *объявленным* пулам, поэтому кордон отказавшего массива посреди инцидента по-прежнему рендерится. Членов меньше, чем пулов, — нормально: одночленный дочерний кластер, объявивший три массива, недозаполнен, а не перекошен. |
+| `storage.pools` вместе с `storage.storageClassName` | Два написания одного и того же. |
+| Все пулы `disabled` | Разместить члена было бы негде. |
+| `backup.enabled` без destination | Политика, которая существует и ничего не хранит, выглядит как покрытие бэкапами. |
+| `auth.enabled` без учётных данных либо без `tls.spec.client` | Учётные данные не должны идти по открытому соединению, а аутентификация неизменяема после создания. |
+| `restore.enabled` без source | Иначе молча забутстрапится пустой кластер. |
+
+Он также проставляет anti-affinity для членов, чего не делает сам оператор, и разносит минуту бэкапа каждого кластера по часу (`backup.spread`), чтобы сотня дочерних кластеров не снимала снапшоты одновременно.
+
+## Сборка из исходников
+
+Makefile репозитория выполняет полную установку через Helm. Из клона репозитория (нужен `helm` v3.16+ в PATH):
+
+```sh
+# 1. Собрать образ оператора (или сразу перейти к готовому тегу в реестре).
 make docker-build docker-push IMG=<your-registry>/etcd-operator:<tag>
 
-# 2. Install/upgrade the operator (CRDs + RBAC + manager) with Helm.
-#    `make deploy` runs `helm upgrade --install` and wires image == OPERATOR_IMAGE.
+# 2. Установить или обновить оператора (CRD + RBAC + менеджер) через Helm.
+#    `make deploy` выполняет `helm upgrade --install` и связывает
+#    image == OPERATOR_IMAGE.
 make deploy IMG=<your-registry>/etcd-operator:<tag>
 ```
 
-The cluster must be able to pull from `<your-registry>`. For local clusters (`kind` / `minikube` / `k3d`), either sideload the image (`kind load docker-image ...`) or push to an ephemeral registry the cluster can reach (e.g. `ttl.sh/<random>:1h`); otherwise the operator Deployment goes `ImagePullBackOff` with no clear hint from the operator side.
+Кластер должен уметь загружать образы из `<your-registry>`. Для локальных кластеров (`kind`, `minikube`, `k3d`) либо загрузите образ в узлы напрямую (`kind load docker-image ...`), либо отправьте его во временный реестр, доступный кластеру (например `ttl.sh/<random>:1h`); иначе Deployment оператора уйдёт в `ImagePullBackOff` без внятной подсказки со стороны оператора.
 
-`make deploy` installs the release `etcd-operator` into the `etcd-operator-system`
-namespace (override with `HELM_RELEASE=` / `NAMESPACE=`). The Deployment is named
-after the release. Verify:
+`make deploy` устанавливает релиз `etcd-operator` в неймспейс `etcd-operator-system` (переопределяется через `HELM_RELEASE=` и `NAMESPACE=`). Deployment называется по имени релиза. Проверка:
 
 ```sh
 kubectl get pod -n etcd-operator-system
 kubectl -n etcd-operator-system logs deploy/etcd-operator -c manager --tail=20
 ```
 
-You should see the manager start lines and an empty work-queue (no `EtcdCluster` resources yet). Tear down with `make undeploy` (see [Teardown](#teardown)).
+Вы должны увидеть строки запуска менеджера и пустую очередь работ (ресурсов `EtcdCluster` пока нет). Свернуть установку — `make undeploy` (см. [Удаление](#удаление)).
 
-## Rendering manifests (GitOps / no in-cluster Helm)
+## Рендер манифестов (GitOps, без Helm в кластере)
 
-For GitOps flows that apply plain YAML, render the chart with `helm template`
-instead of installing it — this is exactly what `make build-dist-manifests` (and
-the release pipeline) does to produce the release's `etcd-operator.yaml`:
+Для GitOps-процессов, применяющих обычный YAML, чарт нужно не устанавливать, а рендерить через `helm template` — ровно это делает `make build-dist-manifests` (и конвейер релиза), получая `etcd-operator.yaml` для релиза:
 
 ```sh
 helm template etcd-operator charts/etcd-operator \
@@ -153,11 +285,11 @@ helm template etcd-operator charts/etcd-operator \
   --set namespace.create=true | kubectl apply --server-side -f -
 ```
 
-`--server-side` avoids the client-side last-applied-config annotation size limit (the consolidated manifest embeds the full CRD schemas). `namespace.create=true` emits the Namespace so the output is self-contained.
+`--server-side` обходит ограничение на размер клиентской аннотации last-applied-config (сводный манифест содержит полные схемы CRD). `namespace.create=true` добавляет Namespace, чтобы вывод был самодостаточным.
 
-> **The chart keeps `image:` and `OPERATOR_IMAGE` equal for you.** `OPERATOR_IMAGE` is the image the operator launches for snapshot Jobs and restore init containers; it must match the manager image. The chart renders both from `image.repository`/`image.tag` (the `etcd-operator.image` helper in `_helpers.tpl`), so setting the image once covers both. If you hand-craft manifests and leave `OPERATOR_IMAGE` at the placeholder `controller:latest`, the operator **refuses to start** and exits with a clear error (rather than letting snapshot/restore Pods `ImagePullBackOff` later).
+> **Чарт сам держит `image:` и `OPERATOR_IMAGE` равными.** `OPERATOR_IMAGE` — это образ, который оператор запускает для Job снапшотов и init-контейнеров восстановления; он обязан совпадать с образом менеджера. Чарт рендерит оба из `image.repository` и `image.tag` (хелпер `etcd-operator.image` в `_helpers.tpl`), поэтому одна установка образа покрывает оба места. Если вы собираете манифесты руками и оставляете `OPERATOR_IMAGE` на заглушке `controller:latest`, оператор **откажется стартовать** и выйдет с внятной ошибкой (вместо того чтобы потом дать подам снапшота и восстановления уйти в `ImagePullBackOff`).
 
-## Create your first cluster
+## Создание первого кластера
 
 ```sh
 cat <<'EOF' | kubectl apply -f -
@@ -174,15 +306,15 @@ spec:
 EOF
 ```
 
-Watch it form:
+Понаблюдать за сборкой:
 
 ```sh
 kubectl get etcdcluster.etcd-operator.cozystack.io my-etcd -w
 ```
 
-The operator bootstraps a single seed first, latches `clusterID`, then adds the remaining members one at a time as learners (with promotion). A 3-member cluster typically reaches `READY=3` in well under a minute on a healthy cluster.
+Оператор сначала бутстрапит единственный сид, фиксирует `clusterID`, затем добавляет остальных членов по одному как learner (с повышением). Кластер из трёх членов на здоровой инсталляции обычно достигает `READY=3` заметно быстрее минуты.
 
-To open a shell to one of the members:
+Чтобы открыть оболочку в одном из членов:
 
 ```sh
 POD=$(kubectl get pod -l etcd-operator.cozystack.io/cluster=my-etcd \
@@ -191,11 +323,11 @@ kubectl exec -it "$POD" -- etcdctl --endpoints=http://localhost:2379 \
   member list -w table
 ```
 
-Don't hard-code Pod names — they carry a random suffix from `GenerateName` (e.g. `my-etcd-7xq2k`). The label selector is the stable handle.
+Не зашивайте имена подов: они несут случайный суффикс от `GenerateName` (например `my-etcd-7xq2k`). Устойчивая зацепка — селектор по метке.
 
-### Memory-backed variant
+### Вариант на хранилище в памяти
 
-For reconstructable workloads (e.g. a Kubernetes-in-Kubernetes apiserver whose state is GitOps-managed) you can opt the cluster onto a tmpfs `emptyDir` instead of a PVC:
+Для восстановимых нагрузок (например, apiserver Kubernetes-в-Kubernetes, чьё состояние управляется GitOps) можно перевести кластер на tmpfs `emptyDir` вместо PVC:
 
 ```yaml
 apiVersion: etcd-operator.cozystack.io/v1alpha2
@@ -207,166 +339,166 @@ spec:
   replicas: 3
   version: 3.6.11
   storage:
-    size: 256Mi          # tmpfs SizeLimit per member
+    size: 256Mi          # SizeLimit tmpfs на члена
     medium: Memory
 ```
 
-This trades durability for speed: a Pod that loses its tmpfs (eviction, node failure) loses its data and the member is automatically replaced via `MemberRemove` + scale-up. **Don't use it as a general-purpose etcd backend** — see [docs/concepts.md](concepts.md#storage) and [docs/operations.md](operations.md#memory-backed-clusters) for the full trade-off. For production, set `spec.affinity` (pod anti-affinity) and `spec.resources.limits.memory` explicitly — neither is defaulted (tracked in [#16](https://github.com/lllamnyp/etcd-operator/issues/16)); see the [production checklist](operations.md#what-you-should-configure-before-going-to-production). The apiserver rejects `replicas: 0` on memory clusters via the [CEL validation rules](concepts.md#apiserver-enforced-validation), and every cluster gets an auto-emitted [PodDisruptionBudget](concepts.md#poddisruptionbudget).
+Это меняет надёжность на скорость: под, потерявший свой tmpfs (вытеснение, отказ ноды), теряет данные, и член автоматически заменяется через `MemberRemove` и масштабирование вверх. **Не используйте это как etcd общего назначения** — полный разбор компромисса см. в [docs/concepts.md](concepts.md#хранилище) и [docs/operations.md](operations.md#кластеры-в-памяти). Для продакшена явно задайте `spec.affinity` (anti-affinity подов) и `spec.resources.limits.memory` — ни то, ни другое не проставляется по умолчанию (отслеживается в [#16](https://github.com/lllamnyp/etcd-operator/issues/16)); см. [чеклист перед продакшеном](operations.md#что-настроить-перед-продакшеном). Apiserver отклоняет `replicas: 0` на кластерах в памяти через [правила проверки CEL](concepts.md#проверки-на-стороне-apiserver), а каждый кластер получает автоматически выпускаемый [PodDisruptionBudget](concepts.md#poddisruptionbudget).
 
-### TLS-enabled variant
+### Вариант с TLS
 
-You can opt the client API (2379), the peer API (2380), or both onto TLS. Two sources per subtree, mutually exclusive:
+Вы можете перевести на TLS клиентский API (2379), peer-API (2380) или оба сразу. Для каждого поддерева два взаимоисключающих источника:
 
-- **BYO Secrets** — you create `kubernetes.io/tls`-shaped Secrets out-of-band (e.g. via your own cert pipeline) and reference them via `spec.tls.client.serverSecretRef` / `operatorClientSecretRef` and `spec.tls.peer.secretRef`. See [operations: TLS-enabled clusters](operations.md#tls-enabled-clusters) for Secret-creation commands.
-- **cert-manager** — point at an `Issuer` or `ClusterIssuer` via `spec.tls.client.certManager.{serverIssuerRef,operatorClientIssuerRef}` and `spec.tls.peer.certManager.issuerRef`. The operator emits `cert-manager.io/v1 Certificate` resources, cert-manager produces the Secrets, the rest of the wiring is identical.
+- **Собственные Secret** — вы создаёте Secret вида `kubernetes.io/tls` вне оператора (например, своим конвейером сертификатов) и ссылаетесь на них через `spec.tls.client.serverSecretRef` и `operatorClientSecretRef`, а также `spec.tls.peer.secretRef`. Команды создания Secret см. в [эксплуатации: кластеры с TLS](operations.md#кластеры-с-tls).
+- **cert-manager** — укажите `Issuer` или `ClusterIssuer` через `spec.tls.client.certManager.{serverIssuerRef,operatorClientIssuerRef}` и `spec.tls.peer.certManager.issuerRef`. Оператор выпускает ресурсы `cert-manager.io/v1 Certificate`, cert-manager создаёт Secret, вся остальная обвязка идентична.
 
-See [concepts: TLS](concepts.md#tls) for the trade-offs (EKU `clientAuth` requirement on the server cert, CA-bundle topology, etc.) and [concepts: cert-manager-driven TLS](concepts.md#cert-manager-driven-tls) for the operator-emitted-Certificate path.
+О компромиссах (требование EKU `clientAuth` на серверном сертификате, топология CA-бандла и прочее) см. [концепции: TLS](concepts.md#tls), а о пути с сертификатами, которые выпускает оператор, — [концепции: TLS через cert-manager](concepts.md#tls-через-cert-manager).
 
-#### Prerequisites for cert-manager mode
+#### Предварительные требования для режима cert-manager
 
-- cert-manager (any v1.x release) installed on the cluster *before* the operator starts. The operator probes the discovery API for `cert-manager.io/v1` at startup; if absent, clusters with `certManager` set are parked at `Available=False / CertManagerNotInstalled` and the operator never touches the GVK. Recovery is install-cert-manager + operator restart.
-- An `Issuer` (namespaced, in the EtcdCluster's namespace) or `ClusterIssuer` for each role. Most commonly a single Issuer per plane signs both the server and operator-client certs.
-- The operator's cluster DNS suffix must match the cluster's actual suffix so the emitted SANs match what kube-dns returns for peer reverse-DNS. The operator auto-discovers it from `/etc/resolv.conf`'s `search` line at startup (covers `cluster.local`, `cozy.local`, and any other kubelet-injected suffix for normal cluster-pod deployments); falls back to `cluster.local` when auto-discovery yields nothing (hostNetwork pods, custom `dnsPolicy`). Override explicitly with `--cluster-domain=<suffix>` when neither path finds the right value.
+- cert-manager (любой релиз v1.x), установленный в кластере *до* запуска оператора. Оператор при старте опрашивает discovery API на предмет `cert-manager.io/v1`; если его нет, кластеры с заданным `certManager` паркуются в `Available=False / CertManagerNotInstalled`, и оператор к этой GVK не притрагивается. Восстановление — установить cert-manager и перезапустить оператора.
+- `Issuer` (в неймспейсе EtcdCluster) или `ClusterIssuer` для каждой роли. Чаще всего один Issuer на plane подписывает и серверный, и клиентский сертификат оператора.
+- DNS-суффикс кластера, известный оператору, должен совпадать с реальным суффиксом, чтобы выпущенные SAN совпадали с тем, что kube-dns возвращает при обратном разрешении для peer. Оператор определяет его при старте по строке `search` в `/etc/resolv.conf` (это покрывает `cluster.local`, `cozy.local` и любой другой суффикс, который kubelet подставляет обычным подам кластера); при неудаче автоопределения откатывается на `cluster.local` (поды с hostNetwork, нестандартный `dnsPolicy`). Переопределяйте явно через `--cluster-domain=<суффикс>`, когда ни один путь не даёт нужного значения.
 
-Required SANs on the per-cluster server cert (BYO must cover all of these because the cert is shared by every member; cert-manager mode emits them automatically based on `--cluster-domain`):
+Обязательные SAN на общем серверном сертификате кластера (свой сертификат должен покрывать все, потому что он общий для всех членов; в режиме cert-manager они выпускаются автоматически на основе `--cluster-domain`):
 
-- `*.<cluster>.<ns>.svc` (DNS SAN, wildcard — etcd ≥3.4 supports wildcard DNS SANs)
-- `*.<cluster>.<ns>.svc.<cluster-domain>` (also wildcard) — required by etcd's peer-mTLS verification, which reverse-DNS-looks-up the connecting peer's IP. Kubernetes' DNS returns the fully-qualified `<pod>.<svc>.<ns>.svc.<cluster-domain>` form, and the cert SAN has to cover it. `<cluster-domain>` is `cluster.local` on most clusters; Cozystack uses `cozy.local`. Check `kubectl exec -n kube-system <coredns-pod> -- cat /etc/coredns/Corefile` or your cluster's resolved DNS suffix if unsure.
-- `<cluster>.<ns>.svc` (the headless Service)
-- `<cluster>-client.<ns>.svc` (the client Service)
-- `localhost` (DNS SAN, for the `kubectl exec ... etcdctl --endpoints=https://localhost:2379` flow documented under operations)
-- `127.0.0.1` (IP SAN — same)
+- `*.<cluster>.<ns>.svc` (DNS SAN, с подстановкой — etcd ≥3.4 поддерживает подстановочные DNS SAN)
+- `*.<cluster>.<ns>.svc.<cluster-domain>` (тоже с подстановкой) — требуется проверкой peer-mTLS в etcd, которая делает обратное разрешение IP подключающегося узла. DNS Kubernetes возвращает полную форму `<pod>.<svc>.<ns>.svc.<cluster-domain>`, и SAN сертификата обязан её покрывать. `<cluster-domain>` на большинстве кластеров — `cluster.local`; Cozystack использует `cozy.local`. Если не уверены, посмотрите `kubectl exec -n kube-system <coredns-pod> -- cat /etc/coredns/Corefile` или разрешённый DNS-суффикс вашего кластера.
+- `<cluster>.<ns>.svc` (headless-Service)
+- `<cluster>-client.<ns>.svc` (клиентский Service)
+- `localhost` (DNS SAN, для описанного в эксплуатации сценария `kubectl exec ... etcdctl --endpoints=https://localhost:2379`)
+- `127.0.0.1` (IP SAN — для того же)
 
-Required SANs on the per-cluster peer cert: both `*.<cluster>.<ns>.svc` AND `*.<cluster>.<ns>.svc.<cluster-domain>` — the second is load-bearing for peer-mTLS, as above.
+Обязательные SAN на peer-сертификате кластера: и `*.<cluster>.<ns>.svc`, и `*.<cluster>.<ns>.svc.<cluster-domain>` — второй, как и выше, несёт нагрузку для peer-mTLS.
 
-Server cert EKU **must include `serverAuth` AND `clientAuth`** (the etcd grpc-gateway loopback presents the server cert as a client cert when self-dialing; the server's `--trusted-ca-file` then verifies it with `ExtKeyUsageClientAuth`). Peer cert EKU must include both because peer is symmetric. Operator-client cert needs only `clientAuth`.
+EKU серверного сертификата **обязан включать и `serverAuth`, и `clientAuth`** (петля grpc-gateway в etcd предъявляет серверный сертификат как клиентский, когда обращается сама к себе; `--trusted-ca-file` сервера затем проверяет его с `ExtKeyUsageClientAuth`). EKU peer-сертификата обязан включать оба, потому что peer симметричен. Клиентскому сертификату оператора достаточно `clientAuth`.
 
-The `spec.tls` subtree is immutable post-create — flipping TLS on or off on an existing cluster is delete-and-recreate.
+Поддерево `spec.tls` неизменяемо после создания — включение или выключение TLS на существующем кластере означает удалить и создать заново.
 
-## Image versions
+## Версии образов
 
-By default `spec.version` in an `EtcdCluster` becomes `quay.io/coreos/etcd:v<version>`. For an air-gapped environment that mirrors the image to a private registry, repoint the **repository** operator-wide and supply per-cluster pull credentials:
+По умолчанию `spec.version` в `EtcdCluster` превращается в `quay.io/coreos/etcd:v<версия>`. Для закрытого контура, зеркалирующего образ в приватный реестр, перенаправьте **репозиторий** на уровне всего оператора и задайте учётные данные загрузки на каждый кластер:
 
-- **Repository (operator-wide)** — set `etcdImage.repository` in the chart (env `ETCD_IMAGE_REPOSITORY` / flag `--etcd-image-repository`) to a registry/path, e.g. `registry.internal/mirror/etcd`. Every member Pod the operator creates pulls from it; the tag is always `v<spec.version>`. Restore init containers pull the same image (that is where the version-matched `etcdutl` comes from), so mirroring it also covers restore. Mirror once per fleet — there is intentionally no per-cluster repository/tag override, because the operator keys every version-dependent behaviour (the etcd image tag, the latched target, drift detection) off `spec.version`, and a per-cluster `tag` could silently disagree with it.
-- **Pull credentials (per-cluster)** — `spec.imagePullSecrets` on an `EtcdCluster`:
+- **Репозиторий (на весь оператор)** — задайте `etcdImage.repository` в чарте (переменная `ETCD_IMAGE_REPOSITORY`, флаг `--etcd-image-repository`) как реестр с путём, например `registry.internal/mirror/etcd`. Каждый под члена, создаваемый оператором, будет загружаться оттуда; тег всегда `v<spec.version>`. Init-контейнеры восстановления загружают тот же образ (именно оттуда берётся `etcdutl` нужной версии), поэтому зеркалирование покрывает и восстановление. Зеркалируйте один раз на весь парк — переопределения репозитория или тега на кластер намеренно нет, потому что оператор строит всё зависящее от версии поведение (тег образа etcd, зафиксированную цель, обнаружение расхождений) на `spec.version`, и отдельный `tag` на кластер мог бы молча с ним разойтись.
+- **Учётные данные загрузки (на кластер)** — `spec.imagePullSecrets` в `EtcdCluster`:
 
   ```yaml
   spec:
     version: "3.6.11"
     imagePullSecrets:
-      - name: regcreds   # Secret in the cluster's namespace
+      - name: regcreds   # Secret в неймспейсе кластера
   ```
 
-  It references pull-credential Secrets in the cluster's own namespace and is passed straight through to each member Pod. Like `spec.resources`, a change applies to **newly-created** members (scale-up, replacement), not existing Pods in place.
+  Он ссылается на Secret с учётными данными в собственном неймспейсе кластера и передаётся каждому поду члена как есть. Как и `spec.resources`, изменение применяется к **вновь создаваемым** членам (масштабирование вверх, замена), а не к существующим подам на месте.
 
-  `spec.imagePullSecrets` is set Pod-wide, so it **does** cover the member Pod's restore initContainers at bootstrap-from-snapshot (the `install-tools` container runs the operator image; the `restore` container runs the etcd image for its version-matched `etcdutl`) — a `spec.bootstrap.restore` can pull both mirrored images via these secrets. Standalone `EtcdSnapshot` backup/restore **Jobs** also run the operator image but are **not** covered by `spec.imagePullSecrets`: in a fully air-gapped install repoint the operator image (chart `image.repository`) and make sure the snapshot's namespace can already pull it, or those Jobs `ImagePullBackOff`. The operator Pod itself uses the chart-level `imagePullSecrets`.
+  `spec.imagePullSecrets` задаётся на уровне пода, поэтому он **покрывает** и init-контейнеры восстановления при бутстрапе из снапшота (контейнер `install-tools` запускает образ оператора, контейнер `restore` — образ etcd ради `etcdutl` нужной версии): `spec.bootstrap.restore` может загрузить оба зеркалированных образа через эти секреты. Отдельные **Job** резервного копирования и восстановления `EtcdSnapshot` тоже запускают образ оператора, но `spec.imagePullSecrets` их **не** покрывает: в полностью закрытом контуре перенаправьте образ оператора (`image.repository` в чарте) и убедитесь, что неймспейс снапшота уже умеет его загружать, иначе эти Job уйдут в `ImagePullBackOff`. Сам под оператора использует `imagePullSecrets` уровня чарта.
 
-The `spec.version` examples throughout these docs use **3.6.x** for consistency, but any supported etcd version works — including on the restore path, which rebuilds the data dir with the `etcdutl` from the target etcd image (`v<spec.version>`) rather than a single bundled one. That keeps `etcdutl` in lockstep with the etcd that boots on the result; it does **not** validate the snapshot's own origin version, so restoring a snapshot from a newer etcd into an older `spec.version` remains unsupported (see the [restore runbook](operations.md#restoring-a-cluster-from-a-snapshot)).
+В примерах этой документации `spec.version` для единообразия использует **3.6.x**, но работает любая поддерживаемая версия etcd — в том числе и на пути восстановления, который пересобирает data-dir с помощью `etcdutl` из целевого образа etcd (`v<spec.version>`), а не из одного вшитого. Это держит `etcdutl` в связке с той etcd, которая на результате и стартует; версию происхождения самого снапшота это **не** проверяет, поэтому восстановление снапшота от более новой etcd в более старую `spec.version` остаётся неподдерживаемым (см. [порядок восстановления](operations.md#восстановление-кластера-из-снапшота)).
 
-Operator's own toolchain (relevant when building from source):
+Собственный набор инструментов оператора (важен при сборке из исходников):
 
-| Component | Version |
+| Компонент | Версия |
 |---|---|
 | Go | 1.25.10 |
 | controller-runtime | v0.21 |
 | k8s.io/api, k8s.io/client-go | v0.33 |
 | controller-gen | v0.18.0 |
-| Helm (install/render the chart) | v3.16+ |
-| etcd client (`go.etcd.io/etcd/client/v3`) | v3.6.11 |
-| Kubebuilder layout | v4 |
+| Helm (установка и рендер чарта) | v3.16+ |
+| Клиент etcd (`go.etcd.io/etcd/client/v3`) | v3.6.11 |
+| Раскладка Kubebuilder | v4 |
 
-All pinned in `go.mod`, `Dockerfile`, and `Makefile`.
+Всё закреплено в `go.mod`, `Dockerfile` и `Makefile`.
 
 ## RBAC
 
-The operator runs as a ClusterRole — it needs to watch `EtcdCluster` and `EtcdMember` across all namespaces, plus create/delete the per-member Pods, PVCs, and Services in each user namespace. The rules are generated from the `+kubebuilder:rbac` markers (by `make manifests`) into `charts/etcd-operator/files/manager-role-rules.yaml` and pulled into the chart's templated ClusterRole — don't hand-edit; edit the markers and regenerate.
+Оператор работает с ClusterRole: ему нужно следить за `EtcdCluster` и `EtcdMember` во всех неймспейсах и создавать и удалять поды, PVC и Service отдельных членов в каждом пользовательском неймспейсе. Правила генерируются из маркеров `+kubebuilder:rbac` (командой `make manifests`) в `charts/etcd-operator/files/manager-role-rules.yaml` и подтягиваются в ClusterRole, которую рендерит чарт, — не правьте их руками, правьте маркеры и перегенерируйте.
 
-By default the manager watches all namespaces. To scope it, set `--watch-namespace` / `WATCH_NAMESPACE` (comma-separated), or `--set 'manager.watchNamespaces={tenant-a,tenant-b}'` via the chart. Scoping bounds cache memory on large clusters. RBAC must still permit the watches; the chart's ClusterRole does. Switching to namespaced `Role`s also requires `kubeRbacProxy.enabled=false` — the proxy's TokenReview/SubjectAccessReview permissions are cluster-scoped.
+По умолчанию менеджер следит за всеми неймспейсами. Чтобы ограничить область, задайте `--watch-namespace` или `WATCH_NAMESPACE` (через запятую) либо `--set 'manager.watchNamespaces={tenant-a,tenant-b}'` в чарте. Ограничение области сокращает память кэша на больших кластерах. RBAC при этом всё равно должен разрешать наблюдения; ClusterRole чарта разрешает. Переход на `Role` уровня неймспейса дополнительно требует `kubeRbacProxy.enabled=false` — права прокси на TokenReview и SubjectAccessReview имеют область всего кластера.
 
-## Networking
+## Сеть
 
-The operator creates two Services per `EtcdCluster`:
+Оператор создаёт по два Service на `EtcdCluster`:
 
-- **`<cluster>`** — headless (`clusterIP: None`), `publishNotReadyAddresses: true`, selector `etcd-operator.cozystack.io/cluster=<cluster>`, exposes **both 2379 (client) and 2380 (peer)**. Used by etcd for peer discovery and by the operator's own etcd client (which dials per-pod DNS `<member>.<cluster>.<ns>.svc:2379` resolved through this service). `publishNotReadyAddresses` is required for bootstrap: members during the initial join window aren't `Ready` yet but still need DNS entries to find each other.
-- **`<cluster>-client`** — `ClusterIP`, exposes 2379 only. Intended for end-user client traffic (load-balanced across all pods backing the selector).
+- **`<cluster>`** — headless (`clusterIP: None`), `publishNotReadyAddresses: true`, селектор `etcd-operator.cozystack.io/cluster=<cluster>`, отдаёт **и 2379 (клиентский), и 2380 (peer)**. Его использует etcd для обнаружения соседей и собственный клиент etcd оператора (который обращается к DNS-имени конкретного пода `<member>.<cluster>.<ns>.svc:2379`, разрешаемому через этот Service). `publishNotReadyAddresses` необходим для бутстрапа: члены в окне первоначального присоединения ещё не `Ready`, но им уже нужны записи DNS, чтобы найти друг друга.
+- **`<cluster>-client`** — `ClusterIP`, отдаёт только 2379. Предназначен для клиентского трафика конечных пользователей (с балансировкой по всем подам, попадающим в селектор).
 
-External access (NodePort / LoadBalancer / Ingress) isn't created automatically. If you need it, layer a separate Service or Ingress on top of `<cluster>-client`'s selector.
+Внешний доступ (NodePort, LoadBalancer, Ingress) автоматически не создаётся. Если он нужен, добавьте отдельный Service или Ingress поверх селектора `<cluster>-client`.
 
-A specific routing pitfall: kube-apiserver pointed at the headless Service or the client `ClusterIP` will round-robin its etcd client across all reachable backends, including any current learner. Learners reject `MemberList` etc. with "rpc not supported for learner". The operator's *own* etcd client filters learners out (issue #12 fix in `memberEndpoints` / `discoverMemberID`), but you can't make kube-apiserver do the same. The pragmatic options for apiserver→etcd:
+Отдельная ловушка маршрутизации: kube-apiserver, направленный на headless-Service или на `ClusterIP` клиентского Service, будет по кругу распределять свой клиент etcd по всем достижимым бэкендам, включая текущий learner. Learner отклоняет `MemberList` и подобное с «rpc not supported for learner». *Собственный* клиент etcd оператора learner-ы отфильтровывает (исправление issue #12 в `memberEndpoints` и `discoverMemberID`), но заставить kube-apiserver делать то же самое нельзя. Практичные варианты для связки apiserver→etcd:
 
-- Point at a single voter Pod's per-pod DNS name. Simple, fragile (Pod rescheduling).
-- Point at a leader-aware proxy (etcd's own gRPC-proxy, or a sidecar). Robust, extra moving part.
-- Accept occasional "rpc not supported for learner" errors during scale-up windows; kube-apiserver's own retry layer absorbs them.
+- Направить на DNS-имя конкретного голосующего пода. Просто и хрупко (под может переехать).
+- Направить на прокси, знающий о лидере (собственный gRPC-прокси etcd или sidecar). Надёжно, но появляется лишняя деталь.
+- Смириться с редкими ошибками «rpc not supported for learner» в окна масштабирования; собственный слой повторов kube-apiserver их поглощает.
 
-This is outside the operator's scope but documented because operators ask.
+Это вне области ответственности оператора, но документируется, потому что вопрос задают.
 
-## Teardown
+## Удаление
 
 ```sh
-# Remove individual clusters first — their finalizers will clean up etcd state.
+# Сначала уберите отдельные кластеры — их финализаторы приберут состояние etcd.
 kubectl delete etcdcluster.etcd-operator.cozystack.io --all -A
 
-# Remove the operator (helm uninstall). The CRDs carry
-# helm.sh/resource-policy: keep, so they (and any surviving EtcdClusters) are
-# intentionally left in place.
+# Уберите оператора (helm uninstall). CRD несут
+# helm.sh/resource-policy: keep, поэтому они (и уцелевшие EtcdCluster)
+# намеренно остаются на месте.
 make undeploy
 
-# Remove the member-deletion guard. `helm uninstall` above already removed it;
-# this is for teardowns that skipped Helm. Order does not actually matter for
-# the CRD: apiextensions cleans up CR instances in-process during CRD deletion,
-# which bypasses admission, so the policy neither denies those deletes nor
-# stalls the CRD (this is also why CRD-deletion-driven member removal is a
-# known gap the guard does not cover — see concepts.md). Delete by label so it
-# works regardless of the release name (add app.kubernetes.io/instance=<release>
-# to disambiguate when several releases are installed):
+# Уберите защиту от удаления членов. `helm uninstall` выше её уже удалил;
+# это для сценариев удаления в обход Helm. Порядок для CRD на самом деле не
+# важен: apiextensions прибирает экземпляры CR внутри процесса при удалении
+# CRD, минуя допуск, поэтому политика не запрещает эти удаления и не тормозит
+# CRD (это же объясняет, почему удаление членов через удаление CRD — известный
+# пробел, который защита не покрывает; см. concepts.md). Удаляйте по метке,
+# чтобы это работало независимо от имени релиза (добавьте
+# app.kubernetes.io/instance=<релиз>, если установлено несколько релизов):
 kubectl delete validatingadmissionpolicybinding,validatingadmissionpolicy \
   -l app.kubernetes.io/name=etcd-operator --ignore-not-found
 
-# Remove the CRDs too (only after all EtcdClusters are gone) — deleting them
-# cascade-deletes every remaining EtcdCluster:
+# Уберите и CRD (только после того, как исчезли все EtcdCluster) — их удаление
+# каскадом удаляет каждый оставшийся EtcdCluster:
 kubectl delete crd etcdclusters.etcd-operator.cozystack.io \
   etcdmembers.etcd-operator.cozystack.io \
   etcdsnapshots.etcd-operator.cozystack.io
 ```
 
-Deleting an `EtcdCluster` while it's running cascades through every owned resource: the operator's finalizer on each `EtcdMember` calls `MemberRemove` (when the cluster itself is also being deleted, the operator detects this and skips `MemberRemove` to avoid a deadlock — see `handleDeletion` in `controllers/etcdmember_controller.go`). Pods and PVCs are then GC'd via owner-refs.
+Удаление работающего `EtcdCluster` каскадом проходит по каждому принадлежащему ему ресурсу: финализатор оператора на каждом `EtcdMember` вызывает `MemberRemove` (а когда удаляется и сам кластер, оператор это распознаёт и пропускает `MemberRemove`, чтобы избежать взаимной блокировки, — см. `handleDeletion` в `controllers/etcdmember_controller.go`). Поды и PVC затем собираются по владельческим ссылкам.
 
-If the operator is uninstalled while `EtcdCluster` resources still exist, they're stranded — the finalizers won't run because no controller is reading the queue. Recovery is to either re-install the operator, or `kubectl patch ... --type=merge -p '{"metadata":{"finalizers":null}}'` on each `EtcdMember` (manual, leaves PVCs and Pods in place — clean them up by label).
+Если оператора удалили, пока ресурсы `EtcdCluster` ещё существуют, они зависают: финализаторы не отработают, потому что очередь никто не читает. Восстановление — либо переустановить оператора, либо выполнить `kubectl patch ... --type=merge -p '{"metadata":{"finalizers":null}}'` на каждом `EtcdMember` (вручную; поды и PVC остаются на месте, убирайте их по метке).
 
-## Upgrades
+## Обновления
 
-For now, in-place operator upgrades work via `kubectl set image` on the operator Deployment, but in-place etcd version upgrades **do not** — changing `spec.version` on an existing `EtcdCluster` only affects newly-created members. See [What's not supported](../README.md#whats-not-supported-yet). The current recommended path for an etcd-version bump is:
+Пока что обновление самого оператора на месте работает через `kubectl set image` на его Deployment, а вот обновление версии etcd на месте — **нет**: смена `spec.version` на существующем `EtcdCluster` действует только на вновь создаваемых членов. См. [Чего пока нет](../README.md#чего-пока-нет). Текущий рекомендуемый путь для смены версии etcd:
 
-1. Scale up by one to introduce a new-version member as a learner.
-2. Scale down by one to evict an old-version member.
-3. Repeat for each member.
-4. Once all members are on the new version, edit `spec.version` so future scale-ups use it directly.
+1. Увеличьте размер на единицу, чтобы ввести члена новой версии как learner.
+2. Уменьшите на единицу, чтобы вытеснить члена старой версии.
+3. Повторите для каждого члена.
+4. Когда все члены на новой версии, отредактируйте `spec.version`, чтобы будущие масштабирования сразу её использовали.
 
-This is manual and slow. A native rolling upgrade is a tracked follow-up.
+Это ручной и медленный путь. Собственное плавающее обновление — отслеживаемая задача на будущее.
 
-## kubectl-etcd plugin
+## Плагин kubectl-etcd
 
-`kubectl-etcd` is an optional client-side [kubectl plugin](https://kubernetes.io/docs/tasks/extend-kubectl/kubectl-plugins/) for day-2 operations on operator-managed clusters (member list, status, defrag, compact, alarms, snapshot, member add/remove). It runs on your workstation against your kubeconfig — it is **not** part of the operator image.
+`kubectl-etcd` — необязательный клиентский [плагин kubectl](https://kubernetes.io/docs/tasks/extend-kubectl/kubectl-plugins/) для повседневных операций над кластерами под управлением оператора (список членов, статус, дефрагментация, компакция, тревоги, снапшот, добавление и удаление члена). Он работает на вашей рабочей станции с вашим kubeconfig и **не** входит в образ оператора.
 
-Each release attaches `kubectl-etcd-<os>-<arch>` binaries (with `cli-SHA256SUMS.txt`). Install it onto your `PATH` named `kubectl-etcd`, and kubectl picks it up as `kubectl etcd`:
+К каждому релизу прикладываются бинарники `kubectl-etcd-<os>-<arch>` (вместе с `cli-SHA256SUMS.txt`). Положите его в `PATH` под именем `kubectl-etcd`, и kubectl подхватит его как `kubectl etcd`:
 
 ```sh
 VERSION=v0.5.0; OS=$(uname -s | tr A-Z a-z); ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 curl -sSLo kubectl-etcd "https://github.com/cozystack/etcd-operator/releases/download/$VERSION/kubectl-etcd-$OS-$ARCH"
-chmod +x kubectl-etcd && sudo mv kubectl-etcd /usr/local/bin/   # any dir on $PATH works
+chmod +x kubectl-etcd && sudo mv kubectl-etcd /usr/local/bin/   # подойдёт любой каталог из $PATH
 
 kubectl etcd --version
 kubectl etcd members --help
 ```
 
-Or build from a checkout with `make kubectl-etcd` (lands in `bin/kubectl-etcd`). There is no krew package yet.
+Либо соберите из клона репозитория через `make kubectl-etcd` (результат в `bin/kubectl-etcd`). Пакета для krew пока нет.
 
-## Development
+## Разработка
 
-Out-of-cluster development run (against the current `$KUBECONFIG`):
+Запуск для разработки вне кластера (против текущего `$KUBECONFIG`):
 
 ```sh
 make run
 ```
 
-This builds and runs the operator binary on your laptop. It can reconcile `EtcdCluster` resources but **cannot dial etcd via in-cluster DNS** — `MemberList`/`MemberAdd`/`MemberRemove` will fail. Useful for testing reconcile loop logic against the apiserver, not for end-to-end testing. For e2e use the deploy flow above.
+Это соберёт и запустит бинарник оператора на вашем ноутбуке. Он может согласовывать ресурсы `EtcdCluster`, но **не может обращаться к etcd через внутрикластерный DNS** — `MemberList`, `MemberAdd` и `MemberRemove` будут падать. Полезно для проверки логики цикла reconcile против apiserver, но не для сквозного тестирования. Для e2e используйте путь развёртывания выше.

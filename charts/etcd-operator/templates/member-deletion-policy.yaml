@@ -1,44 +1,45 @@
 {{- /*
-Enforces at the API boundary the contract the docs have carried since day one:
-EtcdMember objects are created and deleted by the operator, not by users.
+Делает обязательным на границе API тот контракт, который документация несла с
+первого дня: объекты EtcdMember создаёт и удаляет оператор, а не пользователи.
 
-Deleting one is not a recoverable mistake. Its data PVC is controller-owned by
-the member, so the volume — and on a Delete-reclaim StorageClass the data
-itself — goes with it, while the member's finalizer removes the member from
-etcd on the way out. A cluster whose members are deleted one by one therefore
-dismembers itself and leaves nothing to restore from.
+Удаление такого объекта — невосстановимая ошибка. Его PVC с данными принадлежит
+члену как контроллеру, поэтому том — а на StorageClass с политикой Delete и
+сами данные — уходит вместе с ним, а финализатор члена по пути убирает его из
+etcd. Кластер, чьи члены удаляются один за другим, тем самым разбирает сам себя
+и не оставляет ничего, из чего восстанавливаться.
 
-Nothing manages EtcdMember objects declaratively (the only sanctioned
-non-operator writer is cmd/etcd-migrate, which creates and never deletes), so a
-DELETE from anywhere else is always an accident or a tracking misconfiguration
-— stopped at the boundary, with the requester told why.
+Ничто не управляет объектами EtcdMember декларативно (единственный
+санкционированный писатель, кроме оператора, — cmd/etcd-migrate, который только
+создаёт и никогда не удаляет), поэтому DELETE откуда-либо ещё — это всегда либо
+случайность, либо ошибка в настройке слежения; он останавливается на границе, а
+запросившему сообщают причину.
 
-Allowed through:
-  - the operator's own ServiceAccount — scale-down and crash-loop replacement
-    delete members deliberately;
-  - the garbage collector — cascade from a deleted EtcdCluster must still work;
-  - the namespace controller — deleting a namespace must not hang;
-  - kube-controller-manager itself — on clusters run without
-    --use-service-account-credentials the GC and namespace-cleanup deletes
-    authenticate as the user system:kube-controller-manager rather than the
-    per-controller ServiceAccounts above.
+Пропускаются:
+  - собственный ServiceAccount оператора — scale-down и замена при crash-loop
+    удаляют членов намеренно;
+  - сборщик мусора — каскад от удалённого EtcdCluster обязан продолжать
+    работать;
+  - контроллер неймспейсов — удаление неймспейса не должно зависать;
+  - сам kube-controller-manager — на кластерах без
+    --use-service-account-credentials удаления от GC и при очистке неймспейса
+    аутентифицируются как пользователь system:kube-controller-manager, а не как
+    перечисленные выше ServiceAccount отдельных контроллеров.
 
-Break-glass without uninstalling the policy: annotate the member with
-etcd-operator.cozystack.io/allow-deletion=true, then delete it.
+Разбить стекло, не удаляя политику: пометить члена аннотацией
+etcd-operator.cozystack.io/allow-deletion=true и затем удалить.
 
-Requires Kubernetes 1.30+ (ValidatingAdmissionPolicy GA). On an older
-apiserver the install fails with "no matches for kind
-ValidatingAdmissionPolicy"; set memberDeletionProtection.enabled=false to
-install without the guard.
+Требует Kubernetes 1.30+ (ValidatingAdmissionPolicy в GA). На более старом
+apiserver установка падает с «no matches for kind ValidatingAdmissionPolicy»;
+поставьте memberDeletionProtection.enabled=false, чтобы установить без защиты.
 
-Rendered unconditionally (NOT gated on .Capabilities.APIVersions): capability
-detection would make a security guard's absence silent — a pre-1.30 `helm
-install`, or a GitOps render carrying the destination's API versions, would
-quietly omit it. Absence of a guard against an unrecoverable accident must be
-loud and explicit: always render, and opt out via
+Рендерится безусловно (НЕ через .Capabilities.APIVersions): определение
+возможностей сделало бы отсутствие защиты незаметным — `helm install` на версии
+до 1.30 или рендер в GitOps, несущий версии API целевого кластера, тихо
+пропустил бы её. Отсутствие защиты от невосстановимой ошибки должно быть
+громким и явным: рендерим всегда, а отказ оформляется через
 memberDeletionProtection.enabled=false.
 */ -}}
-{{- if .Values.memberDeletionProtection.enabled }}
+{{- if and .Values.operator.enabled (.Values.memberDeletionProtection.enabled) }}
 {{- $allowed := concat
       (list
         (printf "system:serviceaccount:%s:%s" .Release.Namespace (include "etcd-operator.serviceAccountName" .))
@@ -83,9 +84,11 @@ spec:
   policyName: {{ include "etcd-operator.fullname" . }}-protect-members
   validationActions: ["Deny"]
 {{- with .Values.manager.watchNamespaces }}
-  # Scope to the watched namespaces so multiple namespace-scoped releases don't
-  # deny each other's members (admission is deny-wins; each allowlist holds only
-  # its own operator SA). Cluster-wide install must be a singleton — see values.yaml.
+  # Ограничиваем отслеживаемыми неймспейсами, чтобы несколько релизов,
+  # ограниченных неймспейсами, не запрещали членов друг друга (при допуске
+  # побеждает запрет, а в списке разрешённых у каждого только его собственный SA
+  # оператора). Установка на весь кластер обязана быть единственной — см.
+  # values.yaml.
   matchResources:
     namespaceSelector:
       matchExpressions:

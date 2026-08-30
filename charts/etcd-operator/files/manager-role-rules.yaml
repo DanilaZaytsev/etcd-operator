@@ -32,16 +32,9 @@
     - ""
   resources:
     - pods/log
-  verbs:
-    - get
-- apiGroups:
-    - ""
-  resources:
     - secrets
   verbs:
     - get
-    - list
-    - watch
 - apiGroups:
     - ""
   resources:
@@ -97,6 +90,7 @@
     - etcddefragpolicies/status
     - etcddefrags/status
     - etcdmembers/status
+    - etcdsnapshotpolicies/status
     - etcdsnapshots/status
   verbs:
     - get
@@ -106,6 +100,7 @@
     - etcd-operator.cozystack.io
   resources:
     - etcddefragpolicies
+    - etcdsnapshotpolicies
   verbs:
     - get
     - list

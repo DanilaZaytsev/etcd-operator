@@ -33,8 +33,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -50,6 +52,21 @@ const DefaultProgressDeadlineSeconds = int32(600)
 type EtcdClusterReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// Recorder emits advisory events (e.g. a storage-pool layout that
+	// concentrates quorum on one array). Tests may leave it nil.
+	Recorder record.EventRecorder
+
+	// MaxConcurrentReconciles is how many EtcdClusters this controller
+	// reconciles at once. 0 means controller-runtime's default of 1.
+	//
+	// Worth raising on a cluster that hosts many EtcdClusters. Nearly every
+	// reconcile makes an etcd RPC with a dial timeout, and with one worker a
+	// single unreachable cluster stalls every other cluster's reconcile behind
+	// it. Distinct EtcdClusters share no state, and controller-runtime never
+	// reconciles one object concurrently with itself, so parallelism here is
+	// across clusters only.
+	MaxConcurrentReconciles int
 
 	// EtcdClientFactory builds an etcd client. Tests inject a fake;
 	// production wiring uses DefaultEtcdClientFactory.
@@ -82,7 +99,12 @@ type EtcdClusterReconciler struct {
 //+kubebuilder:rbac:groups=etcd-operator.cozystack.io,resources=etcdmembers/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch
 //+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// Secrets are read by name and never listed. They are also excluded from the
+// informer cache (see main.go), which is what allowed list/watch to go: those
+// verbs existed only so the cache could build a Secret informer, and on a
+// multi-tenant parent cluster they meant the operator could enumerate every
+// tenant's CA and signing keys.
+//+kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // `delete` is intentionally omitted from the certificates verb list:
 // each Certificate is owned by the EtcdCluster via SetControllerReference,
 // and spec.tls is CEL-immutable post-create, so the only Certificate
@@ -413,7 +435,16 @@ func (r *EtcdClusterReconciler) bootstrap(
 	}
 
 	if seed == nil {
+		// Pool placement for the seed. With no members yet every pool's count
+		// is 0, so the tie-break puts the seed in pools[0] — deterministic by
+		// construction, which is what makes a restore reproducible.
+		seedStorage, seedPool, err := resolveStoragePool(cluster.Status.Observed.Storage, members)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		r.warnUnevenStoragePools(cluster)
 		seedLabels, seedAnnotations := applyAdditionalMetadata(clusterLabels(cluster.Name), nil, observedAdditionalMetadata(cluster))
+		seedLabels = withStoragePoolLabel(seedLabels, seedPool)
 		seed = &lll.EtcdMember{
 			ObjectMeta: metav1.ObjectMeta{
 				GenerateName: cluster.Name + "-",
@@ -424,10 +455,11 @@ func (r *EtcdClusterReconciler) bootstrap(
 			Spec: lll.EtcdMemberSpec{
 				ClusterName:               cluster.Name,
 				Version:                   cluster.Status.Observed.Version,
-				Storage:                   cluster.Status.Observed.Storage,
+				Storage:                   seedStorage,
+				StoragePool:               seedPool,
 				Resources:                 cluster.Status.Observed.Resources,
 				AdditionalMetadata:        cluster.Status.Observed.AdditionalMetadata,
-				Affinity:                  cluster.Status.Observed.Affinity,
+				Affinity:                  storagePoolAffinity(cluster.Status.Observed.Storage, seedPool, cluster.Status.Observed.Affinity),
 				TopologySpreadConstraints: cluster.Status.Observed.TopologySpreadConstraints,
 				Options:                   cluster.Status.Observed.Options,
 				ImagePullSecrets:          cluster.Status.Observed.ImagePullSecrets,
@@ -818,7 +850,16 @@ func (r *EtcdClusterReconciler) scaleUp(
 	}
 
 	// Step 4: no learner waiting. Create a fresh CR, AddAsLearner, patch.
+	// Pool placement for the new member. Counted over `members` — the full
+	// active set, dormant included — rather than `running`: a paused member
+	// keeps its PVC, so its pool is still occupied.
+	newStorage, newPool, err := resolveStoragePool(cluster.Status.Observed.Storage, members)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	r.warnUnevenStoragePools(cluster)
 	mLabels, mAnnotations := applyAdditionalMetadata(clusterLabels(cluster.Name), nil, observedAdditionalMetadata(cluster))
+	mLabels = withStoragePoolLabel(mLabels, newPool)
 	newMember := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: cluster.Name + "-",
@@ -829,10 +870,11 @@ func (r *EtcdClusterReconciler) scaleUp(
 		Spec: lll.EtcdMemberSpec{
 			ClusterName:               cluster.Name,
 			Version:                   cluster.Status.Observed.Version,
-			Storage:                   cluster.Status.Observed.Storage,
+			Storage:                   newStorage,
+			StoragePool:               newPool,
 			Resources:                 cluster.Status.Observed.Resources,
 			AdditionalMetadata:        cluster.Status.Observed.AdditionalMetadata,
-			Affinity:                  cluster.Status.Observed.Affinity,
+			Affinity:                  storagePoolAffinity(cluster.Status.Observed.Storage, newPool, cluster.Status.Observed.Affinity),
 			TopologySpreadConstraints: cluster.Status.Observed.TopologySpreadConstraints,
 			Options:                   cluster.Status.Observed.Options,
 			ImagePullSecrets:          cluster.Status.Observed.ImagePullSecrets,
@@ -1483,6 +1525,16 @@ func (r *EtcdClusterReconciler) updateStatus(
 		// Non-fatal: status update still runs; next reconcile retries.
 	}
 
+	// Stamp the generation only here, at the tail of a completed pass.
+	// Reconcile has several earlier returns that requeue while the cluster
+	// is still converging, and each of them leaves the stamp behind on
+	// purpose: observedGeneration must lag metadata.generation for exactly
+	// as long as the operator has not finished acting on that spec.
+	if cluster.Status.ObservedGeneration != cluster.Generation {
+		cluster.Status.ObservedGeneration = cluster.Generation
+		changed = true
+	}
+
 	if changed {
 		if err := r.Status().Update(ctx, cluster); err != nil {
 			return ctrl.Result{}, err
@@ -1933,6 +1985,7 @@ func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&lll.EtcdMember{}).
 		Owns(&corev1.Service{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
+		WithOptions(controller.Options{MaxConcurrentReconciles: workerCount(r.MaxConcurrentReconciles)}).
 		Complete(r)
 }
 
@@ -2019,6 +2072,22 @@ func (r *EtcdClusterReconciler) handleDeadlineExceeded(
 	return ctrl.Result{Requeue: true}, nil
 }
 
+// warnUnevenStoragePools emits an advisory Event when the target replica
+// count does not divide evenly across the enabled storage pools. See
+// unevenStoragePools for why this is an Event rather than a CEL rule or a
+// Degraded condition. No-op when the layout is even, when the cluster has
+// fewer than two pools, or when no Recorder is wired (tests).
+func (r *EtcdClusterReconciler) warnUnevenStoragePools(cluster *lll.EtcdCluster) {
+	if r.Recorder == nil || cluster.Status.Observed == nil {
+		return
+	}
+	msg, uneven := unevenStoragePools(cluster.Status.Observed.Storage, cluster.Status.Observed.Replicas)
+	if !uneven {
+		return
+	}
+	r.Recorder.Event(cluster, corev1.EventTypeWarning, "UnevenStoragePools", msg)
+}
+
 // ── Locking-pattern helpers ──────────────────────────────────────────────
 
 func snapshotSpecIntoObserved(cluster *lll.EtcdCluster) {
@@ -2052,6 +2121,12 @@ func specEqualsObserved(cluster *lll.EtcdCluster) bool {
 		o.Version == cluster.Spec.Version &&
 		o.Storage.Size.Cmp(cluster.Spec.Storage.Size) == 0 &&
 		o.Storage.Medium == cluster.Spec.Storage.Medium &&
+		// Pools must be compared: unlike storageClassName they are not fully
+		// immutable — a pool can be appended, grown, or cordoned. Leaving them
+		// out would mean a `disabled: true` cordon never reached the locked
+		// target, so the replacement member would keep landing on the dead
+		// array.
+		equality.Semantic.DeepEqual(o.Storage.Pools, cluster.Spec.Storage.Pools) &&
 		equality.Semantic.DeepEqual(o.Resources, cluster.Spec.Resources) &&
 		equality.Semantic.DeepEqual(o.Affinity, cluster.Spec.Affinity) &&
 		equality.Semantic.DeepEqual(o.TopologySpreadConstraints, cluster.Spec.TopologySpreadConstraints) &&

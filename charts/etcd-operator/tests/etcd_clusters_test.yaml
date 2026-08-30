@@ -1,0 +1,634 @@
+suite: Tenant clusters authored through the chart
+
+# The cluster half of the chart. Its job is not to shorten the YAML — it is to
+# make the mistakes that are unrecoverable or invisible impossible to render.
+# Each guard below stands for one such mistake; the pass-through cases exist so
+# the guards cannot be satisfied by a template that refuses everything.
+#
+# Every test sets operator.enabled=false so only the cluster documents are
+# rendered, which is also the shape a per-tenant release uses.
+
+templates:
+  - etcdclusters.yaml
+
+set:
+  operator.enabled: false
+  crds.enabled: false
+
+tests:
+  - it: renders nothing when no clusters are listed
+    # The operator is useful on its own; a chart that invented a cluster on
+    # install would be surprising.
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders a three-member cluster from one name
+    set:
+      clusters:
+        - name: tenant-a
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: EtcdCluster
+      - equal:
+          path: metadata.name
+          value: tenant-a
+      - equal:
+          path: spec.replicas
+          value: 3
+
+  # `helm uninstall` means two different things depending on which half of the
+  # chart the release carries, and one annotation cannot be right for both.
+
+  - it: keeps clusters when the release also installs the operator
+    # Uninstalling means "remove the operator". Taking every tenant's etcd and
+    # its PVCs along with it is nobody's intent.
+    set:
+      operator.enabled: true
+      clusters:
+        - name: tenant-a
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/resource-policy"]
+          value: keep
+
+  - it: lets the cluster go with a per-tenant release
+    # Here the cluster IS the release. Keeping it would leave the release unable
+    # to manage the one object it exists to manage.
+    set:
+      clusters:
+        - name: tenant-a
+    asserts:
+      - notExists:
+          path: metadata.annotations["helm.sh/resource-policy"]
+
+  - it: can be forced to keep even in a per-tenant release
+    set:
+      clustersKeepOnUninstall: true
+      clusters:
+        - name: tenant-a
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/resource-policy"]
+          value: keep
+
+  - it: can be forced to let go even alongside the operator
+    set:
+      operator.enabled: true
+      clustersKeepOnUninstall: false
+      clusters:
+        - name: tenant-a
+    asserts:
+      - notExists:
+          path: metadata.annotations["helm.sh/resource-policy"]
+
+  # ── defaults and per-cluster overrides ─────────────────────────────────
+
+  - it: lets each cluster override only what it names
+    set:
+      clusterDefaults:
+        replicas: 3
+        version: "3.6.11"
+      clusters:
+        - name: tenant-a
+        - name: tenant-b
+          replicas: 1
+    asserts:
+      - hasDocuments:
+          count: 2
+      - equal:
+          path: spec.replicas
+          value: 3
+        documentIndex: 0
+      - equal:
+          path: spec.replicas
+          value: 1
+        documentIndex: 1
+      # Both inherit the version they did not name.
+      - equal:
+          path: spec.version
+          value: "3.6.11"
+        documentIndex: 1
+
+  # mergeOverwrite mutates its first argument. Without a deepCopy of the
+  # defaults per iteration, the first cluster's overrides would leak into the
+  # defaults every later cluster inherits — the classic Helm range bug, and one
+  # that only shows up with more than one entry.
+  - it: does not leak one cluster's overrides into the next
+    set:
+      clusterDefaults:
+        replicas: 3
+      clusters:
+        - name: tenant-a
+          replicas: 1
+        - name: tenant-b
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 1
+        documentIndex: 0
+      - equal:
+          path: spec.replicas
+          value: 3
+        documentIndex: 1
+
+  - it: requires every entry to be named
+    # Caught by values.schema.json before the template's own guard is reached —
+    # which is the better place for it. The guard stays as defence in depth for
+    # a render that bypasses the schema.
+    set:
+      clusters:
+        - replicas: 3
+    asserts:
+      - failedTemplate:
+          errorMessage: "values don't meet the specifications of the schema(s) in the following chart(s):\netcd-operator:\n- at '/clusters/0': missing property 'name'\n"
+
+  # ── scheduling ─────────────────────────────────────────────────────────
+
+  - it: spreads members across nodes by default
+    # Three members on one node is three members lost with that node, and the
+    # operator does not default anti-affinity for members.
+    set:
+      clusters:
+        - name: tenant-a
+    asserts:
+      - equal:
+          path: spec.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].podAffinityTerm.topologyKey
+          value: kubernetes.io/hostname
+
+  - it: can require rather than prefer the spread
+    set:
+      clusters:
+        - name: tenant-a
+          antiAffinity: hard
+    asserts:
+      - exists:
+          path: spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution
+      - notExists:
+          path: spec.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution
+
+  - it: lets an explicit affinity win
+    set:
+      clusters:
+        - name: tenant-a
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - {key: storage, operator: In, values: [fast]}
+    asserts:
+      - notExists:
+          path: spec.affinity.podAntiAffinity
+      - exists:
+          path: spec.affinity.nodeAffinity
+
+  # ── replica count ──────────────────────────────────────────────────────
+
+  - it: refuses an even replica count
+    # Strictly worse than the odd count below it, and legal as far as the
+    # apiserver is concerned.
+    set:
+      clusters:
+        - name: tenant-a
+          replicas: 4
+    asserts:
+      - failedTemplate:
+          errorMessage: 'cluster "tenant-a": replicas must be odd (got 4): an even member count tolerates the same number of failures as the odd count below it while adding a member to every write quorum'
+
+  - it: allows parking a cluster at zero
+    set:
+      clusters:
+        - name: tenant-a
+          replicas: 0
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 0
+
+  # ── storage pools ──────────────────────────────────────────────────────
+
+  - it: places three members on three arrays
+    set:
+      clusters:
+        - name: tenant-a
+          storage:
+            size: 20Gi
+            pools:
+              - {name: array-a, storageClassName: san-a}
+              - {name: array-b, storageClassName: san-b}
+              - {name: array-c, storageClassName: san-c}
+    asserts:
+      - equal:
+          path: spec.storage.pools[0].storageClassName
+          value: san-a
+      - equal:
+          path: spec.storage.pools[2].name
+          value: array-c
+      - notExists:
+          path: spec.storage.storageClassName
+
+  - it: refuses pools together with a single storageClassName
+    set:
+      clusters:
+        - name: tenant-a
+          storage:
+            storageClassName: san-a
+            pools:
+              - {name: array-a, storageClassName: san-a}
+    asserts:
+      - failedTemplate:
+          errorMessage: 'cluster "tenant-a": storage.pools and storage.storageClassName are mutually exclusive: pools is the multi-array form of the same setting'
+
+  - it: allows fewer members than arrays
+    # A single-member tenant declaring three arrays is under-filled, not
+    # lopsided: the member goes on the first pool and the rest wait for a
+    # scale-up. The pool list is append-only post-create, so declaring all
+    # three up front is the right thing to do.
+    set:
+      clusters:
+        - name: tenant-a
+          replicas: 1
+          storage:
+            pools:
+              - {name: array-a, storageClassName: san-a}
+              - {name: array-b, storageClassName: san-b}
+              - {name: array-c, storageClassName: san-c}
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 1
+      - equal:
+          path: spec.storage.pools[2].name
+          value: array-c
+
+  - it: refuses three members over two arrays
+    # One array would hold two of the three and could take quorum with it.
+    set:
+      clusters:
+        - name: tenant-a
+          replicas: 3
+          storage:
+            pools:
+              - {name: array-a, storageClassName: san-a}
+              - {name: array-b, storageClassName: san-b}
+    asserts:
+      - failedTemplate:
+          errorMessage: 'cluster "tenant-a": replicas (3) is not a multiple of the 2 storage pools: at least one array would hold more members than the others, so losing that array would cost quorum — the failure this layout exists to prevent'
+
+  - it: still renders while an array is cordoned
+    # The evenness check counts DECLARED pools, not enabled ones: cordoning is
+    # done mid-incident, and a chart that refused to render it then would block
+    # the one action that unsticks the replacement member.
+    set:
+      clusters:
+        - name: tenant-a
+          replicas: 3
+          storage:
+            pools:
+              - {name: array-a, storageClassName: san-a}
+              - {name: array-b, storageClassName: san-b, disabled: true}
+              - {name: array-c, storageClassName: san-c}
+    asserts:
+      - equal:
+          path: spec.storage.pools[1].disabled
+          value: true
+
+  - it: refuses a layout with every array cordoned
+    set:
+      clusters:
+        - name: tenant-a
+          storage:
+            pools:
+              - {name: array-a, storageClassName: san-a, disabled: true}
+              - {name: array-b, storageClassName: san-b, disabled: true}
+    asserts:
+      - failedTemplate:
+          errorMessage: 'cluster "tenant-a": every storage pool is disabled; the cluster would have nowhere to place a member''s PVC'
+
+  # ── tuning ─────────────────────────────────────────────────────────────
+
+  - it: emits no flag for an unset tuning option
+    # A null must leave etcd's own default in force, not render as a zero.
+    set:
+      clusters:
+        - name: tenant-a
+    asserts:
+      - notExists:
+          path: spec.options.heartbeatIntervalMilliseconds
+      - notExists:
+          path: spec.options.quotaBackendBytes
+      - equal:
+          path: spec.options.autoCompactionMode
+          value: periodic
+
+  - it: passes through the consensus timing
+    set:
+      clusters:
+        - name: tenant-a
+          options:
+            heartbeatIntervalMilliseconds: 500
+            electionTimeoutMilliseconds: 2500
+    asserts:
+      - equal:
+          path: spec.options.heartbeatIntervalMilliseconds
+          value: 500
+      - equal:
+          path: spec.options.electionTimeoutMilliseconds
+          value: 2500
+
+  # ── auth and restore ───────────────────────────────────────────────────
+
+  - it: refuses auth without credentials
+    set:
+      clusters:
+        - name: tenant-a
+          auth:
+            enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: 'cluster "tenant-a": auth.enabled requires auth.rootCredentialsSecretRef'
+
+  - it: refuses auth over a plaintext client plane
+    set:
+      clusters:
+        - name: tenant-a
+          auth:
+            enabled: true
+            rootCredentialsSecretRef: root-creds
+    asserts:
+      - failedTemplate:
+          errorMessage: 'cluster "tenant-a": auth.enabled requires tls.spec.client: auth credentials must not cross a plaintext connection'
+
+  - it: carries the restore source and its checksum
+    set:
+      clusters:
+        - name: tenant-a
+          restore:
+            enabled: true
+            checksum: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            source:
+              s3:
+                endpoint: https://s3.example.com
+                bucket: b
+                key: exact/object.db
+                credentialsSecretRef: {name: s3-creds}
+    asserts:
+      - equal:
+          path: spec.bootstrap.restore.checksum
+          value: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      - equal:
+          path: spec.bootstrap.restore.source.s3.key
+          value: exact/object.db
+
+  - it: refuses a restore with no source
+    set:
+      clusters:
+        - name: tenant-a
+          restore:
+            enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: 'cluster "tenant-a": restore.enabled requires restore.source'
+
+  # ── backups ────────────────────────────────────────────────────────────
+
+  - it: creates no backup policy by default
+    set:
+      clusters:
+        - name: tenant-a
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: EtcdCluster
+
+  - it: pairs a cluster with its backup policy
+    set:
+      clusters:
+        - name: tenant-a
+          backup:
+            enabled: true
+            destination:
+              pvc: {claimName: backups}
+    asserts:
+      - hasDocuments:
+          count: 2
+      - isKind:
+          of: EtcdSnapshotPolicy
+        documentIndex: 1
+      - equal:
+          path: spec.clusterRef.name
+          value: tenant-a
+        documentIndex: 1
+
+  - it: refuses a backup policy with no destination
+    # A policy that exists and stores nothing is worse than no policy: it looks
+    # like coverage.
+    set:
+      clusters:
+        - name: tenant-a
+          backup:
+            enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: 'cluster "tenant-a": backup.enabled requires backup.destination (s3 or pvc): a policy with no destination would look like backup coverage and store nothing'
+
+  - it: keeps successes and failures under separate limits
+    # A burst of failures must not evict the successes a restore needs.
+    set:
+      clusters:
+        - name: tenant-a
+          backup:
+            enabled: true
+            destination:
+              pvc: {claimName: backups}
+    asserts:
+      - equal:
+          path: spec.successfulHistoryLimit
+          value: 10
+        documentIndex: 1
+      - equal:
+          path: spec.failedHistoryLimit
+          value: 3
+        documentIndex: 1
+      # Deleting stored backups stays a decision, not a default.
+      - equal:
+          path: spec.deleteArtifactOnPrune
+          value: false
+        documentIndex: 1
+
+  # Where each tenant gets its own namespace, the natural name for its cluster
+  # is the same in all of them. Hashing the name alone gives every tenant the
+  # identical minute — the herd the feature exists to prevent, behind a feature
+  # that looks like it prevented it.
+  - it: spreads identically-named clusters in different namespaces
+    set:
+      clusters:
+        - name: etcd
+          backup:
+            enabled: true
+            destination:
+              pvc: {claimName: backups}
+    release:
+      namespace: tenant-a
+    asserts:
+      - equal:
+          path: spec.schedule.cron
+          value: "57 */6 * * *"
+        documentIndex: 1
+
+  - it: gives the same cluster name a different minute in another namespace
+    set:
+      clusters:
+        - name: etcd
+          backup:
+            enabled: true
+            destination:
+              pvc: {claimName: backups}
+    release:
+      namespace: tenant-b
+    asserts:
+      - notEqual:
+          path: spec.schedule.cron
+          value: "57 */6 * * *"
+        documentIndex: 1
+
+  - it: spreads the backup minute across the hour
+    # Tenants written from one defaults block otherwise snapshot on the same
+    # minute: a hundred simultaneous streams to one object store, every tick.
+    set:
+      clusters:
+        - name: tenant-a
+          backup:
+            enabled: true
+            destination:
+              pvc: {claimName: backups}
+    asserts:
+      - notEqual:
+          path: spec.schedule.cron
+          value: "0 */6 * * *"
+        documentIndex: 1
+      - matchRegex:
+          path: spec.schedule.cron
+          pattern: ^[0-9]+ \*/6 \* \* \*$
+        documentIndex: 1
+
+  - it: leaves a step expression alone
+    # Spreading "every 15 minutes between 9 and 17" would change what was asked
+    # for, not just when it happens.
+    set:
+      clusters:
+        - name: tenant-a
+          backup:
+            enabled: true
+            schedule: "*/15 9-17 * * *"
+            destination:
+              pvc: {claimName: backups}
+    asserts:
+      - equal:
+          path: spec.schedule.cron
+          value: "*/15 9-17 * * *"
+        documentIndex: 1
+
+  - it: honours an exact schedule when spreading is off
+    set:
+      clusters:
+        - name: tenant-a
+          backup:
+            enabled: true
+            spread: false
+            destination:
+              pvc: {claimName: backups}
+    asserts:
+      - equal:
+          path: spec.schedule.cron
+          value: "0 */6 * * *"
+        documentIndex: 1
+
+  # The policy name heads a chain that ends at a Job name the apiserver caps at
+  # 63: "<policy>-<tick>" names the snapshot, "<snapshot>-snapshot" names its
+  # Job. A cluster name near its own 52-character ceiling would otherwise
+  # produce a policy that stamps snapshots which can never run.
+  - it: keeps the backup policy name short enough for the Jobs it leads to
+    set:
+      clusters:
+        - name: tenant-with-a-name-that-runs-right-up-to-the-limit
+          backup:
+            enabled: true
+            destination:
+              pvc: {claimName: backups}
+    asserts:
+      - matchRegex:
+          path: metadata.name
+          pattern: ^.{1,44}$
+        documentIndex: 1
+      # It still has to point at the cluster, whose own name is untruncated.
+      - equal:
+          path: spec.clusterRef.name
+          value: tenant-with-a-name-that-runs-right-up-to-the-limit
+        documentIndex: 1
+
+  # storageClassName has three distinct states in the CRD and the chart has to
+  # keep them apart: unset (namespace default), a named class, and the empty
+  # string — which means "disable dynamic provisioning, bind only a matching
+  # pre-provisioned PV". A truthiness test collapses the last into the first
+  # and silently hands a cluster asking for a hand-provisioned volume the
+  # default StorageClass instead.
+  - it: leaves storageClassName unset for the namespace default
+    set:
+      clusters:
+        - name: tenant-a
+          replicas: 1
+    asserts:
+      - notExists:
+          path: spec.storage.storageClassName
+
+  - it: passes a named StorageClass through
+    set:
+      clusters:
+        - name: tenant-a
+          replicas: 1
+          storage:
+            storageClassName: san-a
+    asserts:
+      - equal:
+          path: spec.storage.storageClassName
+          value: san-a
+
+  - it: preserves the empty string, which disables dynamic provisioning
+    set:
+      clusters:
+        - name: tenant-a
+          replicas: 1
+          storage:
+            storageClassName: ""
+    asserts:
+      - equal:
+          path: spec.storage.storageClassName
+          value: ""
+
+  # A tenant that wants one array while the defaults declare several has to be
+  # able to opt out, or the defaults become a trap for the single-member case.
+  - it: lets a cluster clear the inherited pools
+    set:
+      clusterDefaults:
+        storage:
+          pools:
+            - {name: a, storageClassName: san-a}
+            - {name: b, storageClassName: san-b}
+            - {name: c, storageClassName: san-c}
+      clusters:
+        - name: tenant-single
+          replicas: 1
+          storage:
+            pools: []
+            storageClassName: local-nvme
+    asserts:
+      - notExists:
+          path: spec.storage.pools
+      - equal:
+          path: spec.storage.storageClassName
+          value: local-nvme

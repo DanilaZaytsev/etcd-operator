@@ -29,6 +29,11 @@ const defragCluster = "etcd"
 // EtcdDefrag is created, and the controller defragments it so the physical
 // DbSize shrinks and the run reaches phase Complete.
 func TestEtcdDefragReclaimsSpace(t *testing.T) {
+	// Each test owns its namespace and cluster names, so the suite is
+	// bound by the slowest test rather than their sum. Kept honest by the
+	// operator running with more than one reconcile worker in e2e — with a
+	// single worker these would just queue behind each other.
+	t.Parallel()
 	ctx := context.Background()
 	ns := "defrag-reclaim-e2e"
 	createDefragNamespace(ctx, t, ns)

@@ -4,3 +4,6 @@
 .gitignore
 *.tgz
 README.md.gotmpl
+# helm-unittest suites. They exercise the chart, they are not part of what it
+# installs, and shipping them bloats the published package.
+tests/

@@ -1,0 +1,77 @@
+{{- /*
+Отказывает EtcdCluster, лежащим на tmpfs (spec.storage.medium=Memory).
+
+Кластеры в памяти — поддерживаемая возможность оператора и законная для
+одноразовых и тестовых нагрузок: член, потерявший под, теряет данные, оператор
+это замечает и заменяет члена, а кластер выживает, пока потеря не унесла кворум.
+Неприемлемым это делает в родительском кластере с control plane
+дочерних кластеров радиус поражения: «одноразовые» данные — это чей-то
+control plane Kubernetes, а одновременная потеря больше чем floor((n-1)/2) членов
+невосстановима, потому что восстанавливаться не из чего.
+
+Это решение уровня всей инсталляции, а не отдельного кластера, поэтому его
+место на границе допуска, а не в чеклисте ревью. Выключено по умолчанию:
+возможность законная, и чарт не должен отключать поддерживаемую
+функциональность другой команды только потому, что эта инсталляция её не хочет.
+
+Совпадает с CREATE и UPDATE. spec.storage.medium неизменяем после создания,
+поэтому UPDATE не может внести его в существующий кластер, — но кластер,
+созданный до установки этой политики, продолжит работать и окажется заблокирован
+для любых дальнейших правок. Это намеренно: существующий кластер на tmpfs в
+инсталляции, которая от них отказалась, должен всплыть, а не тихо остаться.
+
+Требует Kubernetes 1.30+ (ValidatingAdmissionPolicy в GA). Рендерится
+безусловно, а не через .Capabilities, — почему защита никогда не должна
+отсутствовать молча, см. member-deletion-policy.yaml.
+*/ -}}
+{{- if and .Values.operator.enabled (.Values.denyMemoryStorage.enabled) }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "etcd-operator.fullname" . }}-deny-memory-storage
+  labels:
+    {{- include "etcd-operator.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["etcd-operator.cozystack.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["etcdclusters"]
+  validations:
+    - expression: >-
+        !has(object.spec.storage)
+        || !has(object.spec.storage.medium)
+        || object.spec.storage.medium != "Memory"
+      reason: Forbidden
+      messageExpression: >-
+        "EtcdCluster " + object.metadata.name + " requests spec.storage.medium=Memory, which this
+        cluster does not allow: a tmpfs-backed member loses its data with its Pod, and losing more
+        than a minority at once leaves nothing to restore from. Use persistent storage
+        (spec.storage.medium: \"\") with spec.storage.storageClassName or spec.storage.pools."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "etcd-operator.fullname" . }}-deny-memory-storage
+  labels:
+    {{- include "etcd-operator.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "etcd-operator.fullname" . }}-deny-memory-storage
+  validationActions: ["Deny"]
+{{- with .Values.manager.watchNamespaces }}
+  # Ограничено отслеживаемыми неймспейсами, как и привязка защиты от удаления
+  # членов, чтобы релиз, ограниченный неймспейсами, не навязывал свою политику
+  # хранения тем неймспейсам, которыми он не управляет.
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values:
+            {{- range . }}
+            - {{ . | quote }}
+            {{- end }}
+{{- end }}
+{{- end }}

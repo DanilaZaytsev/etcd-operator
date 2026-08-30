@@ -1,140 +1,288 @@
-# Default values for etcd-operator.
+# Значения по умолчанию для etcd-operator.
+#
+# Один чарт, две половины. `operator.*` и всё, что рядом с ним, ставят самого
+# оператора — CRD, RBAC, Deployment менеджера, политики допуска. `clusters`
+# рендерит те EtcdCluster, которыми он управляет.
+#
+# Половины включаются независимо, и это позволяет одному чарту обслуживать две
+# формы установки:
+#
+#   оператор на весь родительский кластер, дочерние кластеры ставятся отдельно
+#   (обычная форма, когда их много: жизненный цикл дочернего кластера не
+#   привязывается к жизненному циклу оператора):
+#     helm install etcd-operator . -n etcd-operator-system
+#     helm install tenant-a      . -n tenant-a \
+#       --set operator.enabled=false --set crds.enabled=false -f tenant-a.yaml
+#
+#   всё одним релизом (проще, когда список кластеров короткий и меняется
+#   вместе с оператором):
+#     helm install etcd-operator . -n etcd-operator-system -f clusters.yaml
+
+operator:
+  # -- Ставить оператора: CRD, RBAC, Deployment менеджера, Service метрик и
+  # политики допуска. Поставьте false для релиза, который только рендерит
+  # `clusters` против оператора, установленного отдельно, — не забудьте заодно
+  # crds.enabled=false, потому что CRD принадлежат релизу оператора.
+  enabled: true
 
 crds:
-  # -- Render the CRDs as part of the release. Templated (not Helm's install-only
-  # crds/ dir) so `helm upgrade` keeps them current with the API types.
+  # -- Рендерить CRD в составе релиза. Именно шаблонами, а не через каталог
+  # crds/ (который Helm применяет только при установке), чтобы `helm upgrade`
+  # держал их в соответствии с типами API.
   enabled: true
-  # -- Annotate CRDs with helm.sh/resource-policy: keep so `helm uninstall` leaves
-  # them in place. Strongly recommended: deleting the CRDs cascade-deletes every
-  # EtcdCluster and its data.
+  # -- Помечать CRD аннотацией helm.sh/resource-policy: keep, чтобы
+  # `helm uninstall` оставлял их на месте. Настоятельно рекомендуется: удаление
+  # CRD каскадом удаляет каждый EtcdCluster вместе с его данными.
   keep: true
 
-# Deny DELETE on EtcdMember objects at the API boundary, except for the
-# operator itself, the garbage collector (so a deleted EtcdCluster still
-# cascades) and the namespace controller (so namespace deletion does not hang).
+# Запрет DELETE на объектах EtcdMember на границе API — всем, кроме самого
+# оператора, сборщика мусора (чтобы удаление EtcdCluster по-прежнему
+# каскадировало) и контроллера неймспейсов (чтобы удаление неймспейса не
+# зависало).
 #
-# Deleting an EtcdMember by hand is not a recoverable mistake: its data PVC is
-# controller-owned by the member, so the volume goes with it, while the
-# member's finalizer removes the member from etcd on the way out. The docs have
-# always said these objects are the operator's; this enforces it.
+# Удаление EtcdMember руками — невосстановимая ошибка: его PVC с данными
+# принадлежит члену как контроллеру, поэтому том уходит вместе с ним, а
+# финализатор члена по пути удаляет его из etcd. Документация всегда говорила,
+# что эти объекты принадлежат оператору; здесь это становится обязательным.
 #
-# Break-glass without uninstalling: annotate the member with
-# etcd-operator.cozystack.io/allow-deletion=true, then delete it.
+# Разбить стекло, не удаляя политику: пометить члена аннотацией
+# etcd-operator.cozystack.io/allow-deletion=true и затем удалить.
 #
-# Requires Kubernetes 1.30+ (ValidatingAdmissionPolicy GA). Set to false on
-# older apiservers.
+# Требует Kubernetes 1.30+ (ValidatingAdmissionPolicy в GA). На более старых
+# apiserver поставьте false.
 #
-# Scope: with manager.watchNamespaces set, the binding is scoped to those
-# namespaces so scoped releases coexist. Cluster-wide (watchNamespaces empty)
-# the install must be a singleton — a second cluster-wide release would deny
-# this operator's own scale-down/replacement (admission is deny-wins).
+# Область действия: если задан manager.watchNamespaces, привязка ограничивается
+# этими неймспейсами, поэтому несколько ограниченных релизов уживаются рядом.
+# Установка на весь кластер (watchNamespaces пуст) обязана быть единственной:
+# второй общекластерный релиз запретил бы этому оператору его собственные
+# scale-down и замену членов, потому что при допуске побеждает запрет.
 memberDeletionProtection:
-  # -- Install the ValidatingAdmissionPolicy protecting EtcdMember objects.
+  # -- Ставить ValidatingAdmissionPolicy, защищающую объекты EtcdMember.
   enabled: true
-  # -- Extra usernames allowed to delete EtcdMembers, in apiserver form
-  # (e.g. "system:serviceaccount:<ns>:<sa>" or a user name). For platforms
-  # whose own controllers legitimately reap these objects.
+  # -- Дополнительные пользователи, которым разрешено удалять EtcdMember, в
+  # форме apiserver (например "system:serviceaccount:<ns>:<sa>" или имя
+  # пользователя). Для платформ, чьи собственные контроллеры законно убирают
+  # эти объекты.
   additionalAllowedUsers: []
 
-# -- Render a Namespace object. Off by default (real `helm install` uses
-# --create-namespace); build-dist-manifests turns it on so the rendered
-# kubectl-apply manifest is self-contained.
+# Отказ на границе API в EtcdCluster, лежащих на tmpfs
+# (spec.storage.medium=Memory).
+#
+# Кластеры в памяти — поддерживаемая возможность, законная для одноразовых
+# нагрузок. Она неуместна там, где «одноразовые» данные — это control plane
+# дочернего кластера: член теряет данные вместе со своим подом, а
+# потеря больше чем меньшинства разом не оставляет ничего, из чего
+# восстанавливаться. Включайте там, где решено, что каждый кластер живёт на
+# постоянном хранилище: это делает решение проверяемым, а не соглашением на
+# ревью.
+#
+# Требует Kubernetes 1.30+ (ValidatingAdmissionPolicy в GA).
+denyMemoryStorage:
+  # -- Ставить ValidatingAdmissionPolicy, отказывающую кластерам в памяти.
+  enabled: false
+
+# -- Рендерить объект Namespace. Выключено по умолчанию (настоящий
+# `helm install` использует --create-namespace); build-dist-manifests включает
+# это, чтобы отрендеренный манифест для kubectl apply был самодостаточным.
 namespace:
   create: false
 
 metrics:
   serviceMonitor:
-    # -- Create a prometheus-operator ServiceMonitor for the metrics endpoint.
-    # Requires the monitoring.coreos.com CRDs and kubeRbacProxy.enabled.
+    # -- Создавать ServiceMonitor prometheus-operator для эндпоинта метрик.
+    # Требует установленных CRD monitoring.coreos.com. Работает в обоих режимах
+    # метрик: снимает либо https-порт kube-rbac-proxy, либо открытый порт
+    # менеджера, когда прокси выключен.
     enabled: false
+    # -- Дополнительные метки для ServiceMonitor. Prometheus-операторы обычно
+    # разворачиваются с serviceMonitorSelector (у kube-prometheus-stack это по
+    # умолчанию `release: <имя>`); без подходящей метки объект создастся и
+    # молча никогда не будет выбран.
+    additionalLabels: {}
+    # -- Интервал опроса. Пусто — оставить умолчание Prometheus.
+    interval: ""
+    # -- Таймаут опроса. Пусто — оставить умолчание Prometheus.
+    scrapeTimeout: ""
+    # -- Не проверять TLS при опросе kube-rbac-proxy. Его сертификат по
+    # умолчанию самоподписанный, поэтому проверка не прошла бы; ставьте false,
+    # только если закрываете прокси сертификатом, которому Prometheus доверяет.
+    # Игнорируется при выключенном kubeRbacProxy — тот эндпоинт по чистому http.
+    insecureSkipVerify: true
+    # -- Релейблинг, применяемый до опроса.
+    relabelings: []
+    # -- Релейблинг, применяемый к снятым метрикам.
+    metricRelabelings: []
+
+  prometheusRule:
+    # -- Создавать PrometheusRule с алертами по кластерам и снапшотам.
+    # Требует установленных CRD monitoring.coreos.com. Метрики без алертов
+    # никого не будят: отсутствие бэкапов и «кластер на одного члена меньше»
+    # незаметны ровно до аварии.
+    enabled: false
+    # -- Дополнительные метки. Как и у ServiceMonitor, prometheus-оператор
+    # выбирает правила по ruleSelector — без подходящей метки объект
+    # создастся и молча не будет подхвачен.
+    additionalLabels: {}
+    # -- Возраст последнего успешного снапшота, после которого поднимается
+    # алерт. Умолчание — сутки; ставьте примерно вдвое больше периода вашей
+    # EtcdSnapshotPolicy, чтобы один пропущенный запуск не будил дежурного.
+    snapshotMaxAgeSeconds: 86400
+    # -- Сколько ждать, прежде чем считать кластер без единого успешного
+    # снапшота проблемой. Даёт свежесозданному кластеру время снять первый.
+    neverSnapshottedFor: 1h
 
 image:
-  # -- Operator image repository. The published image is ghcr.io/cozystack/etcd-operator.
+  # -- Репозиторий образа оператора. Публикуемый образ — ghcr.io/cozystack/etcd-operator.
   repository: ghcr.io/cozystack/etcd-operator
-  # -- Image tag. Defaults to the chart's appVersion (set to the release tag by the pipeline).
+  # -- Тег образа. По умолчанию берётся appVersion чарта (конвейер выставляет его в тег релиза).
   tag: ""
-  # -- Image pull policy.
+  # -- Политика загрузки образа.
   pullPolicy: IfNotPresent
 
-# Operator-wide default for the etcd image that runs in member Pods (NOT the
-# operator's own image above). Set the repository here to point every cluster
-# at an air-gapped mirror once. Per-cluster pull credentials go on an
-# EtcdCluster's spec.imagePullSecrets (a Secret in the cluster's own
-# namespace), not here.
+# Общеоператорское умолчание для образа etcd, который работает в подах членов
+# (НЕ образ самого оператора выше). Задайте здесь репозиторий, чтобы один раз
+# направить все кластеры на зеркало в закрытом контуре. Учётные данные для
+# загрузки образа задаются на конкретном EtcdCluster в spec.imagePullSecrets
+# (Secret в неймспейсе самого кластера), а не здесь.
 etcdImage:
-  # -- Default etcd image repository (registry host + path, no tag) for member
-  # Pods. Repoint at an air-gapped mirror, e.g. registry.internal/mirror/etcd.
-  # The chart always wires this into the operator's ETCD_IMAGE_REPOSITORY.
+  # -- Репозиторий образа etcd по умолчанию (хост реестра и путь, без тега) для
+  # подов членов. Перенаправьте на зеркало в закрытом контуре, например
+  # registry.internal/mirror/etcd. Чарт всегда прописывает это в
+  # ETCD_IMAGE_REPOSITORY оператора.
   #
-  # Only the repository is configurable; the tag is always derived from each
-  # cluster's spec.version as "v<version>" (e.g. v3.6.11). There is no
-  # per-cluster repository/tag override — the operator keys all
-  # version-dependent behaviour off spec.version, so a separate tag could
-  # silently disagree with it.
+  # Настраивается только репозиторий; тег всегда выводится из spec.version
+  # каждого кластера как "v<версия>" (например v3.6.11). Переопределения
+  # репозитория или тега на кластер нет: оператор строит всё зависящее от
+  # версии поведение на spec.version, и отдельный тег мог бы молча с ним
+  # разойтись.
   #
-  # Keep this in sync with the controllers.EtcdImage constant — the operator's
-  # built-in fallback used only when this env is unset (outside the chart). The
-  # chart always sets ETCD_IMAGE_REPOSITORY, so a drift between the two is
-  # harmless here, but bump both together to keep the no-chart default honest.
+  # Держите в согласии с константой controllers.EtcdImage — встроенным запасным
+  # значением оператора, которое используется, только если эта переменная
+  # окружения не задана (то есть вне чарта). Чарт всегда задаёт
+  # ETCD_IMAGE_REPOSITORY, так что расхождение здесь безвредно, но меняйте оба
+  # вместе, чтобы умолчание без чарта оставалось честным.
   repository: quay.io/coreos/etcd
 
-# -- Number of operator replicas (leader election picks the active one).
+# -- Число реплик оператора (лидерские выборы выбирают активную). Свыше 1
+# резервные только принимают на себя работу при отказе — сами они ничего не
+# делают, — так что это покупает время переключения, а не пропускную
+# способность. За пропускной способностью — в manager.maxConcurrentReconciles.
 replicaCount: 1
 
-# -- Image pull secrets for private registries.
+# -- PriorityClass для пода оператора. Оператор — часть control plane для
+# каждого EtcdCluster в кластере, поэтому на ноде под давлением он не должен
+# выселяться одним из первых. "system-cluster-critical" — встроенный класс ровно
+# для этого; поставьте "", чтобы оставить обычный приоритет.
+priorityClassName: system-cluster-critical
+
+podDisruptionBudget:
+  # -- Создавать PodDisruptionBudget для оператора. Осмысленно только при
+  # replicaCount > 1: бюджет над единственной репликой либо не делает ничего
+  # (minAvailable: 0), либо блокирует любой drain её ноды (minAvailable: 1).
+  enabled: false
+  # -- Минимум подов оператора, которые должны оставаться доступными при
+  # добровольном вытеснении.
+  minAvailable: 1
+
+# -- Разносить реплики оператора по нодам. Применяется только при
+# replicaCount > 1 и незаданном .Values.affinity (явная affinity побеждает).
+# Две реплики на одной ноде не дают никакого переключения, когда нода уходит.
+defaultAntiAffinity: true
+
+# -- Секреты для загрузки образов из приватных реестров.
 imagePullSecrets: []
 
-# -- Override the chart name portion of resource names.
+# -- Переопределить часть имени ресурсов, взятую из имени чарта.
 nameOverride: ""
-# -- Override the full resource-name prefix.
+# -- Переопределить префикс имён ресурсов целиком.
 fullnameOverride: ""
 
 serviceAccount:
-  # -- Create the operator ServiceAccount.
+  # -- Создавать ServiceAccount оператора.
   create: true
-  # -- Name of an existing ServiceAccount to use when create is false. Required
-  # in that case — the operator's ClusterRole is bound to this name.
+  # -- Имя существующего ServiceAccount, когда create = false. В этом случае
+  # обязательно: ClusterRole оператора привязывается именно к этому имени.
   name: ""
-  # -- Extra annotations for the ServiceAccount.
+  # -- Дополнительные аннотации для ServiceAccount.
   annotations: {}
 
-# -- Extra annotations for the operator Pod.
+# -- Дополнительные аннотации для пода оператора.
 podAnnotations: {}
-# -- Extra labels for the operator Pod.
+# -- Дополнительные метки для пода оператора.
 podLabels: {}
-# -- Node selector for the operator Pod.
+# -- Селектор нод для пода оператора.
 nodeSelector: {}
-# -- Tolerations for the operator Pod.
+# -- Tolerations для пода оператора.
 tolerations: []
-# -- Affinity for the operator Pod.
+# -- Affinity для пода оператора.
 affinity: {}
 
 manager:
-  # -- Namespaces the manager watches (WATCH_NAMESPACE env var). Empty = all.
+  # -- Неймспейсы, за которыми следит менеджер (переменная окружения
+  # WATCH_NAMESPACE). Пусто — за всеми.
   watchNamespaces: []
-  # -- Resource requests/limits for the manager container.
+  # -- DNS-суффикс кластера (--cluster-domain), например "cozy.local". Пусто —
+  # автоопределение по списку search из /etc/resolv.conf пода оператора, с
+  # откатом на "cluster.local". Задайте явно, если оператор работает с
+  # hostNetwork или dnsPolicy:None (искать в search тогда нечего), а также на
+  # любом кластере, чей суффикс отличается от cluster.local: значение попадает в
+  # SAN сертификатов cert-manager, которые выпускает оператор, поэтому неверный
+  # суффикс ломает проверку peer TLS на кластерах с TLS.
+  clusterDomain: ""
+  # -- Профиль seccomp для пода оператора. RuntimeDefault требуется профилем
+  # PodSecurity `restricted`. Поставьте {type: Localhost, localhostProfile:
+  # <путь>}, чтобы закрепить профиль, или `null`, чтобы убрать поле совсем, —
+  # `{}` его НЕ уберёт, потому что Helm сливает словари, а не заменяет их.
+  seccompProfile:
+    type: RuntimeDefault
+  # -- Сколько EtcdCluster (и EtcdMember) оператор обрабатывает одновременно
+  # (--max-concurrent-reconciles). Почти каждый reconcile делает RPC к etcd с
+  # dial timeout, поэтому при умолчании в 1 один недоступный кластер
+  # задерживает за собой все остальные. На родительском кластере с большим
+  # числом EtcdCluster это значение стоит поднять. Цена — больше одновременных
+  # подключений к etcd и больше трафика к apiserver.
+  maxConcurrentReconciles: 1
+  # -- Запросы и лимиты ресурсов для контейнера менеджера.
+  #
+  # Лимит памяти — первое, что стоит пересмотреть, когда оператор следит за
+  # многими кластерами. В кэше лежат EtcdCluster, EtcdMember, поды и PVC членов,
+  # Service и PDB — отобранные по метке, то есть только собственные объекты
+  # оператора, но объём всё равно растёт с числом кластеров, а не с тем,
+  # насколько они нагружены. Родительский кластер со ~160 трёхчленными
+  # кластерами — это примерно 2000 объектов в кэше; 256Mi покрывает это с
+  # запасом. Смотрите на container_memory_working_set_bytes и поднимайте лимит
+  # (или разделяйте оператора через manager.watchNamespaces), а не давайте ему
+  # уходить в цикл OOMKill.
+  #
+  # Запрос CPU важен по другой причине: это гарантированная доля оператора,
+  # когда за ноду идёт конкуренция, а этот процесс — часть control plane для
+  # каждого EtcdCluster в кластере. Умолчание скаффолда в 10m морит его голодом
+  # ровно тогда, когда кластер занят. За несколькими десятками кластеров
+  # поднимайте и запрос, и лимит: массовое событие (отказ массива, при котором
+  # разом переcогласуются все члены) — это всплеск нагрузки на CPU, а потолок в
+  # 500m душит восстановление. Разобранный профиль — в docs/installation.md.
   resources:
     limits:
       cpu: 500m
-      memory: 128Mi
+      memory: 256Mi
     requests:
-      cpu: 10m
+      cpu: 100m
       memory: 64Mi
 
-# kube-rbac-proxy fronts the manager's /metrics endpoint with SubjectAccessReview
-# authz. Disable to expose metrics without the proxy (the manager then binds
-# metrics on :8080 directly).
+# kube-rbac-proxy закрывает эндпоинт /metrics менеджера авторизацией через
+# SubjectAccessReview. Выключите, чтобы отдавать метрики без прокси (менеджер
+# тогда слушает метрики прямо на :8080).
 kubeRbacProxy:
-  # -- Run the kube-rbac-proxy metrics sidecar.
+  # -- Запускать sidecar-прокси метрик kube-rbac-proxy.
   enabled: true
   image:
-    # -- kube-rbac-proxy image repository (upstream's GitHub org; the old gcr.io/kubebuilder one is gone).
+    # -- Репозиторий образа kube-rbac-proxy (организация апстрима на GitHub; старого gcr.io/kubebuilder больше нет).
     repository: ghcr.io/kube-rbac-proxy/kube-rbac-proxy
-    # -- kube-rbac-proxy image tag.
+    # -- Тег образа kube-rbac-proxy.
     tag: v0.22.0
-    # -- kube-rbac-proxy image pull policy.
+    # -- Политика загрузки образа kube-rbac-proxy.
     pullPolicy: IfNotPresent
-  # -- Resource requests/limits for the proxy container.
+  # -- Запросы и лимиты ресурсов для контейнера прокси.
   resources:
     limits:
       cpu: 500m
@@ -144,5 +292,313 @@ kubeRbacProxy:
       memory: 64Mi
 
 metricsService:
-  # -- Port the metrics Service exposes (proxy https port).
+  # -- Порт, который отдаёт Service метрик. При включённом kubeRbacProxy это
+  # https-порт прокси, без него — открытый порт метрик менеджера.
   port: 8443
+
+# ── Кластеры, которыми управляет этот оператор ──────────────────────────────
+
+# -- Умолчания, применяемые к каждой записи в `clusters` ниже. Запись
+# переопределяет то, что называет, и наследует остальное, поэтому 160
+# дочерние кластеры могут делить один профиль настроек и различаться только там, где
+# они действительно различаются.
+clusterDefaults:
+
+  # -- Число членов etcd. Должно быть нечётным: чётное добавляет члена, который
+  # участвует в голосовании, но не увеличивает число переживаемых отказов
+  # (4 члена переживают 1 отказ — столько же, сколько 3, при вдвое более широком
+  # кворуме записи). 0 паркует кластер.
+  #
+  # 1 поддерживается и разумно для дочернего кластера, который переживёт простой, но это
+  # другой эксплуатационный контракт, а не просто кластер поменьше:
+  #
+  #   - его PodDisruptionBudget навсегда блокирует drain ноды, на которой он
+  #     стоит (minAvailable 1 при одном голосующем), поэтому обслуживание ноды
+  #     означает либо предварительное масштабирование до 3, либо согласие на
+  #     простой;
+  #   - оператор его не починит: замена при crash-loop гейтится кворумом, а у
+  #     одного члена кворума, которым можно гейтить, нет, — поэтому потерянный
+  #     data-dir восстанавливается только из снапшота;
+  #   - дефрагментация останавливает весь кластер, потому что передать лидерство
+  #     некому.
+  #
+  # Для кластера с одной репликой `backup.enabled` ниже — это механизм
+  # восстановления, а не дополнение. См. docs/operations.md.
+  replicas: 3
+
+  # -- Версия etcd, голым semver (тег образа выводится как "v<версия>").
+  version: "3.6.11"
+
+  storage:
+    # -- Запрашиваемый объём на члена. Только вверх.
+    size: 10Gi
+
+    # -- StorageClass для PVC каждого члена. Взаимоисключимо с `pools`.
+    #
+    # `null` (по умолчанию) означает StorageClass по умолчанию для неймспейса.
+    # Пустая строка — НЕ то же самое: так CRD полностью отключает динамический
+    # провижининг и привязывается только к подходящему заранее созданному PV.
+    # Ставьте её осознанно, для томов, нарезанных руками.
+    storageClassName: null
+
+    # -- Разносить членов по нескольким хранилищам, по одному члену на пул,
+    # чтобы массив хранения был доменом отказа, а не единой точкой отказа. При
+    # трёх пулах и трёх репликах PVC каждого члена оказывается на своём массиве:
+    # потеря массива стоит одного члена, а не кворума.
+    #
+    # Взаимоисключимо со storageClassName выше. Когда членов больше, чем пулов,
+    # держите число реплик кратным числу пулов — иначе один массив держит больше
+    # членов, чем остальные, и может унести кворум с собой. Членов меньше, чем
+    # пулов, — нормально и ожидаемо: одночленный кластер, объявивший три
+    # массива, ставит своего члена на первый и оставляет остальные под будущее
+    # масштабирование, что и правильно, раз список после установки можно только
+    # дополнять.
+    #
+    # Только дополнение после установки: новый массив добавить можно, а
+    # существующий пул нельзя ни удалить, ни перенаправить — его PVC уже
+    # привязаны.
+    #
+    #   pools:
+    #     - name: array-a
+    #       storageClassName: san-a
+    #     - name: array-b
+    #       storageClassName: san-b
+    #     - name: array-c
+    #       storageClassName: san-c
+    #       # Необязательные переопределения на уровне пула:
+    #       # size: 40Gi
+    #       # affinity: {}       # если массив доступен не со всех нод
+    #       # disabled: false    # кордон: НОВЫХ членов сюда не ставить
+    pools: []
+
+  # -- Запросы и лимиты ресурсов для контейнера etcd. Встроенный запас самого
+  # оператора (100m/128Mi запросов, без лимитов) годится, чтобы попробовать, но
+  # не для продакшена — задайте их.
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+
+  # Настройки сервера etcd. Каждое поле необязательно; незаданное означает
+  # умолчание самого etcd.
+  options:
+    # -- --quota-backend-bytes: размер бэкенда, после которого поднимается
+    # общекластерная тревога NOSPACE. Практический максимум etcd — 8 ГиБ.
+    quotaBackendBytes: null
+    # -- --auto-compaction-mode: "periodic" или "revision".
+    autoCompactionMode: periodic
+    # -- --auto-compaction-retention. В режиме periodic — длительность ("1h").
+    autoCompactionRetention: "1h"
+    # -- --snapshot-count: число записей raft до внутреннего снапшота (не имеет
+    # отношения к бэкапам EtcdSnapshot).
+    snapshotCount: null
+
+    # Тайминги консенсуса. Умолчания etcd (100 мс / 1000 мс) рассчитаны на
+    # локальный SSD и RTT около миллисекунды. На сетевом хранилище fsync может
+    # быть на порядок медленнее, раунд heartbeat ждёт за ним, последователи
+    # объявляют лидера мёртвым, и кластер переизбирает лидера под обычной
+    # нагрузкой на запись — не оставляя следа ни в одном логе. Типичные значения
+    # на массиве — 250–500 мс при election timeout в 5 раз больше.
+    #
+    # Отношение 5:1 требует apiserver, и ловушку он ловит тоже: если поднять
+    # ТОЛЬКО heartbeat, election timeout останется на умолчании в 1000 мс, а это
+    # уже ниже отношения для любого heartbeat выше 200 мс. Задавайте оба или ни
+    # одного.
+    # -- --heartbeat-interval, в миллисекундах.
+    heartbeatIntervalMilliseconds: null
+    # -- --election-timeout, в миллисекундах. Должен быть >= 5x heartbeat.
+    electionTimeoutMilliseconds: null
+
+    # -- --max-wals: сколько файлов WAL хранить. Ограничивает размер data-dir в
+    # установившемся режиме; снижение сокращает окно, в котором член может
+    # восстановиться по собственному WAL, а не полной пересинхронизацией от
+    # лидера.
+    maxWals: null
+    # -- --max-snapshots: сколько файлов raft-снапшотов хранить.
+    maxSnapshots: null
+    # -- --backend-batch-limit: сколько операций до коммита бэкенда. Вместе с
+    # интервалом ниже меняет задержку коммита на число fsync — основной рычаг для
+    # кластера, у которого длительность коммита бэкенда определяется массивом.
+    backendBatchLimit: null
+    # -- --backend-batch-interval, в миллисекундах.
+    backendBatchIntervalMilliseconds: null
+
+  # -- Anti-affinity подов для членов. Оператор её не проставляет, а задать
+  # стоит: три члена на одной ноде — это три члена, потерянных вместе с ней.
+  # `soft` — предпочтительная anti-affinity по имени хоста, `hard` —
+  # обязательная, `none` оставляет поле незаданным (для чего-то другого
+  # используйте `affinity` ниже).
+  antiAffinity: soft
+
+  # -- Полная affinity для подов членов, передаётся как есть. Перекрывает
+  # antiAffinity выше, когда задана.
+  affinity: {}
+
+  # -- Ограничения разноса по топологии для подов членов, передаются как есть.
+  # Через них разносят по зонам или стойкам, а не только по нодам.
+  topologySpreadConstraints: []
+
+  # -- Дополнительные метки и аннотации, которые сливаются на каждый объект,
+  # создаваемый оператором для этого кластера (поды членов, PVC, Service, PDB,
+  # объекты EtcdMember). Ключи, принадлежащие оператору, всегда побеждают при
+  # столкновении.
+  additionalMetadata: {}
+  #   labels: {}
+  #   annotations: {}
+
+  # -- Сколько оператор тратит на попытки достичь заданного состояния, прежде
+  # чем принять вместо него то, что говорит spec. В секундах.
+  progressDeadlineSeconds: 600
+
+  # -- Секреты для загрузки образа etcd, в неймспейсе этого кластера.
+  imagePullSecrets: []
+
+  # TLS. Всё поддерево неизменяемо после создания кластера — добавить его или
+  # убрать позже означает удалить и создать кластер заново, так что решайте до
+  # первой установки.
+  tls:
+    # -- Своя или управляемая cert-manager конфигурация TLS, передаётся в
+    # spec.tls как есть. Пусто означает открытый обмен и на клиентской, и на
+    # peer-соединений без аутентификации.
+    spec: {}
+
+  # Аутентификация. Тоже неизменяема после создания и требует tls.spec.client.
+  auth:
+    # -- Включить аутентификацию внутри etcd (единственный пользователь `root`).
+    enabled: false
+    # -- Secret в этом неймспейсе с паролем root под ключом `password`.
+    # Обязателен при enabled. Берегите его: снапшот etcd хранит bcrypt-хэш
+    # пароля, поэтому восстановление проходит проверку только с исходным
+    # паролем.
+    rootCredentialsSecretRef: ""
+
+  # Восстановление при бутстрапе. Читается только при первом бутстрапе и после
+  # него неизменяемо — это способ пересоздать кластер из снапшота при аварийном
+  # восстановлении, а не то, что оставляют на работающем кластере.
+  restore:
+    # -- Восстановить этот кластер из существующего снапшота при первом
+    # бутстрапе.
+    enabled: false
+    # -- Ожидаемая контрольная сумма снапшота в виде "sha256:<hex>" — то
+    # значение, которое EtcdSnapshot записывает в status.artifact.checksum.
+    # Настоятельно рекомендуется: снапшот etcd не несёт собственного хэша,
+    # поэтому восстановление идёт с --skip-hash-check, и это единственная
+    # проверка целостности на всём пути. Иначе повреждённый снапшот даст
+    # data-dir, на котором etcd спокойно стартует.
+    checksum: ""
+    # -- Откуда читать снапшот. Для S3 ключ — ТОЧНЫЙ ключ объекта (не префикс),
+    # для PVC subPath — точный путь к файлу. Передаётся в
+    # spec.bootstrap.restore.source как есть.
+    #   source:
+    #     s3:
+    #       endpoint: https://s3.example.com
+    #       bucket: etcd-snapshots
+    #       key: my-etcd/my-etcd-backup-29558640.db
+    #       region: us-east-1
+    #       forcePathStyle: true
+    #       credentialsSecretRef: {name: s3-creds}
+    source: {}
+
+  # Регулярные бэкапы (EtcdSnapshotPolicy). Выключены по умолчанию только
+  # потому, что им нужны хранилище и учётные данные; продакшен-кластеру их
+  # стоит включить. Отсутствие бэкапов незаметно ровно до восстановления.
+  backup:
+    # -- Создавать EtcdSnapshotPolicy для этого кластера.
+    enabled: false
+    # -- Расписание cron (пять полей; сокращения вроде @daily не принимаются).
+    schedule: "0 */6 * * *"
+    # -- Разносить минуту по часу, выводя её из неймспейса и имени кластера.
+    #
+    # Иначе каждый дочерний кластер, написанный из одного блока умолчаний, снимает
+    # снапшот в одну и ту же минуту — на родительском кластере с сотней с лишним
+    # кластеров это сотня одновременных потоков снапшотов в одно хранилище на
+    # каждом тике. Смещение устойчиво между обновлениями (перерендер не сдвигает
+    # окно бэкапа кластера) и различается между кластерами, при этом числа
+    # никто не выбирает руками.
+    #
+    # Переписывается только простая числовая минута: выражение с шагом или
+    # диапазоном остаётся ровно таким, как написано, потому что его разнос
+    # изменил бы саму заявку.
+    spread: true
+    # -- Зона IANA, в которой читается расписание. Пусто означает UTC.
+    timezone: ""
+    # -- Приостановить создание снапшотов, не удаляя политику.
+    suspend: false
+    # -- Что делает наступивший тик, пока предыдущий снапшот ещё выполняется:
+    # Forbid или Allow.
+    concurrencyPolicy: Forbid
+    # -- Насколько поздно ещё можно запустить пропущенный тик, в секундах. Пусто
+    # означает отсутствие предельного срока (самый недавний пропущенный тик всё
+    # равно запускается только один раз).
+    startingDeadlineSeconds: null
+    # -- Сколько успешных EtcdSnapshot хранить. Ограничивается отдельно от
+    # отказов, чтобы серия отказов не вытеснила успешные снапшоты, которые нужны
+    # для восстановления.
+    successfulHistoryLimit: 10
+    # -- Сколько неудачных EtcdSnapshot хранить.
+    failedHistoryLimit: 3
+    # -- Удалять ли сохранённый снапшот вместе с объектом EtcdSnapshot при
+    # вычистке истории.
+    #
+    # Удаляется ровно тот объект, который каждый удаляемый снапшот записал в
+    # status.artifact, — никогда не перечисление содержимого хранилища. Выключено
+    # по умолчанию: удаление бэкапов не должно начинаться оттого, что сработало
+    # умолчание лимита хранения.
+    deleteArtifactOnPrune: false
+    # -- Куда складывать снапшоты. Для S3 ключ — ПРЕФИКС; каждый запуск
+    # дописывает собственное имя, поэтому запуски не перезаписывают друг друга.
+    # Передаётся в spec.destination как есть.
+    #   destination:
+    #     s3:
+    #       endpoint: https://s3.example.com
+    #       bucket: etcd-snapshots
+    #       key: my-etcd/
+    #       region: us-east-1
+    #       forcePathStyle: true
+    #       credentialsSecretRef: {name: s3-creds}
+    destination: {}
+
+# -- Сохранять отрендеренные EtcdCluster при удалении релиза
+# (helm.sh/resource-policy: keep). `null` решает по форме релиза, и это почти
+# всегда то, что нужно:
+#
+#   operator.enabled=true  -> сохранять. Удаление релиза означает «убрать
+#                             оператора», и уносить вместе с ним etcd каждого
+#                             кластера вместе с его PVC — ничьё намерение.
+#   operator.enabled=false -> не сохранять. Это форма релиза на дочерний кластер, где
+#                             кластер И ЕСТЬ релиз; сохранение оставило бы релиз
+#                             неспособным управлять единственным объектом, ради
+#                             которого он существует.
+#
+# Явные true или false перекрывают это решение. Учтите: там, где кластеры
+# сохраняются, удаление записи из `clusters` при `helm upgrade` тоже НЕ удалит
+# кластер — Helm его пропустит, и вывод кластера становится осознанным
+# `kubectl delete etcdcluster`.
+clustersKeepOnUninstall: null
+
+# -- Какие EtcdCluster создавать. По умолчанию пусто: оператор полезен сам по
+# себе, а чарт, придумавший кластер при установке, был бы неожиданностью.
+#
+# Каждой записи нужно `name`, и она может переопределить что угодно из
+# clusterDefaults:
+#
+#   clusters:
+#     - name: tenant-a                     # 3 члена, по одному на массив
+#       storage:
+#         pools:
+#           - {name: array-a, storageClassName: san-a}
+#           - {name: array-b, storageClassName: san-b}
+#           - {name: array-c, storageClassName: san-c}
+#       backup:
+#         enabled: true
+#         destination:
+#           s3:
+#             endpoint: https://s3.example.com
+#             bucket: etcd-snapshots
+#             key: tenant-a/
+#             credentialsSecretRef: {name: s3-creds}
+#     - name: tenant-b                     # один член, простой допустим
+#       replicas: 1
+clusters: []

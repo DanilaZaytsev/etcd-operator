@@ -1,0 +1,102 @@
+suite: Memory-backed clusters can be refused at admission
+
+# A deployment that has decided every EtcdCluster lives on persistent storage
+# should be able to enforce that, rather than rely on reviewers noticing. What
+# matters here is that the guard is off unless asked for, that it denies rather
+# than warns, and that a namespace-scoped release does not impose its storage
+# policy on namespaces it does not manage.
+
+templates:
+  - memory-storage-policy.yaml
+
+tests:
+  - it: is not installed by default
+    # Memory-backed clusters are a legitimate supported feature; a chart should
+    # not disable another team's functionality because this deployment does not
+    # want it.
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: installs a policy and a binding when enabled
+    set:
+      denyMemoryStorage.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 2
+      - containsDocument:
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicy
+          name: RELEASE-NAME-etcd-operator-deny-memory-storage
+        documentIndex: 0
+      - equal:
+          path: spec.policyName
+          value: RELEASE-NAME-etcd-operator-deny-memory-storage
+        documentIndex: 1
+
+  - it: denies rather than warns, and fails closed
+    set:
+      denyMemoryStorage.enabled: true
+    asserts:
+      - equal:
+          path: spec.validationActions
+          value: ["Deny"]
+        documentSelector:
+          path: kind
+          value: ValidatingAdmissionPolicyBinding
+      - equal:
+          path: spec.failurePolicy
+          value: Fail
+        documentSelector:
+          path: kind
+          value: ValidatingAdmissionPolicy
+
+  # UPDATE is matched as well as CREATE: spec.storage.medium is immutable, so
+  # this cannot block a legitimate edit, but a cluster created before the policy
+  # existed should surface rather than persist quietly.
+  - it: matches create and update on etcdclusters
+    set:
+      denyMemoryStorage.enabled: true
+    documentSelector:
+      path: kind
+      value: ValidatingAdmissionPolicy
+    asserts:
+      - equal:
+          path: spec.matchConstraints.resourceRules[0].operations
+          value: ["CREATE", "UPDATE"]
+      - equal:
+          path: spec.matchConstraints.resourceRules[0].resources
+          value: ["etcdclusters"]
+
+  - it: points the user at persistent storage instead
+    set:
+      denyMemoryStorage.enabled: true
+    documentSelector:
+      path: kind
+      value: ValidatingAdmissionPolicy
+    asserts:
+      - matchRegex:
+          path: spec.validations[0].messageExpression
+          pattern: spec\.storage\.pools
+
+  - it: scopes the binding to the watched namespaces when set
+    set:
+      denyMemoryStorage.enabled: true
+      manager.watchNamespaces: [team-a, team-b]
+    documentSelector:
+      path: kind
+      value: ValidatingAdmissionPolicyBinding
+    asserts:
+      - equal:
+          path: spec.matchResources.namespaceSelector.matchExpressions[0].values
+          value: [team-a, team-b]
+
+  - it: binds cluster-wide when the operator watches all namespaces
+    set:
+      denyMemoryStorage.enabled: true
+    documentSelector:
+      path: kind
+      value: ValidatingAdmissionPolicyBinding
+    asserts:
+      - notExists:
+          path: spec.matchResources

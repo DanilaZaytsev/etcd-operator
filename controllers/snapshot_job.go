@@ -71,9 +71,15 @@ const (
 	// turns into a terminal EtcdSnapshot failure. 30 min is generous for a large
 	// snapshot + upload while still bounding a true hang.
 	snapshotJobActiveDeadlineSeconds int64 = 1800
-	snapshotCAMountPath                    = "/etc/etcd/pki/ca"
-	snapshotClientMountPath                = "/etc/etcd/pki/client"
-	snapshotPVCMountPath                   = "/snapshot/data"
+	// A prune is one DeleteObject (or one unlink). It needs neither the
+	// snapshot Job's retry budget nor its half-hour deadline: a prune that is
+	// still going after two minutes is not slow, it is pointed at something
+	// unreachable, and history GC will try again on the next reconcile anyway.
+	pruneJobBackoffLim            int32 = 2
+	pruneJobActiveDeadlineSeconds int64 = 120
+	snapshotCAMountPath                 = "/etc/etcd/pki/ca"
+	snapshotClientMountPath             = "/etc/etcd/pki/client"
+	snapshotPVCMountPath                = "/snapshot/data"
 )
 
 // snapshotJobName is the deterministic, owned Job name for an EtcdSnapshot.
@@ -205,6 +211,111 @@ func buildSnapshotJob(snapshot *lll.EtcdSnapshot, cluster *lll.EtcdCluster, oper
 						Name:    "snapshot-agent",
 						Image:   operatorImage,
 						Command: []string{"/manager", "snapshot-agent"},
+						Env:     env,
+						SecurityContext: &corev1.SecurityContext{
+							AllowPrivilegeEscalation: ptrBool(false),
+							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+						},
+						VolumeMounts: mounts,
+						Resources:    agentResources(),
+					}},
+					Volumes: volumes,
+				},
+			},
+		},
+	}
+}
+
+// pruneJobName is the deterministic, policy-owned Job name for pruning one
+// snapshot's stored artifact. Derived from the snapshot's name so a repeated
+// reconcile finds its own Job rather than starting a second one.
+func pruneJobName(snapshotName string) string {
+	return snapshotName + "-prune"
+}
+
+// buildPruneJob constructs the Job that deletes a single stored snapshot. It is
+// the snapshot Job's destination wiring with everything else removed: no etcd
+// endpoint, no TLS, no credentials for the cluster — pruning talks only to the
+// object store or the volume.
+//
+// Owned by the POLICY rather than by the EtcdSnapshot it prunes: the whole
+// point is to delete that EtcdSnapshot once the Job succeeds, and a Job owned by
+// the object being deleted would be garbage-collected mid-run.
+func buildPruneJob(snapshot *lll.EtcdSnapshot, operatorImage string) *batchv1.Job {
+	dest := snapshot.Spec.Destination
+
+	env := []corev1.EnvVar{
+		{Name: "SNAPSHOT_NAME", Value: snapshot.Name},
+	}
+
+	var volumes []corev1.Volume
+	var mounts []corev1.VolumeMount
+
+	switch {
+	case dest.S3 != nil:
+		s3 := dest.S3
+		env = append(env,
+			corev1.EnvVar{Name: "SNAPSHOT_DEST_KIND", Value: "s3"},
+			corev1.EnvVar{Name: "S3_ENDPOINT", Value: s3.Endpoint},
+			corev1.EnvVar{Name: "S3_BUCKET", Value: s3.Bucket},
+			corev1.EnvVar{Name: "S3_KEY", Value: s3.Key},
+			corev1.EnvVar{Name: "S3_REGION", Value: s3.Region},
+			corev1.EnvVar{Name: "S3_FORCE_PATH_STYLE", Value: fmt.Sprintf("%t", s3.ForcePathStyle)},
+			corev1.EnvVar{Name: "AWS_ACCESS_KEY_ID", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: s3.CredentialsSecretRef, Key: "AWS_ACCESS_KEY_ID",
+			}}},
+			corev1.EnvVar{Name: "AWS_SECRET_ACCESS_KEY", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: s3.CredentialsSecretRef, Key: "AWS_SECRET_ACCESS_KEY",
+			}}},
+		)
+	case dest.PVC != nil:
+		env = append(env,
+			corev1.EnvVar{Name: "SNAPSHOT_DEST_KIND", Value: "pvc"},
+			corev1.EnvVar{Name: "PVC_MOUNT_PATH", Value: snapshotPVCMountPath},
+			corev1.EnvVar{Name: "PVC_SUBPATH", Value: dest.PVC.SubPath},
+		)
+		volumes = append(volumes, corev1.Volume{
+			Name: "snapshot-data",
+			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: dest.PVC.ClaimName,
+			}},
+		})
+		mounts = append(mounts, corev1.VolumeMount{Name: "snapshot-data", MountPath: snapshotPVCMountPath})
+	}
+
+	ttl := snapshotJobTTLSeconds
+	backoff := pruneJobBackoffLim
+	activeDeadline := pruneJobActiveDeadlineSeconds
+	notRoot := true
+	user := int64(65532)
+	noAutomount := false
+
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pruneJobName(snapshot.Name),
+			Namespace: snapshot.Namespace,
+			Labels:    map[string]string{LabelCluster: snapshot.Spec.ClusterRef.Name},
+		},
+		Spec: batchv1.JobSpec{
+			BackoffLimit:            &backoff,
+			TTLSecondsAfterFinished: &ttl,
+			ActiveDeadlineSeconds:   &activeDeadline,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{LabelCluster: snapshot.Spec.ClusterRef.Name}},
+				Spec: corev1.PodSpec{
+					RestartPolicy:                corev1.RestartPolicyNever,
+					AutomountServiceAccountToken: &noAutomount,
+					SecurityContext: &corev1.PodSecurityContext{
+						RunAsNonRoot:   &notRoot,
+						RunAsUser:      &user,
+						RunAsGroup:     &user,
+						FSGroup:        &user,
+						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+					},
+					Containers: []corev1.Container{{
+						Name:    "prune-agent",
+						Image:   operatorImage,
+						Command: []string{"/manager", "prune-agent"},
 						Env:     env,
 						SecurityContext: &corev1.SecurityContext{
 							AllowPrivilegeEscalation: ptrBool(false),

@@ -1,4 +1,13 @@
-{{- if .Values.kubeRbacProxy.enabled }}
+{{- if .Values.operator.enabled }}
+{{- /*
+Service метрик. Рендерится в ОБОИХ режимах метрик.
+
+Раньше он был закрыт условием kubeRbacProxy.enabled, из-за чего выключение
+прокси давало оператора, до метрик которого невозможно достучаться: менеджер
+слушал :8080, но на него не указывал ни один Service и не был объявлен ни один
+порт контейнера. «Без прокси» должно означать «метрики открытым текстом», а не
+«метрик нет».
+*/ -}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -9,10 +18,17 @@ metadata:
     control-plane: controller-manager
 spec:
   ports:
+  {{- if .Values.kubeRbacProxy.enabled }}
   - name: https
     port: {{ .Values.metricsService.port }}
     protocol: TCP
     targetPort: https
+  {{- else }}
+  - name: metrics
+    port: {{ .Values.metricsService.port }}
+    protocol: TCP
+    targetPort: metrics
+  {{- end }}
   selector:
     {{- include "etcd-operator.selectorLabels" . | nindent 4 }}
 {{- end }}

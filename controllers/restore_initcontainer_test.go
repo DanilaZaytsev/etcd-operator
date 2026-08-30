@@ -241,3 +241,60 @@ func TestBuildPod_RestoreInitContainerPVC(t *testing.T) {
 		t.Errorf("restore-src mount = %+v, want read-only", m)
 	}
 }
+
+// The checksum is worthless if it does not reach the agent: without the env
+// var the agent skips verification and rebuilds the data dir from whatever it
+// downloaded.
+func TestBuildPod_RestoreChecksumReachesTheAgent(t *testing.T) {
+	const digest = "sha256:" +
+		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+	r := &EtcdMemberReconciler{Scheme: testScheme(t), OperatorImage: "operator:latest"}
+	member := seedMember(&lll.RestoreSpec{
+		Source: lll.SnapshotLocation{S3: &lll.S3SnapshotLocation{
+			Endpoint:             "https://s3.example.com",
+			Bucket:               "b",
+			Key:                  "exact/object.db",
+			CredentialsSecretRef: corev1.LocalObjectReference{Name: "creds"},
+		}},
+		Checksum: digest,
+	})
+	pod := r.buildPod(member, false)
+
+	restore, ok := findInitContainer(pod, "restore")
+	if !ok {
+		t.Fatalf("no restore init container; got %v", initContainerNames(pod))
+	}
+	var got string
+	for _, e := range restore.Env {
+		if e.Name == "SNAPSHOT_CHECKSUM" {
+			got = e.Value
+		}
+	}
+	if got != digest {
+		t.Fatalf("SNAPSHOT_CHECKSUM = %q, want %q", got, digest)
+	}
+}
+
+// With no checksum the env var must be absent rather than empty — the agent
+// distinguishes "nothing to verify against" from a malformed value, and an
+// empty string arriving as a set variable would blur that.
+func TestBuildPod_NoChecksumEnvWhenUnset(t *testing.T) {
+	r := &EtcdMemberReconciler{Scheme: testScheme(t), OperatorImage: "operator:latest"}
+	member := seedMember(&lll.RestoreSpec{
+		Source: lll.SnapshotLocation{S3: &lll.S3SnapshotLocation{
+			Endpoint:             "https://s3.example.com",
+			Bucket:               "b",
+			Key:                  "exact/object.db",
+			CredentialsSecretRef: corev1.LocalObjectReference{Name: "creds"},
+		}},
+	})
+	pod := r.buildPod(member, false)
+
+	restore, _ := findInitContainer(pod, "restore")
+	for _, e := range restore.Env {
+		if e.Name == "SNAPSHOT_CHECKSUM" {
+			t.Fatalf("SNAPSHOT_CHECKSUM set to %q with no checksum configured", e.Value)
+		}
+	}
+}

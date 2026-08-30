@@ -45,6 +45,11 @@ const (
 // The wiped seed must therefore never come back serving an empty keyspace; it
 // must fail to start and be replaced, with the pre-wipe data intact throughout.
 func TestSeedDataDirLossDoesNotRebootstrap(t *testing.T) {
+	// Each test owns its namespace and cluster names, so the suite is
+	// bound by the slowest test rather than their sum. Kept honest by the
+	// operator running with more than one reconcile worker in e2e — with a
+	// single worker these would just queue behind each other.
+	t.Parallel()
 	ctx := context.Background()
 
 	ns := &corev1.Namespace{

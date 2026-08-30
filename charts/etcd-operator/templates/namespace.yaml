@@ -1,10 +1,10 @@
 {{- /*
-Only rendered for `helm template`-based manifest rendering (build-dist-manifests
-sets namespace.create=true) so a bare `kubectl apply -f etcd-operator.yaml` is
-self-contained. Real `helm install` uses --create-namespace instead, so this
-stays off by default.
+Рендерится только для сборки манифестов через `helm template`
+(build-dist-manifests выставляет namespace.create=true), чтобы голый
+`kubectl apply -f etcd-operator.yaml` был самодостаточным. Настоящий
+`helm install` использует --create-namespace, поэтому по умолчанию выключено.
 */ -}}
-{{- if .Values.namespace.create }}
+{{- if and .Values.operator.enabled (.Values.namespace.create) }}
 apiVersion: v1
 kind: Namespace
 metadata:

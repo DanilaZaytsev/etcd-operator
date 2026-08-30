@@ -90,6 +90,19 @@ e2e: ## Provision a kind cluster with cert-manager and Kamaji, deploy the operat
 release-smoke: ## Smoke-test the tag-release manifest install path on kind: build image -> render dist manifests -> apply -> assert operator Available and a 1-node cluster READY. KEEP_CLUSTER=1 keeps the cluster.
 	hack/release-smoke.sh
 
+.PHONY: helm-lint
+helm-lint: require-helm ## Lint the Helm chart (also validates values.yaml against values.schema.json).
+	$(HELM) lint charts/etcd-operator
+
+.PHONY: helm-test
+helm-test: require-helm ## Run the chart's helm-unittest suites. Needs the helm-unittest plugin: helm plugin install https://github.com/helm-unittest/helm-unittest --verify=false
+	@$(HELM) unittest --help >/dev/null 2>&1 || { \
+		echo "ERROR: the helm-unittest plugin is not installed."; \
+		echo "  helm plugin install https://github.com/helm-unittest/helm-unittest --verify=false"; \
+		exit 1; \
+	}
+	$(HELM) unittest charts/etcd-operator
+
 .PHONY: helm-smoke
 helm-smoke: ## Smoke-test the Helm chart install path on kind: build image -> helm install chart -> assert operator Available and a 1-node cluster READY. KEEP_CLUSTER=1 keeps the cluster.
 	INSTALL_MODE=helm hack/release-smoke.sh

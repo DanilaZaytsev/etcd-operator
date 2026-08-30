@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -56,6 +57,12 @@ type EtcdMemberReconciler struct {
 	// built-in. Set from --etcd-image-repository / ETCD_IMAGE_REPOSITORY; the
 	// common use is pointing every cluster at an air-gapped mirror once.
 	EtcdImageRepository string
+
+	// MaxConcurrentReconciles is how many EtcdMembers this controller
+	// reconciles at once. 0 means controller-runtime's default of 1. See the
+	// EtcdClusterReconciler field of the same name for why it matters at
+	// scale.
+	MaxConcurrentReconciles int
 }
 
 //+kubebuilder:rbac:groups=etcd-operator.cozystack.io,resources=etcdmembers,verbs=get;list;watch;update;patch
@@ -64,7 +71,8 @@ type EtcdMemberReconciler struct {
 //+kubebuilder:rbac:groups=etcd-operator.cozystack.io,resources=etcdclusters,verbs=get
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;patch;delete
 //+kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// Read by name only, never listed — see the note in etcdcluster_controller.go.
+//+kubebuilder:rbac:groups="",resources=secrets,verbs=get
 
 func (r *EtcdMemberReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
@@ -383,6 +391,9 @@ func (r *EtcdMemberReconciler) ensurePVC(ctx context.Context, member *lll.EtcdMe
 	// tooling and cost-allocation selectors target PVCs specifically).
 	pvcLabels, pvcAnnotations := applyAdditionalMetadata(
 		memberLabels(member.Spec.ClusterName, member.Name), nil, member.Spec.AdditionalMetadata)
+	// Which storage array this volume lives on, readable straight off the PVC —
+	// the object an array outage is diagnosed from.
+	pvcLabels = withStoragePoolLabel(pvcLabels, member.Spec.StoragePool)
 	pvc = &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        pvcName,
@@ -622,6 +633,27 @@ func optionFlags(o *lll.EtcdOptions) []string {
 	if o.SnapshotCount != nil {
 		flags = append(flags, fmt.Sprintf("--snapshot-count=%d", *o.SnapshotCount))
 	}
+	// etcd takes both of these as durations; it accepts a bare integer as
+	// milliseconds, but spell the unit out so the rendered command line reads
+	// unambiguously to anyone inspecting the Pod.
+	if o.HeartbeatIntervalMilliseconds != nil {
+		flags = append(flags, fmt.Sprintf("--heartbeat-interval=%dms", *o.HeartbeatIntervalMilliseconds))
+	}
+	if o.ElectionTimeoutMilliseconds != nil {
+		flags = append(flags, fmt.Sprintf("--election-timeout=%dms", *o.ElectionTimeoutMilliseconds))
+	}
+	if o.MaxWals != nil {
+		flags = append(flags, fmt.Sprintf("--max-wals=%d", *o.MaxWals))
+	}
+	if o.MaxSnapshots != nil {
+		flags = append(flags, fmt.Sprintf("--max-snapshots=%d", *o.MaxSnapshots))
+	}
+	if o.BackendBatchLimit != nil {
+		flags = append(flags, fmt.Sprintf("--backend-batch-limit=%d", *o.BackendBatchLimit))
+	}
+	if o.BackendBatchIntervalMilliseconds != nil {
+		flags = append(flags, fmt.Sprintf("--backend-batch-interval=%dms", *o.BackendBatchIntervalMilliseconds))
+	}
 	return flags
 }
 
@@ -694,6 +726,7 @@ func (r *EtcdMemberReconciler) buildPod(member *lll.EtcdMember, clusterFormed bo
 		// and Pod state consistent in one reconcile rather than two.
 		labels[LabelRole] = RoleVoter
 	}
+	labels = withStoragePoolLabel(labels, member.Spec.StoragePool)
 	labels, annotations := applyAdditionalMetadata(labels, nil, member.Spec.AdditionalMetadata)
 
 	// Data dir defaults to the volume root; adopted legacy members carry an
@@ -894,6 +927,12 @@ func restoreInitContainers(member *lll.EtcdMember, peerAddr, operatorImage, etcd
 		{Name: "ETCD_INITIAL_CLUSTER", Value: member.Spec.InitialCluster},
 		{Name: "ETCD_INITIAL_CLUSTER_TOKEN", Value: member.Spec.ClusterToken},
 		{Name: "ETCD_PEER_URLS", Value: peerAddr},
+	}
+	// Expected SHA-256 of the snapshot, when the user supplied one. The agent
+	// fails closed on a mismatch rather than rebuilding the data dir from a
+	// corrupted object.
+	if c := member.Spec.Restore.Checksum; c != "" {
+		env = append(env, corev1.EnvVar{Name: "SNAPSHOT_CHECKSUM", Value: c})
 	}
 	mounts := []corev1.VolumeMount{
 		{Name: "data", MountPath: "/var/lib/etcd"},
@@ -1375,5 +1414,9 @@ func (r *EtcdMemberReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&lll.EtcdMember{}).
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
+		// Members outnumber clusters, and each reconcile can dial etcd. One
+		// worker means a single unreachable member's dial timeout delays every
+		// other member in the parent cluster.
+		WithOptions(controller.Options{MaxConcurrentReconciles: workerCount(r.MaxConcurrentReconciles)}).
 		Complete(r)
 }

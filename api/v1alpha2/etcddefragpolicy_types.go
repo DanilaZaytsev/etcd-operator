@@ -135,6 +135,7 @@ type EtcdDefragPolicyStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
+// +kubebuilder:resource:shortName=etcddp,categories=etcd
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // The name goes into a label value on every stamped EtcdDefrag, and label

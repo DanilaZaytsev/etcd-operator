@@ -1,3 +1,4 @@
+{{- if .Values.operator.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -26,9 +27,20 @@ spec:
         {{- end }}
     spec:
       serviceAccountName: {{ include "etcd-operator.serviceAccountName" . }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
       terminationGracePeriodSeconds: 10
       securityContext:
         runAsNonRoot: true
+        # Требуется профилем PodSecurity `restricted`. Без него собственный под
+        # оператора отклоняется в неймспейсе, где restricted принудителен, —
+        # притом что поды членов etcd, которые выпускает оператор, ему уже
+        # соответствуют. Переопределяемо для кластеров с профилем Localhost.
+        {{- with .Values.manager.seccompProfile }}
+        seccompProfile:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -47,21 +59,36 @@ spec:
         - --metrics-bind-address=:8080
         {{- end }}
         - --leader-elect
+        {{- with .Values.manager.clusterDomain }}
+        - --cluster-domain={{ . }}
+        {{- end }}
+        {{- if gt (int .Values.manager.maxConcurrentReconciles) 1 }}
+        - --max-concurrent-reconciles={{ int .Values.manager.maxConcurrentReconciles }}
+        {{- end }}
         env:
-        # MUST equal the manager image: the operator launches this ref for
-        # snapshot Jobs and restore init containers, and refuses to start if it
-        # is left at a placeholder.
+        # ОБЯЗАН совпадать с образом менеджера: оператор запускает эту ссылку
+        # для Job снапшотов и init-контейнеров восстановления и отказывается
+        # стартовать, если здесь осталась заглушка.
         - name: OPERATOR_IMAGE
           value: {{ include "etcd-operator.image" . }}
-        # Operator-wide default etcd image repository for member Pods. Always
-        # set, so the operator's built-in fallback is only reached when the
-        # binary runs outside this chart. Repoint here for an air-gapped mirror;
-        # the tag is always v<spec.version>.
+        # Общеоператорское умолчание репозитория образа etcd для подов членов.
+        # Задаётся всегда, поэтому встроенный запасной вариант оператора
+        # достижим, только когда бинарь запущен вне этого чарта. Перенаправляйте
+        # сюда на зеркало в закрытом контуре; тег всегда v<spec.version>.
         - name: ETCD_IMAGE_REPOSITORY
           value: {{ .Values.etcdImage.repository | quote }}
         {{- with .Values.manager.watchNamespaces }}
         - name: WATCH_NAMESPACE
           value: {{ if kindIs "slice" . }}{{ join "," . | quote }}{{ else }}{{ . | quote }}{{ end }}
+        {{- end }}
+        {{- if not .Values.kubeRbacProxy.enabled }}
+        # Когда прокси впереди нет, менеджер сам слушает метрики на :8080.
+        # Объявленный порт — это то, что позволяет Service метрик указать на него
+        # по имени.
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+          name: metrics
         {{- end }}
         livenessProbe:
           httpGet:
@@ -77,6 +104,10 @@ spec:
           periodSeconds: 10
         securityContext:
           allowPrivilegeEscalation: false
+          # Менеджер ничего не пишет на диск: запись есть только в
+          # internal/agent, а он выполняется в контейнерах Job'ов снапшота и
+          # восстановления и пишет в смонтированные тома, не в корневую ФС.
+          readOnlyRootFilesystem: true
           capabilities:
             drop:
             - "ALL"
@@ -97,6 +128,9 @@ spec:
           name: https
         securityContext:
           allowPrivilegeEscalation: false
+          # Прокси только терминирует TLS и проксирует в 127.0.0.1 — на диск
+          # не пишет.
+          readOnlyRootFilesystem: true
           capabilities:
             drop:
             - "ALL"
@@ -107,11 +141,25 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- if .Values.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else if and .Values.defaultAntiAffinity (gt (int .Values.replicaCount) 1) }}
+      # Две резервные реплики на одной ноде не дают никакого переключения,
+      # когда эта нода уходит. Предпочтительная, а не обязательная, чтобы на
+      # одноузловом или небольшом кластере они всё же разместились.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "etcd-operator.selectorLabels" . | nindent 18 }}
       {{- end }}
       {{- with .Values.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+{{- end }}

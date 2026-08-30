@@ -1,12 +1,13 @@
 {{- /*
-CRDs, templated (not Helm's install-only crds/ dir) so `helm upgrade` keeps
-them current with the release. The raw, controller-gen-generated CRDs live in
-crd-bases/ (written by `make manifests`, guarded by ci.yml's codegen-drift
-gate); we round-trip each through fromYaml/toYaml to inject the
-helm.sh/resource-policy:keep annotation, which stops `helm uninstall` from
-deleting the CRDs — that would cascade-delete every EtcdCluster and its data.
+CRD, отрендеренные шаблонами, а не через каталог crds/ (который Helm применяет
+только при установке), чтобы `helm upgrade` держал их в соответствии с релизом.
+Исходные CRD, сгенерированные controller-gen, лежат в crd-bases/ (их пишет
+`make manifests`, а сторожит codegen-drift гейт в ci.yml); каждый прогоняется
+через fromYaml/toYaml, чтобы вставить аннотацию helm.sh/resource-policy:keep,
+которая не даёт `helm uninstall` удалить CRD — иначе каскадом удалился бы
+каждый EtcdCluster вместе с данными.
 */ -}}
-{{- if .Values.crds.enabled }}
+{{- if and .Values.operator.enabled (.Values.crds.enabled) }}
 {{- range $path, $_ := .Files.Glob "crd-bases/*.yaml" }}
 {{- $crd := $.Files.Get $path | fromYaml }}
 {{- if $.Values.crds.keep }}

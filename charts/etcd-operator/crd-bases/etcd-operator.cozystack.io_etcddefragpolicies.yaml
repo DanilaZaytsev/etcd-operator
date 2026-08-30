@@ -8,9 +8,13 @@ metadata:
 spec:
   group: etcd-operator.cozystack.io
   names:
+    categories:
+    - etcd
     kind: EtcdDefragPolicy
     listKind: EtcdDefragPolicyList
     plural: etcddefragpolicies
+    shortNames:
+    - etcddp
     singular: etcddefragpolicy
   scope: Namespaced
   versions:

@@ -20,12 +20,26 @@ const (
 	// stamped it, so the policy controller can find its own runs.
 	LabelDefragPolicy = "etcd-operator.cozystack.io/defrag-policy"
 
+	// LabelSnapshotPolicy tags an EtcdSnapshot with the EtcdSnapshotPolicy that
+	// stamped it, so the policy controller can find its own runs. The label
+	// only narrows the List; ownership is decided by the ownerRef, so a
+	// hand-labelled snapshot is never counted or garbage-collected.
+	LabelSnapshotPolicy = "etcd-operator.cozystack.io/snapshot-policy"
+
 	// LabelRole identifies the etcd-side raft role of a member's Pod. The
 	// only value the operator emits today is RoleVoter; learners carry no
 	// LabelRole at all so the per-cluster PodDisruptionBudget can select
 	// voters exclusively (its selector requires LabelRole=RoleVoter).
 	LabelRole = "etcd-operator.cozystack.io/role"
 	RoleVoter = "voter"
+
+	// LabelStoragePool records which EtcdCluster storage pool a member was
+	// placed in. Stamped on the EtcdMember, its Pod and its PVC so the
+	// spread across storage arrays is visible with a plain
+	// `kubectl get etcdmember -L etcd-operator.cozystack.io/storage-pool`
+	// rather than by reading each member's spec. Absent on clusters that
+	// declare no pools.
+	LabelStoragePool = "etcd-operator.cozystack.io/storage-pool"
 
 	// EtcdImage is the built-in fallback etcd image repository (registry
 	// host + path, no tag). It is used when the operator-wide
@@ -593,4 +607,152 @@ func setCondition(conditions *[]metav1.Condition, c metav1.Condition) {
 	}
 	c.LastTransitionTime = now
 	*conditions = append(*conditions, c)
+}
+
+// ── Storage pools ────────────────────────────────────────────────────────
+
+// resolveStoragePool decides which of the cluster's storage pools a member
+// about to be created belongs in, and returns the member-side StorageSpec
+// (the pool's backend resolved into StorageClassName/Size, with the pool list
+// itself stripped — a member is placed, it does not re-decide) together with
+// the chosen pool's name.
+//
+// The rule is "least-used enabled pool, ties broken by declaration order".
+// Members are named with GenerateName rather than ordinals, so there is no
+// index to key a pool off; counting the live members is what makes the
+// placement stable anyway:
+//
+//   - a fresh 3-replica cluster over 3 pools fills them 1/1/1, and the seed
+//     deterministically lands in pools[0] (all counts are 0, so the tie-break
+//     decides) — which is what makes a restore reproducible;
+//   - when a member is lost, its pool becomes the least-used one, so the
+//     gap-fill replacement lands back on the same array;
+//   - when that array is the reason the member was lost, cordoning the pool
+//     (Disabled=true) is what steers the replacement elsewhere. Without the
+//     cordon the replacement's PVC would sit Pending on the dead array
+//     forever.
+//
+// Members being deleted are not counted: their PVCs go with them (the PVC is
+// controller-owned by the member), so the pool is about to be free. Dormant
+// members ARE counted — a paused member keeps its PVC, so its pool is still
+// occupied.
+func resolveStoragePool(observed lll.StorageSpec, members []lll.EtcdMember) (lll.StorageSpec, string, error) {
+	memberStorage := *observed.DeepCopy()
+	memberStorage.Pools = nil
+
+	if len(observed.Pools) == 0 {
+		return memberStorage, "", nil
+	}
+
+	counts := make(map[string]int, len(observed.Pools))
+	for i := range members {
+		if !members[i].DeletionTimestamp.IsZero() {
+			continue
+		}
+		counts[members[i].Spec.StoragePool]++
+	}
+
+	var chosen *lll.StoragePool
+	for i := range observed.Pools {
+		p := &observed.Pools[i]
+		if p.Disabled {
+			continue
+		}
+		if chosen == nil || counts[p.Name] < counts[chosen.Name] {
+			chosen = p
+		}
+	}
+	if chosen == nil {
+		return lll.StorageSpec{}, "", fmt.Errorf(
+			"every storage pool is disabled (%s); a new member has nowhere to place its PVC — "+
+				"re-enable a pool by clearing spec.storage.pools[].disabled",
+			strings.Join(storagePoolNames(observed.Pools), ", "))
+	}
+
+	memberStorage.StorageClassName = chosen.StorageClassName
+	if chosen.Size != nil {
+		memberStorage.Size = *chosen.Size
+	}
+	return memberStorage, chosen.Name, nil
+}
+
+// storagePoolNames lists pool names in declaration order, for error text.
+func storagePoolNames(pools []lll.StoragePool) []string {
+	names := make([]string, 0, len(pools))
+	for i := range pools {
+		names = append(names, pools[i].Name)
+	}
+	return names
+}
+
+// storagePoolAffinity returns the Pod affinity a member placed in poolName
+// should get: the pool's own override when it has one (for an array reachable
+// only from part of the cluster), otherwise the cluster-wide affinity. A
+// member sits in exactly one pool, so the pool's terms replace rather than
+// intersect the cluster-wide ones.
+func storagePoolAffinity(observed lll.StorageSpec, poolName string, clusterAffinity *corev1.Affinity) *corev1.Affinity {
+	if poolName == "" {
+		return clusterAffinity
+	}
+	for i := range observed.Pools {
+		if observed.Pools[i].Name == poolName && observed.Pools[i].Affinity != nil {
+			return observed.Pools[i].Affinity
+		}
+	}
+	return clusterAffinity
+}
+
+// unevenStoragePools reports whether the target replica count does not divide
+// evenly across the enabled pools, and returns the message to surface. This is
+// advisory, not an error: 3 replicas over 2 pools is a legitimate (if
+// lopsided) request, but it means one array holds two of the three members and
+// therefore holds quorum on its own — worth saying out loud rather than
+// discovering during an array outage.
+//
+// Deliberately NOT a CEL rule (it would block a legitimate spec) and NOT a
+// Degraded condition (Degraded means "members are unhealthy but quorum
+// holds"; overloading it with a config warning would make cluster-level
+// alerting fire on a healthy cluster). An Event is the right altitude.
+func unevenStoragePools(observed lll.StorageSpec, replicas int32) (string, bool) {
+	enabled := 0
+	for i := range observed.Pools {
+		if !observed.Pools[i].Disabled {
+			enabled++
+		}
+	}
+	if enabled < 2 || replicas < 2 || int(replicas)%enabled == 0 {
+		return "", false
+	}
+	return fmt.Sprintf(
+		"spec.replicas=%d does not divide evenly across %d enabled storage pools: "+
+			"at least one pool will hold more members than the others, so losing that "+
+			"storage array costs more than one member. Use a replica count that is a "+
+			"multiple of the pool count.", replicas, enabled), true
+}
+
+// withStoragePoolLabel stamps LabelStoragePool when the member is placed in a
+// named pool, so the spread across arrays is readable with
+// `kubectl get etcdmember -L etcd-operator.cozystack.io/storage-pool`.
+// A cluster with no pools gets no label rather than an empty-valued one.
+func withStoragePoolLabel(l map[string]string, pool string) map[string]string {
+	if pool == "" {
+		return l
+	}
+	if l == nil {
+		l = map[string]string{}
+	}
+	l[LabelStoragePool] = pool
+	return l
+}
+
+// workerCount resolves a configured reconcile concurrency to what
+// controller.Options wants: 0 (unset) means controller-runtime's own default of
+// one worker, and a negative value — which the flag parser cannot reject on its
+// own — is treated the same rather than being passed through to panic at
+// startup.
+func workerCount(configured int) int {
+	if configured < 1 {
+		return 1
+	}
+	return configured
 }

@@ -12,11 +12,14 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	hexencoding "encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -119,6 +122,16 @@ func RunRestore(ctx context.Context) error {
 		if err := ensureRestoreSpace(dataDir, fi.Size()); err != nil {
 			return err
 		}
+	}
+
+	// Verify the snapshot before rebuilding anything from it. This is the only
+	// integrity check available on this path: runEtcdutlRestore must pass
+	// --skip-hash-check because a snapshot taken through the clientv3
+	// Maintenance API carries no hash of its own. Without this, a truncated or
+	// corrupted object produces a data dir that etcd happily starts on, and the
+	// cluster looks healthy until someone reads the part that is missing.
+	if err := verifySnapshotChecksum(snapPath, os.Getenv(envSnapshotChecksum)); err != nil {
+		return err
 	}
 
 	// etcdutl refuses a non-empty output dir, so restore into a fresh staging
@@ -375,4 +388,44 @@ func availableBytes(dir string) (uint64, error) {
 		return 0, err
 	}
 	return st.Bavail * uint64(st.Bsize), nil
+}
+
+// verifySnapshotChecksum compares the snapshot file against the expected
+// "sha256:<hex>" digest, in the form EtcdSnapshot records in
+// status.artifact.checksum. An empty expectation skips verification — a
+// snapshot taken before the operator recorded checksums, or copied in by hand,
+// has nothing to check against.
+//
+// Fails closed in both directions: a malformed expectation is an error rather
+// than a silent skip, because a typo that quietly disables the only integrity
+// check is worse than a restore that refuses to start.
+func verifySnapshotChecksum(snapPath, expected string) error {
+	if expected == "" {
+		fmt.Println("restore: no checksum supplied, skipping snapshot verification")
+		return nil
+	}
+	hex, ok := strings.CutPrefix(expected, "sha256:")
+	if !ok || len(hex) != 64 {
+		return fmt.Errorf("malformed %s=%q: want \"sha256:<64 hex chars>\" (as recorded in EtcdSnapshot status.artifact.checksum)",
+			envSnapshotChecksum, expected)
+	}
+
+	f, err := os.Open(snapPath)
+	if err != nil {
+		return fmt.Errorf("open snapshot for verification: %w", err)
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return fmt.Errorf("read snapshot for verification: %w", err)
+	}
+	got := hexencoding.EncodeToString(h.Sum(nil))
+	if !strings.EqualFold(got, hex) {
+		return fmt.Errorf("snapshot checksum mismatch: expected sha256:%s, got sha256:%s — "+
+			"the snapshot is truncated, corrupted, or not the one this cluster was meant to restore from; "+
+			"refusing to rebuild the data dir from it", hex, got)
+	}
+	fmt.Printf("restore: snapshot verified against sha256:%s\n", got)
+	return nil
 }

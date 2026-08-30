@@ -88,6 +88,19 @@ type EtcdMemberSpec struct {
 	// immutable per-member spec.
 	Storage StorageSpec `json:"storage"`
 
+	// StoragePool is the name of the EtcdCluster storage pool this member
+	// was placed in (EtcdCluster.spec.storage.pools[].name). Empty when the
+	// cluster declares no pools.
+	//
+	// Set by the cluster controller at creation time and never changed: it
+	// is the record of which array this member's PVC lives on, and the
+	// cluster controller counts members by this field to place the next one.
+	// The resolved storageClassName and size are copied into Storage above —
+	// this field is the label/bookkeeping half, not an indirection the member
+	// controller resolves.
+	// +optional
+	StoragePool string `json:"storagePool,omitempty"`
+
 	// Resources mirrors EtcdCluster.spec.resources at the time this
 	// member was created. The cluster controller copies it onto each
 	// member at creation. The member controller passes the value
@@ -244,6 +257,7 @@ type EtcdMemberStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
+// +kubebuilder:resource:shortName=etcdm,categories=etcd
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas,selectorpath=.status.selector

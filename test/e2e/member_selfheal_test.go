@@ -37,6 +37,11 @@ const (
 // 5-restart threshold takes on the order of ten minutes. The waits below are
 // sized for that.
 func TestPVCMemberCrashLoopSelfHeal(t *testing.T) {
+	// Each test owns its namespace and cluster names, so the suite is
+	// bound by the slowest test rather than their sum. Kept honest by the
+	// operator running with more than one reconcile worker in e2e — with a
+	// single worker these would just queue behind each other.
+	t.Parallel()
 	ctx := context.Background()
 
 	ns := &corev1.Namespace{

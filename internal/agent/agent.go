@@ -63,13 +63,17 @@ const (
 	envDestKind     = "SNAPSHOT_DEST_KIND" // "s3" | "pvc"
 	envSnapshotName = "SNAPSHOT_NAME"
 	envSnapshotUID  = "SNAPSHOT_UID" // EtcdSnapshot UID; stamped on the S3 object so a retry recognizes its own upload
-	envS3Endpoint   = "S3_ENDPOINT"
-	envS3Bucket     = "S3_BUCKET"
-	envS3Key        = "S3_KEY"
-	envS3Region     = "S3_REGION"
-	envS3PathStyle  = "S3_FORCE_PATH_STYLE"
-	envPVCMountPath = "PVC_MOUNT_PATH" // where the destination/source PVC is mounted
-	envPVCSubPath   = "PVC_SUBPATH"
+	// envSnapshotChecksum is the expected "sha256:<hex>" of a restore source.
+	// Restore-only: a snapshot destination computes its checksum, it does not
+	// verify one.
+	envSnapshotChecksum = "SNAPSHOT_CHECKSUM"
+	envS3Endpoint       = "S3_ENDPOINT"
+	envS3Bucket         = "S3_BUCKET"
+	envS3Key            = "S3_KEY"
+	envS3Region         = "S3_REGION"
+	envS3PathStyle      = "S3_FORCE_PATH_STYLE"
+	envPVCMountPath     = "PVC_MOUNT_PATH" // where the destination/source PVC is mounted
+	envPVCSubPath       = "PVC_SUBPATH"
 
 	// restore-only.
 	envDataDir        = "ETCD_DATA_DIR"

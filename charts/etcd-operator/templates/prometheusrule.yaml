@@ -1,0 +1,141 @@
+{{/*
+  Алерты по метрикам оператора.
+
+  Пороги подобраны так, чтобы не будить на нормальных переходных состояниях:
+  reconcile кластера идёт секунды-минуты, поэтому все `for` заметно длиннее
+  интервала reconcile (30 с).
+
+  Семантика метрик, на которую опираются выражения:
+    - etcd_operator_cluster_condition = 1 при True, 0 при False и ОТСУТСТВУЕТ
+      при Unknown. Поэтому `== 0` не ловит Unknown — это намеренно: Unknown
+      означает «оператор ещё не высказался», а не «сломано».
+    - etcd_operator_snapshot_last_success_* эмитится ТОЛЬКО для кластеров, у
+      которых есть хотя бы один успешный снапшот. «Ни разу не бэкапился»
+      ловится через `unless`, а не через сравнение с нулём.
+*/}}
+{{- if and .Values.operator.enabled .Values.metrics.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "etcd-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "etcd-operator.labels" . | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+  - name: etcd-operator.clusters
+    rules:
+    - alert: EtcdClusterUnavailable
+      expr: etcd_operator_cluster_condition{condition="Available"} == 0
+      for: 10m
+      labels:
+        severity: critical
+      annotations:
+        summary: "EtcdCluster {{ `{{ $labels.namespace }}/{{ $labels.cluster }}` }} недоступен"
+        description: >-
+          Условие Available держится False уже 10 минут (причина:
+          {{ `{{ $labels.reason }}` }}). Кластер не обслуживает запросы —
+          control plane дочернего кластера в этом неймспейсе не работает.
+
+    - alert: EtcdClusterQuorumLost
+      expr: >-
+        etcd_operator_cluster_members_ready
+          < floor(etcd_operator_cluster_members_desired / 2) + 1
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "EtcdCluster {{ `{{ $labels.namespace }}/{{ $labels.cluster }}` }} потерял кворум"
+        description: >-
+          Готовых членов {{ `{{ $value }}` }} — меньше большинства. Запись
+          невозможна; оператор не сможет ни заменить члена, ни отмасштабировать
+          кластер, пока кворум не восстановится. Восстановление из снапшота —
+          в docs/operations.md.
+
+    - alert: EtcdClusterMembersMissing
+      expr: >-
+        etcd_operator_cluster_members_ready
+          < etcd_operator_cluster_members_desired
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: "EtcdCluster {{ `{{ $labels.namespace }}/{{ $labels.cluster }}` }} работает не в полном составе"
+        description: >-
+          Готово {{ `{{ $value }}` }} членов из заданных. Кворум ещё есть, но
+          запаса по отказам нет. Частая причина при включённом TLS — член, чьё
+          имя не покрыто SAN сертификата: он входит в состав raft и его под
+          Ready, но эндпоинт не проходит проверку. Проверяйте на уровне etcd
+          (`etcdctl endpoint health --cluster`), а не по условиям CR.
+
+    - alert: EtcdClusterDegraded
+      expr: etcd_operator_cluster_condition{condition="Degraded"} == 1
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: "EtcdCluster {{ `{{ $labels.namespace }}/{{ $labels.cluster }}` }} в состоянии Degraded"
+        description: >-
+          Оператор держит Degraded=True 15 минут (причина:
+          {{ `{{ $labels.reason }}` }}).
+
+    - alert: EtcdClusterNotBootstrapped
+      expr: etcd_operator_cluster_bootstrapped == 0
+      for: 30m
+      labels:
+        severity: warning
+      annotations:
+        summary: "EtcdCluster {{ `{{ $labels.namespace }}/{{ $labels.cluster }}` }} так и не собрался"
+        description: >-
+          Кластер существует 30 минут, но так и не зафиксировал cluster ID —
+          то есть ни разу не сформировался. Обычные причины: PVC в Pending
+          (например, член попал в отключённый или мёртвый пул хранения) или
+          под, не проходящий планирование из-за anti-affinity.
+
+  - name: etcd-operator.snapshots
+    rules:
+    - alert: EtcdSnapshotTooOld
+      expr: >-
+        etcd_operator_snapshot_last_success_age_seconds
+          > {{ .Values.metrics.prometheusRule.snapshotMaxAgeSeconds }}
+      for: 30m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Снапшоты EtcdCluster {{ `{{ $labels.namespace }}/{{ $labels.cluster }}` }} устарели"
+        description: >-
+          Последний успешный снапшот снят {{ `{{ $value | humanizeDuration }}` }}
+          назад, порог — {{ .Values.metrics.prometheusRule.snapshotMaxAgeSeconds }} с.
+          Трёхчленный кластер переживает потерю члена, но не потерю данных.
+
+    - alert: EtcdClusterNeverSnapshotted
+      expr: >-
+        etcd_operator_snapshot_policy_info
+          unless on (namespace, cluster)
+        etcd_operator_snapshot_last_success_timestamp_seconds
+      for: {{ .Values.metrics.prometheusRule.neverSnapshottedFor }}
+      labels:
+        severity: warning
+      annotations:
+        summary: "У EtcdCluster {{ `{{ $labels.namespace }}/{{ $labels.cluster }}` }} нет ни одного снапшота"
+        description: >-
+          Политика {{ `{{ $labels.policy }}` }} (расписание
+          {{ `{{ $labels.schedule }}` }}) существует, но ни один её запуск ещё
+          не завершился успешно. Отсутствие бэкапов незаметно ровно до момента
+          восстановления.
+
+    - alert: EtcdSnapshotPolicySuspended
+      expr: etcd_operator_snapshot_policy_suspended == 1
+      for: 24h
+      labels:
+        severity: info
+      annotations:
+        summary: "Политика снапшотов {{ `{{ $labels.namespace }}/{{ $labels.policy }}` }} приостановлена сутки"
+        description: >-
+          suspend=true держится 24 часа. Приостановка обычно временная —
+          забытая приостановка это и есть способ, которым бэкапы тихо
+          прекращаются.
+{{- end }}

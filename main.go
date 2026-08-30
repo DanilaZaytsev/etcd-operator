@@ -32,8 +32,13 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/selection"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/kubernetes"
@@ -41,6 +46,7 @@ import (
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -49,6 +55,7 @@ import (
 	etcdv1alpha2 "github.com/cozystack/etcd-operator/api/v1alpha2"
 	"github.com/cozystack/etcd-operator/controllers"
 	"github.com/cozystack/etcd-operator/internal/agent"
+	etcdmetrics "github.com/cozystack/etcd-operator/internal/metrics"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -101,6 +108,17 @@ func main() {
 				os.Exit(1)
 			}
 			return
+		case "prune-agent":
+			// Deletes exactly one stored snapshot (see agent.RunPrune). Bounded
+			// so a black-holed object-store endpoint fails the Job instead of
+			// pinning it open until the Job deadline.
+			ctx, cancel := context.WithTimeout(context.Background(), agent.PruneTimeout)
+			defer cancel()
+			if err := agent.RunPrune(ctx); err != nil {
+				fmt.Fprintln(os.Stderr, "prune agent failed:", err)
+				os.Exit(1)
+			}
+			return
 		case "restore-agent":
 			// Bound the run so a slow/black-holed S3 endpoint fails with a clear
 			// error instead of hanging the init container (and cluster bootstrap)
@@ -130,6 +148,7 @@ func main() {
 	var operatorImage string
 	var etcdImageRepository string
 	var watchNamespace string
+	var maxConcurrentReconciles int
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
@@ -156,6 +175,13 @@ func main() {
 			"quay.io/coreos/etcd is used.")
 	flag.StringVar(&watchNamespace, "watch-namespace", os.Getenv("WATCH_NAMESPACE"),
 		"Comma-separated namespaces to watch. Defaults to $WATCH_NAMESPACE; empty means all.")
+	flag.IntVar(&maxConcurrentReconciles, "max-concurrent-reconciles", 1,
+		"How many EtcdClusters (and EtcdMembers) to reconcile at once. Nearly every "+
+			"reconcile makes an etcd RPC with a dial timeout, so with the default of 1 a "+
+			"single unreachable cluster stalls every other cluster behind it. Raise it on "+
+			"a parent cluster hosting many EtcdClusters; distinct clusters share no state, "+
+			"and controller-runtime never reconciles one object concurrently with itself. "+
+			"The cost of raising it is more simultaneous etcd dials and apiserver traffic.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -179,8 +205,21 @@ func main() {
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
-		Cache:                  cacheOptions,
+		Scheme: scheme,
+		Cache:  cacheOptions,
+		// Read Secrets live rather than through the informer cache. The
+		// operator reads user-provided TLS and S3 Secrets by name, so they
+		// carry no operator label to narrow a cache with; caching them means
+		// holding every Secret in every watched namespace. On a parent cluster
+		// where each namespace is a tenant control plane, that is every
+		// tenant's CA and service-account signing keys resident in this
+		// process, to serve a handful of by-name reads on Pod creation and on
+		// each etcd dial.
+		Client: client.Options{
+			Cache: &client.CacheOptions{
+				DisableFor: []client.Object{&corev1.Secret{}},
+			},
+		},
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		WebhookServer:          webhook.NewServer(webhook.Options{Port: 9443}),
 		HealthProbeBindAddress: probeAddr,
@@ -225,19 +264,22 @@ func main() {
 	}
 
 	if err = (&controllers.EtcdClusterReconciler{
-		Client:               mgr.GetClient(),
-		Scheme:               mgr.GetScheme(),
-		CertManagerAvailable: certManagerAvailable,
-		ClusterDomain:        clusterDomain,
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		CertManagerAvailable:    certManagerAvailable,
+		ClusterDomain:           clusterDomain,
+		Recorder:                mgr.GetEventRecorderFor("etcd-operator"),
+		MaxConcurrentReconciles: maxConcurrentReconciles,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "EtcdCluster")
 		os.Exit(1)
 	}
 	if err = (&controllers.EtcdMemberReconciler{
-		Client:              mgr.GetClient(),
-		Scheme:              mgr.GetScheme(),
-		OperatorImage:       operatorImage,
-		EtcdImageRepository: etcdImageRepository,
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		OperatorImage:           operatorImage,
+		EtcdImageRepository:     etcdImageRepository,
+		MaxConcurrentReconciles: maxConcurrentReconciles,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "EtcdMember")
 		os.Exit(1)
@@ -273,7 +315,24 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "EtcdDefragPolicy")
 		os.Exit(1)
 	}
+	if err = (&controllers.EtcdSnapshotPolicyReconciler{
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		Recorder:      mgr.GetEventRecorderFor("etcd-operator"),
+		OperatorImage: operatorImage,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "EtcdSnapshotPolicy")
+		os.Exit(1)
+	}
 	//+kubebuilder:scaffold:builder
+
+	// Cluster/backup state as Prometheus metrics, served on the manager's
+	// existing /metrics endpoint. Reads through the manager's cache at scrape
+	// time, so the series cannot outlive the objects they describe.
+	if err := etcdmetrics.NewCollector(mgr.GetClient()).Register(); err != nil {
+		setupLog.Error(err, "unable to register the cluster metrics collector")
+		os.Exit(1)
+	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
@@ -331,16 +390,74 @@ func discoverClusterDomain(path string) string {
 // watchNamespaceCacheOptions scopes the manager cache to a comma-separated
 // namespace list. Empty input means all namespaces (zero cache.Options).
 func watchNamespaceCacheOptions(watchNamespace string) cache.Options {
+	opts := cache.Options{ByObject: operatorOwnedCacheSelectors()}
+
 	namespaces := map[string]cache.Config{}
 	for _, ns := range strings.Split(watchNamespace, ",") {
 		if ns = strings.TrimSpace(ns); ns != "" {
 			namespaces[ns] = cache.Config{}
 		}
 	}
-	if len(namespaces) == 0 {
-		return cache.Options{}
+	if len(namespaces) > 0 {
+		opts.DefaultNamespaces = namespaces
 	}
-	return cache.Options{DefaultNamespaces: namespaces}
+	return opts
+}
+
+// operatorOwnedCacheSelectors narrows the informer cache for the core types the
+// operator owns to objects carrying its cluster label.
+//
+// Without this the cache holds EVERY Pod, PVC, Service, PodDisruptionBudget and
+// Job in every watched namespace — which, on a parent cluster where each
+// namespace is a tenant's control plane, means every tenant's apiserver,
+// scheduler and controller-manager Pod sits in this operator's memory. The
+// footprint then scales with the size of the whole cluster rather than with the
+// number of etcd clusters, and the chart's modest memory limit is the first
+// thing to notice.
+//
+// Every object the operator creates carries the label (clusterLabels /
+// memberLabels), and the migration tool stamps the same set onto the Pods and
+// PVCs it adopts, so nothing the controllers act on is filtered out. An object
+// that lacks it is by definition not one of ours: the effect on a name
+// collision with a foreign Pod is that Create fails with AlreadyExists instead
+// of the ownership check reporting it, which is a worse message but the same
+// refusal to touch it.
+//
+// Secrets are deliberately absent here and excluded from the cache entirely
+// (see the client options in main): the operator reads user-provided TLS and S3
+// Secrets by name, so they carry no operator label to select on. Caching them
+// would mean holding every Secret in every watched namespace — on a
+// multi-tenant parent, every tenant's CA and service-account signing keys.
+//
+// The cost of reading them live is not negligible and is worth stating
+// honestly: a TLS cluster rebuilds its operator TLS config on every reconcile,
+// which is two Secret reads, plus one more for the root password when auth is
+// on. At 160 clusters reconciling every 30s that is roughly 16 live GETs a
+// second against the parent apiserver — small for an apiserver, and a few
+// milliseconds inside a reconcile that has a 30-second budget, but a
+// continuous load rather than a one-off.
+func operatorOwnedCacheSelectors() map[client.Object]cache.ByObject {
+	owned := cache.ByObject{
+		Label: labels.SelectorFromSet(nil).Add(mustExistRequirement(controllers.LabelCluster)),
+	}
+	return map[client.Object]cache.ByObject{
+		&corev1.Pod{}:                   owned,
+		&corev1.PersistentVolumeClaim{}: owned,
+		&corev1.Service{}:               owned,
+		&policyv1.PodDisruptionBudget{}: owned,
+		&batchv1.Job{}:                  owned,
+	}
+}
+
+// mustExistRequirement builds an "label key exists" requirement. The key is a
+// compile-time constant, so a parse failure is a programming error, not a
+// runtime condition to handle.
+func mustExistRequirement(key string) labels.Requirement {
+	req, err := labels.NewRequirement(key, selection.Exists, nil)
+	if err != nil {
+		panic(fmt.Sprintf("building cache selector for %q: %v", key, err))
+	}
+	return *req
 }
 
 // detectCertManager probes the apiserver's discovery API for the

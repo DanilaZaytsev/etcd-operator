@@ -56,3 +56,88 @@ jobs:
         # suite — including the CEL envtest cases in api/v1alpha2
         # which silently skip when KUBEBUILDER_ASSETS is unset.
         run: make test
+
+  chart:
+    # The chart is the single source of truth for the install, and until this
+    # job existed nothing ran its tests: charts/etcd-operator/tests/ was written
+    # and then never executed, in CI or anywhere else. A chart that renders is
+    # not a chart that renders correctly.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.16.4'
+
+      - name: Install helm-unittest
+        # --verify=false: the plugin repo publishes no provenance, and helm
+        # refuses to install an unverifiable plugin without it.
+        run: helm plugin install https://github.com/helm-unittest/helm-unittest --verify=false
+
+      - name: helm lint
+        run: make helm-lint
+
+      - name: helm unittest
+        run: make helm-test
+
+  security:
+    # The supply chain was assembled from one end only: docker-publish.yml
+    # produces an SBOM and a cosign signature, so a consumer can verify WHAT
+    # shipped and WHO built it — but nothing ever asked whether what shipped
+    # contains known vulnerabilities. Signing a vulnerable image proves its
+    # provenance, not its safety.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: govulncheck
+        # Reachability-filtered: govulncheck reports a CVE only when the
+        # vulnerable symbol is actually callable from this code, so a finding
+        # means this operator is affected rather than that some dependency
+        # published an advisory. That is what makes it cheap enough to gate on.
+        #
+        # Not gating yet, deliberately. The module-level findings this check
+        # first surfaced are fixed (grpc, x/net, x/text were bumped in the same
+        # change); what remains is the Go standard library shipped by the
+        # toolchain pinned in go.mod. Flip continue-on-error off in the same
+        # commit that bumps `toolchain` in go.mod and the golang base image in
+        # the Dockerfile to a patched release — a gate that is red on arrival
+        # teaches everyone to ignore it.
+        continue-on-error: true
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-file: go.mod
+          repo-checkout: false
+
+      - name: Trivy (dependency CVEs)
+        # ignore-unfixed keeps this actionable: a CRITICAL with no released fix
+        # cannot be resolved from this repository, and a pipeline that stays red
+        # for something nobody can act on stops being read.
+        #
+        # vuln only. The misconfig scanner would also lint every manifest under
+        # charts/, and its Kubernetes ruleset flags shapes this chart chooses on
+        # purpose — so it needs a reviewed .trivyignore before it can run at all,
+        # not a switch flipped here.
+        #
+        # Not gating yet, for the same reason as govulncheck above: unlike
+        # govulncheck this check is not reachability-filtered, so it reports a
+        # CVE in any dependency whether or not this operator can reach it.
+        # Watch what it actually reports for a few runs, write the ignore file,
+        # then drop continue-on-error.
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+          format: table

@@ -1,34 +1,242 @@
+# Пример EtcdCluster: три члена, каждый на своём массиве хранения.
+#
+# Это форма для дочернего кластера, который не должен терять кворум из-за отказа одного
+# массива. Всё, что закомментировано ниже, — необязательно; раскомментируйте то,
+# что нужно именно вам, и удалите остальное.
+#
+# Применить: kubectl apply -f config/samples/_v1alpha2_etcdcluster.yaml
+---
 apiVersion: etcd-operator.cozystack.io/v1alpha2
 kind: EtcdCluster
 metadata:
   name: etcdcluster-sample
 spec:
+  # Число членов. Должно быть нечётным: чётное добавляет члена, который
+  # участвует в кворуме записи, но не увеличивает число переживаемых отказов
+  # (4 члена переживают 1 отказ — столько же, сколько 3).
+  #
+  # 1 — поддерживаемая форма, но это другой эксплуатационный контракт, а не
+  # просто кластер поменьше: его PodDisruptionBudget навсегда блокирует drain
+  # ноды, оператор не чинит его сам (замена при crash-loop гейтится кворумом,
+  # которого у одного члена нет), а дефрагментация останавливает его целиком.
+  # Подробности — в docs/operations.md.
   replicas: 3
+
+  # Версия etcd. Тег образа выводится как "v<version>".
   version: "3.6.11"
+
   storage:
-    size: 1Gi
-  # Extra labels/annotations merged onto every object the operator creates
-  # for this cluster (member Pods, Services, PDB, EtcdMember CRs). Operator-
-  # owned label keys always win on collision.
-  # additionalMetadata:
-  #   labels:
-  #     cozystack.io/tenant: foo
-  #   annotations:
-  #     example.com/note: managed-by-cozystack
-  # Pod scheduling affinity, passed through to each member Pod. This example
-  # keeps members off the same node.
-  # affinity:
-  #   podAntiAffinity:
-  #     requiredDuringSchedulingIgnoredDuringExecution:
-  #       - labelSelector:
-  #           matchLabels:
-  #             app.kubernetes.io/instance: etcdcluster-sample
-  #         topologyKey: kubernetes.io/hostname
-  # Spread members across zones.
+    # Запрашиваемый объём на члена. Только вверх: PVC не умеют уменьшаться.
+    size: 5Gi
+
+    # Раскладка по массивам. Каждый новый член попадает в наименее занятый
+    # включённый пул, поэтому три реплики на три пула дают ровно по одному
+    # члену на массив: потеря массива стоит одного члена, а не кворума.
+    #
+    # Взаимоисключимо со storage.storageClassName ниже. Список можно только
+    # дополнять после создания — новый массив добавить можно, существующий пул
+    # удалить или перенаправить нельзя, его PVC уже привязаны.
+    pools:
+      - name: array-a
+        storageClassName: san-a
+      - name: array-b
+        storageClassName: san-b
+      - name: array-c
+        storageClassName: san-c
+        # Необязательные переопределения на уровне пула:
+        # size: 40Gi
+        # affinity: {}      # если массив доступен не со всех нод
+        #
+        # disabled: true — «кордон»: новые члены сюда не ставить. Это способ
+        # увести замену с отказавшего массива. Без него replacement снова
+        # встанет на мёртвый массив (он же наименее занятый), и его PVC
+        # навсегда останется в Pending.
+        # disabled: false
+
+    # Альтернатива пулам — один StorageClass на все члены.
+    #
+    # Отсутствие поля означает StorageClass по умолчанию для неймспейса.
+    # Пустая строка — НЕ то же самое: это отключение динамического
+    # провижининга, привязка только к заранее созданному подходящему PV.
+    # storageClassName: san-a
+
+  # Ресурсы контейнера etcd. Встроенный запас оператора (100m/128Mi requests,
+  # без limits) годится для проверки работоспособности, но не для продакшена.
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      memory: 4Gi
+
+  # Тюнинг сервера etcd. Каждое поле необязательно; незаданное не порождает
+  # флага и оставляет в силе умолчание самого etcd.
+  options:
+    # Умолчания etcd (100 мс / 1000 мс) рассчитаны на локальный SSD и RTT около
+    # миллисекунды. Когда data-dir лежит на сетевом хранилище, fsync может быть
+    # на порядок медленнее, раунд heartbeat ждёт за ним, последователи считают
+    # лидера мёртвым — и кластер переизбирает лидера под обычной нагрузкой на
+    # запись, не сообщая об этом ни одной ошибкой.
+    #
+    # Отношение 5:1 требует apiserver. Ловушка, которую одно это правило не
+    # ловит: поднять только heartbeat. Election timeout останется на умолчании
+    # в 1000 мс, и любой heartbeat выше 200 мс уже нарушит отношение — поэтому
+    # heartbeat требует, чтобы рядом был задан и election timeout.
+    heartbeatIntervalMilliseconds: 500
+    electionTimeoutMilliseconds: 2500
+
+    # Компакция. Без неё история ревизий растёт до срабатывания квоты.
+    autoCompactionMode: periodic
+    autoCompactionRetention: "1h"
+
+    # Размер бэкенда, после которого поднимается общекластерная тревога
+    # NOSPACE. Практический максимум по документации etcd — 8 ГиБ.
+    # quotaBackendBytes: 8589934592
+
+    # Сколько файлов WAL и raft-снапшотов хранить. Ограничивает размер
+    # data-dir в установившемся режиме; снижение сокращает окно, в котором
+    # член может восстановиться по собственному WAL, а не полной пересинхрой
+    # от лидера.
+    # maxWals: 5
+    # maxSnapshots: 5
+
+    # Пакетирование коммитов бэкенда: меняет задержку коммита на число fsync.
+    # Основной рычаг для кластера, у которого
+    # etcd_disk_backend_commit_duration_seconds определяется массивом, а не
+    # самим etcd.
+    # backendBatchLimit: 5000
+    # backendBatchIntervalMilliseconds: 100
+
+  # Разнос членов по нодам. Оператор его НЕ проставляет сам: три члена на одной
+  # ноде — это три члена, потерянных вместе с ней.
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              etcd-operator.cozystack.io/cluster: etcdcluster-sample
+
+  # Разнос по зонам или стойкам, если нод достаточно.
   # topologySpreadConstraints:
   #   - maxSkew: 1
   #     topologyKey: topology.kubernetes.io/zone
   #     whenUnsatisfiable: DoNotSchedule
   #     labelSelector:
   #       matchLabels:
-  #         app.kubernetes.io/instance: etcdcluster-sample
+  #         etcd-operator.cozystack.io/cluster: etcdcluster-sample
+
+  # Сколько оператор пытается достичь заданного состояния, прежде чем принять
+  # вместо него то, что написано в spec сейчас.
+  progressDeadlineSeconds: 600
+
+  # Дополнительные метки и аннотации на каждый объект, который оператор создаёт
+  # для этого кластера: поды членов, PVC, Service, PDB, объекты EtcdMember.
+  # Ключи, принадлежащие оператору, всегда побеждают при столкновении.
+  # additionalMetadata:
+  #   labels:
+  #     cozystack.io/tenant: foo
+  #   annotations:
+  #     example.com/note: managed-by-cozystack
+
+  # TLS. Всё поддерево неизменяемо после создания — добавить или убрать TLS у
+  # живого кластера нельзя, только пересоздать. Решайте до первой установки.
+  # tls:
+  #   client:
+  #     certManager:
+  #       issuerRef: {name: etcd-ca, kind: ClusterIssuer}
+  #   peer:
+  #     certManager:
+  #       issuerRef: {name: etcd-ca, kind: ClusterIssuer}
+
+  # Аутентификация внутри etcd (единственный пользователь root). Тоже
+  # неизменяема после создания и требует tls.client.
+  #
+  # Секрет надо беречь: снапшот etcd хранит bcrypt-хэш пароля, поэтому
+  # восстановленный кластер примет только тот пароль, что действовал на момент
+  # снятия снапшота.
+  # auth:
+  #   enabled: true
+  #   rootCredentialsSecretRef:
+  #     name: etcd-root-credentials
+
+  # Восстановление при первом бутстрапе. Читается ровно один раз, при рождении
+  # кластера, и неизменяемо после — это способ пересоздать кластер из снапшота
+  # при аварийном восстановлении, а не то, что стоит оставлять на работающем
+  # кластере. Порядок действий — в docs/operations.md.
+  #
+  # checksum задавать стоит всегда, когда восстановление важно: снапшот etcd не
+  # несёт собственного хэша, поэтому etcdutl запускается с --skip-hash-check, и
+  # эта контрольная сумма — единственная проверка целостности на всём пути.
+  # Без неё усечённый или повреждённый объект даст data-dir, на котором etcd
+  # спокойно стартует, и кластер будет выглядеть здоровым.
+  # bootstrap:
+  #   restore:
+  #     checksum: "sha256:9f2b..."      # status.artifact.checksum снапшота
+  #     source:
+  #       s3:
+  #         endpoint: https://s3.example.com
+  #         bucket: etcd-snapshots
+  #         key: etcdcluster-sample/etcdcluster-sample-29558640.db  # ТОЧНЫЙ ключ
+  #         region: us-east-1
+  #         forcePathStyle: true
+  #         credentialsSecretRef:
+  #           name: s3-creds
+
+---
+# Регулярные бэкапы этого кластера.
+#
+# Не «приятное дополнение»: одночленный кластер оператор не чинит сам, а
+# трёхчленный переживает потерю члена, но не потерю данных. Отсутствие бэкапов
+# незаметно ровно до момента восстановления.
+apiVersion: etcd-operator.cozystack.io/v1alpha2
+kind: EtcdSnapshotPolicy
+metadata:
+  # Не длиннее 44 символов: имя политики — голова цепочки. «<политика>-<тик>»
+  # даёт имя снапшота, «<снапшот>-snapshot» — имя Job, а Job длиннее 63
+  # символов apiserver отклоняет.
+  name: etcdcluster-sample
+spec:
+  clusterRef:
+    name: etcdcluster-sample
+
+  schedule:
+    # Пять полей; сокращения вроде @daily не принимаются.
+    cron: "0 */6 * * *"
+    # Зона IANA, в которой читается расписание. Отсутствие означает UTC.
+    timezone: Europe/Moscow
+
+  destination:
+    s3:
+      endpoint: https://s3.example.com
+      bucket: etcd-snapshots
+      # Здесь key — ПРЕФИКС, в отличие от источника восстановления, где это
+      # точный ключ объекта. Каждый запуск дописывает собственное имя, поэтому
+      # запуски не перезаписывают друг друга.
+      key: etcdcluster-sample/
+      region: us-east-1
+      forcePathStyle: true
+      credentialsSecretRef:
+        name: s3-creds
+
+  # Успехи и отказы ограничиваются раздельно: серия отказов не должна вытеснить
+  # успешные снапшоты — единственное, на что можно указать при восстановлении.
+  successfulHistoryLimit: 10
+  failedHistoryLimit: 3
+
+  # Удалять ли вместе с объектом EtcdSnapshot сам сохранённый снапшот.
+  # Выключено по умолчанию: удаление бэкапов не должно начинаться из-за того,
+  # что сработало умолчание лимита хранения.
+  #
+  # Удаляется ровно один объект — тот, что записан в status.artifact удаляемого
+  # снапшота. Оператор никогда не перечисляет содержимое хранилища и не удаляет
+  # по префиксу или возрасту: бэкапный бакет часто общий, и «удалить всё старше
+  # N под этим префиксом» — это то, как политика хранения съедает чужие бэкапы.
+  # deleteArtifactOnPrune: true
+
+  # Пауза без удаления политики. Снапшоты, уже запущенные, не трогаются.
+  # suspend: true
+
+  # Насколько поздно ещё можно запустить пропущенный тик, в секундах.
+  # Отсутствие означает «без предельного срока».
+  # startingDeadlineSeconds: 600

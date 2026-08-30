@@ -1,8 +1,9 @@
-# RBAC for the operator. The manager ClusterRole's rules are generated from the
-# +kubebuilder:rbac markers into files/manager-role-rules.yaml (by `make
-# manifests`) and pulled in below — a single source of truth, guarded by
-# ci.yml's codegen-drift gate. The release-scoped name, labels, binding, and the
-# leader-election / proxy roles stay templated here.
+{{- if .Values.operator.enabled }}
+# RBAC оператора. Правила ClusterRole менеджера генерируются из маркеров
+# +kubebuilder:rbac в files/manager-role-rules.yaml (командой `make manifests`) и
+# подтягиваются ниже — единственный источник истины, за которым следит
+# codegen-drift гейт в ci.yml. Имя в рамках релиза, метки, привязка и роли для
+# лидерских выборов и прокси остаются шаблонами здесь.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -91,9 +92,9 @@ subjects:
   name: {{ include "etcd-operator.serviceAccountName" . }}
   namespace: {{ .Release.Namespace }}
 ---
-# Convenience role granting GET on /metrics through the proxy (e.g. for a
-# Prometheus scrape identity). Folded in from config/rbac's metrics-reader;
-# the chart defines it but does not bind it.
+# Вспомогательная роль, дающая GET на /metrics через прокси (например, для
+# учётной записи, которой Prometheus снимает метрики). Перенесена из
+# metrics-reader в config/rbac; чарт её определяет, но ни к кому не привязывает.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -103,4 +104,5 @@ metadata:
 rules:
 - nonResourceURLs: ["/metrics"]
   verbs: [get]
+{{- end }}
 {{- end }}

@@ -1,0 +1,100 @@
+suite: Alerts wake someone when the metrics say something is wrong
+
+# Metrics without alerts are a dashboard nobody is looking at. The two
+# failures this chart has to make loud are the ones that stay invisible
+# until a disaster: a cluster running one member short (quorum intact, no
+# failure margin) and a cluster whose backups quietly stopped.
+
+templates:
+  - prometheusrule.yaml
+
+tests:
+  - it: emits nothing by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: emits a PrometheusRule when asked
+    set:
+      metrics.prometheusRule.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: PrometheusRule
+      - equal:
+          path: metadata.namespace
+          value: NAMESPACE
+
+  # The chart installs clusters as well as the operator, so a release with
+  # operator.enabled=false is a clusters-only release: it must not carry
+  # alerts for an operator it does not run.
+  - it: stays out of a clusters-only release
+    set:
+      metrics.prometheusRule.enabled: true
+      operator.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  # A prometheus-operator selects rules by ruleSelector; without the label
+  # it deploys the object and silently never picks it up.
+  - it: carries additional labels for the rule selector
+    set:
+      metrics.prometheusRule.enabled: true
+      metrics.prometheusRule.additionalLabels:
+        release: kube-prometheus-stack
+    asserts:
+      - equal:
+          path: metadata.labels.release
+          value: kube-prometheus-stack
+
+  # "Never backed up" cannot be expressed as a comparison: the collector
+  # emits snapshot_last_success_* only for clusters that have one, so the
+  # series is absent rather than zero. `unless` is the only form that
+  # catches it — a regression to `== 0` would make this alert never fire.
+  - it: detects a never-snapshotted cluster with unless, not a comparison
+    set:
+      metrics.prometheusRule.enabled: true
+    asserts:
+      - matchRegex:
+          path: spec.groups[1].rules[1].expr
+          pattern: "unless on \\(namespace, cluster\\)"
+      - equal:
+          path: spec.groups[1].rules[1].alert
+          value: EtcdClusterNeverSnapshotted
+
+  - it: threads the snapshot age threshold into the expression
+    set:
+      metrics.prometheusRule.enabled: true
+      metrics.prometheusRule.snapshotMaxAgeSeconds: 7200
+    asserts:
+      - matchRegex:
+          path: spec.groups[1].rules[0].expr
+          pattern: "> 7200"
+
+  - it: threads the never-snapshotted grace period into for
+    set:
+      metrics.prometheusRule.enabled: true
+      metrics.prometheusRule.neverSnapshottedFor: 6h
+    asserts:
+      - equal:
+          path: spec.groups[1].rules[1].for
+          value: 6h
+
+  # Quorum arithmetic, not a fixed number: a 3-member cluster loses quorum
+  # below 2, a 5-member one below 3. Hardcoding either would leave one of
+  # the two shapes unalerted.
+  - it: derives the quorum threshold from the desired member count
+    set:
+      metrics.prometheusRule.enabled: true
+    asserts:
+      - equal:
+          path: spec.groups[0].rules[1].alert
+          value: EtcdClusterQuorumLost
+      - matchRegex:
+          path: spec.groups[0].rules[1].expr
+          pattern: "floor\\(etcd_operator_cluster_members_desired / 2\\) \\+ 1"
+      - equal:
+          path: spec.groups[0].rules[1].labels.severity
+          value: critical

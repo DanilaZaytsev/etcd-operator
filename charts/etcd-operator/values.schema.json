@@ -1,0 +1,850 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "etcd-operator chart values",
+  "description": "Validated at install/upgrade time by Helm. The point is not exhaustive typing but catching the two mistakes that otherwise fail silently: a misspelled key (which Helm would accept and ignore, leaving the default in place) and a value of the wrong shape (which surfaces as an unreadable template error or, worse, a rendered manifest the apiserver rejects halfway through an upgrade).",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "crds": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "keep": {
+          "type": "boolean"
+        }
+      }
+    },
+    "memberDeletionProtection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "additionalAllowedUsers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "denyMemoryStorage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "namespace": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": {
+          "type": "boolean"
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "serviceMonitor": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "additionalLabels": {
+              "type": "object"
+            },
+            "interval": {
+              "type": "string"
+            },
+            "scrapeTimeout": {
+              "type": "string"
+            },
+            "insecureSkipVerify": {
+              "type": "boolean"
+            },
+            "relabelings": {
+              "type": "array"
+            },
+            "metricRelabelings": {
+              "type": "array"
+            }
+          }
+        },
+        "prometheusRule": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "additionalLabels": {
+              "type": "object"
+            },
+            "snapshotMaxAgeSeconds": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "neverSnapshottedFor": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag": {
+          "type": "string"
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": [
+            "Always",
+            "IfNotPresent",
+            "Never"
+          ]
+        }
+      }
+    },
+    "etcdImage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Registry host + path, no tag: the tag is always derived from each cluster's spec.version.",
+          "not": {
+            "pattern": ":"
+          }
+        }
+      }
+    },
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "priorityClassName": {
+      "type": "string"
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "minAvailable": {
+          "type": [
+            "integer",
+            "string"
+          ]
+        }
+      }
+    },
+    "defaultAntiAffinity": {
+      "type": "boolean"
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "nameOverride": {
+      "type": "string"
+    },
+    "fullnameOverride": {
+      "type": "string"
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "annotations": {
+          "type": "object"
+        }
+      }
+    },
+    "podAnnotations": {
+      "type": "object"
+    },
+    "podLabels": {
+      "type": "object"
+    },
+    "nodeSelector": {
+      "type": "object"
+    },
+    "tolerations": {
+      "type": "array"
+    },
+    "affinity": {
+      "type": "object"
+    },
+    "manager": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "watchNamespaces": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "clusterDomain": {
+          "type": "string"
+        },
+        "seccompProfile": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "null omits the field; an empty object does NOT, because Helm merges maps rather than replacing them."
+        },
+        "maxConcurrentReconciles": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "resources": {
+          "type": "object"
+        }
+      }
+    },
+    "kubeRbacProxy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string",
+              "minLength": 1
+            },
+            "tag": {
+              "type": "string",
+              "minLength": 1
+            },
+            "pullPolicy": {
+              "type": "string",
+              "enum": [
+                "Always",
+                "IfNotPresent",
+                "Never"
+              ]
+            }
+          }
+        },
+        "resources": {
+          "type": "object"
+        }
+      }
+    },
+    "metricsService": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      }
+    },
+    "operator": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "clusterDefaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Defaults every entry in `clusters` inherits and may override.",
+      "properties": {
+        "replicas": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "storage": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "size": {
+              "type": [
+                "string",
+                "integer"
+              ]
+            },
+            "storageClassName": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "null uses the namespace default StorageClass; the empty string disables dynamic provisioning (pre-provisioned PV only)."
+            },
+            "pools": {
+              "type": "array",
+              "maxItems": 5,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+                    "maxLength": 63
+                  },
+                  "storageClassName": {
+                    "type": "string"
+                  },
+                  "size": {
+                    "type": [
+                      "string",
+                      "integer"
+                    ]
+                  },
+                  "affinity": {
+                    "type": "object"
+                  },
+                  "disabled": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "resources": {
+          "type": "object"
+        },
+        "options": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "quotaBackendBytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "autoCompactionMode": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "periodic",
+                "revision",
+                "",
+                null
+              ]
+            },
+            "autoCompactionRetention": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "snapshotCount": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "heartbeatIntervalMilliseconds": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1,
+              "maximum": 60000
+            },
+            "electionTimeoutMilliseconds": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1,
+              "maximum": 50000
+            },
+            "maxWals": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "maxSnapshots": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "backendBatchLimit": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "backendBatchIntervalMilliseconds": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            }
+          }
+        },
+        "antiAffinity": {
+          "type": "string",
+          "enum": [
+            "soft",
+            "hard",
+            "none"
+          ]
+        },
+        "affinity": {
+          "type": "object"
+        },
+        "topologySpreadConstraints": {
+          "type": "array"
+        },
+        "additionalMetadata": {
+          "type": "object"
+        },
+        "progressDeadlineSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "imagePullSecrets": {
+          "type": "array"
+        },
+        "tls": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "spec": {
+              "type": "object"
+            }
+          }
+        },
+        "auth": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "rootCredentialsSecretRef": {
+              "type": "string"
+            }
+          }
+        },
+        "restore": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "checksum": {
+              "type": "string",
+              "pattern": "^$|^sha256:[0-9a-f]{64}$"
+            },
+            "source": {
+              "type": "object"
+            }
+          }
+        },
+        "backup": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "schedule": {
+              "type": "string",
+              "minLength": 1
+            },
+            "spread": {
+              "type": "boolean"
+            },
+            "timezone": {
+              "type": "string"
+            },
+            "suspend": {
+              "type": "boolean"
+            },
+            "concurrencyPolicy": {
+              "type": "string",
+              "enum": [
+                "Allow",
+                "Forbid"
+              ]
+            },
+            "startingDeadlineSeconds": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 315360000
+            },
+            "successfulHistoryLimit": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "failedHistoryLimit": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "deleteArtifactOnPrune": {
+              "type": "boolean"
+            },
+            "destination": {
+              "type": "object"
+            }
+          }
+        }
+      }
+    },
+    "clustersKeepOnUninstall": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "null decides by release shape: keep when this release also installs the operator, let go when it carries only clusters."
+    },
+    "clusters": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 52,
+            "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+            "description": "The EtcdCluster's name, and the name of its client Service. Capped at 52 so the operator's GenerateName'd member, Pod and PVC names stay within 63."
+          },
+          "replicas": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "version": {
+            "type": "string",
+            "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+          },
+          "storage": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "size": {
+                "type": [
+                  "string",
+                  "integer"
+                ]
+              },
+              "storageClassName": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "null uses the namespace default StorageClass; the empty string disables dynamic provisioning (pre-provisioned PV only)."
+              },
+              "pools": {
+                "type": "array",
+                "maxItems": 5,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "name"
+                  ],
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+                      "maxLength": 63
+                    },
+                    "storageClassName": {
+                      "type": "string"
+                    },
+                    "size": {
+                      "type": [
+                        "string",
+                        "integer"
+                      ]
+                    },
+                    "affinity": {
+                      "type": "object"
+                    },
+                    "disabled": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "resources": {
+            "type": "object"
+          },
+          "options": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "quotaBackendBytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "autoCompactionMode": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "enum": [
+                  "periodic",
+                  "revision",
+                  "",
+                  null
+                ]
+              },
+              "autoCompactionRetention": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "snapshotCount": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1
+              },
+              "heartbeatIntervalMilliseconds": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1,
+                "maximum": 60000
+              },
+              "electionTimeoutMilliseconds": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1,
+                "maximum": 50000
+              },
+              "maxWals": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1
+              },
+              "maxSnapshots": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1
+              },
+              "backendBatchLimit": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1
+              },
+              "backendBatchIntervalMilliseconds": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1
+              }
+            }
+          },
+          "antiAffinity": {
+            "type": "string",
+            "enum": [
+              "soft",
+              "hard",
+              "none"
+            ]
+          },
+          "affinity": {
+            "type": "object"
+          },
+          "topologySpreadConstraints": {
+            "type": "array"
+          },
+          "additionalMetadata": {
+            "type": "object"
+          },
+          "progressDeadlineSeconds": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "imagePullSecrets": {
+            "type": "array"
+          },
+          "tls": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "spec": {
+                "type": "object"
+              }
+            }
+          },
+          "auth": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "rootCredentialsSecretRef": {
+                "type": "string"
+              }
+            }
+          },
+          "restore": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "checksum": {
+                "type": "string",
+                "pattern": "^$|^sha256:[0-9a-f]{64}$"
+              },
+              "source": {
+                "type": "object"
+              }
+            }
+          },
+          "backup": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "schedule": {
+                "type": "string",
+                "minLength": 1
+              },
+              "spread": {
+                "type": "boolean"
+              },
+              "timezone": {
+                "type": "string"
+              },
+              "suspend": {
+                "type": "boolean"
+              },
+              "concurrencyPolicy": {
+                "type": "string",
+                "enum": [
+                  "Allow",
+                  "Forbid"
+                ]
+              },
+              "startingDeadlineSeconds": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0,
+                "maximum": 315360000
+              },
+              "successfulHistoryLimit": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "failedHistoryLimit": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "deleteArtifactOnPrune": {
+                "type": "boolean"
+              },
+              "destination": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

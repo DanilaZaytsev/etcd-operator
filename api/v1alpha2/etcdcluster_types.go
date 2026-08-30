@@ -263,6 +263,15 @@ const (
 // effect on newly-created members (scale-up, replacement) only; the operator
 // does not roll existing Pods to apply a tuning change in place. Delete one
 // Pod at a time to re-template members, or recreate the cluster.
+//
+// etcd's own guidance is that the election timeout must be at least 5x the
+// heartbeat interval; below that, one slow heartbeat round is enough to start
+// an election, and a cluster on network storage will flap its leader under
+// ordinary write load. Enforced rather than documented because the failure it
+// produces — periodic leader changes, no error anywhere — is very hard to
+// attribute back to the setting.
+// +kubebuilder:validation:XValidation:rule="!has(self.heartbeatIntervalMilliseconds) || !has(self.electionTimeoutMilliseconds) || self.electionTimeoutMilliseconds >= 5 * self.heartbeatIntervalMilliseconds",message="options.electionTimeoutMilliseconds must be at least 5x options.heartbeatIntervalMilliseconds (etcd's own guidance); a smaller ratio makes the cluster re-elect its leader under ordinary write latency"
+// +kubebuilder:validation:XValidation:rule="!has(self.heartbeatIntervalMilliseconds) || has(self.electionTimeoutMilliseconds)",message="options.heartbeatIntervalMilliseconds requires options.electionTimeoutMilliseconds to be set alongside it: etcd's default election timeout is 1000ms, so any heartbeat above 200ms would silently break the 5x ratio"
 type EtcdOptions struct {
 	// QuotaBackendBytes sets --quota-backend-bytes: the backend database
 	// size limit in bytes before the member raises the cluster-wide
@@ -297,6 +306,64 @@ type EtcdOptions struct {
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	SnapshotCount *int64 `json:"snapshotCount,omitempty"`
+
+	// HeartbeatIntervalMilliseconds sets --heartbeat-interval: how often the
+	// leader pings followers. etcd's default is 100ms, chosen for a local SSD
+	// and a 1ms-RTT network.
+	//
+	// Persistent storage that is not node-local — a SAN, or any network-
+	// attached array — has fsync latencies an order of magnitude higher, and a
+	// heartbeat round that has to wait behind one of those makes followers
+	// declare the leader dead. etcd's guidance is to set this near the round
+	// -trip time between members and raise the election timeout with it.
+	// Typical values on network storage are 250-500ms.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=60000
+	// +optional
+	HeartbeatIntervalMilliseconds *int64 `json:"heartbeatIntervalMilliseconds,omitempty"`
+
+	// ElectionTimeoutMilliseconds sets --election-timeout: how long a follower
+	// waits without a heartbeat before standing for election. etcd's default
+	// is 1000ms. Must be at least 5x the heartbeat interval (enforced above),
+	// and etcd refuses to start above 50s.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=50000
+	// +optional
+	ElectionTimeoutMilliseconds *int64 `json:"electionTimeoutMilliseconds,omitempty"`
+
+	// MaxWals sets --max-wals: how many WAL files to retain. etcd's default
+	// is 5, each up to 64MiB. Lowering it bounds the data directory's
+	// steady-state size on an array where capacity is charged per volume;
+	// raising it lengthens the window a member can be recovered from its own
+	// WAL rather than by a full resync from the leader.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxWals *int64 `json:"maxWals,omitempty"`
+
+	// MaxSnapshots sets --max-snapshots: how many raft snapshot files to
+	// retain. etcd's default is 5. Same trade-off as MaxWals.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxSnapshots *int64 `json:"maxSnapshots,omitempty"`
+
+	// BackendBatchLimit sets --backend-batch-limit: how many operations
+	// before the backend commits a batch. Absent means etcd's default.
+	//
+	// Together with BackendBatchIntervalMilliseconds this trades commit
+	// latency for fsync count. On an array where each fsync is expensive,
+	// batching harder cuts the fsync rate at the cost of a longer worst-case
+	// commit; the pair is the main lever for a cluster whose
+	// etcd_disk_backend_commit_duration_seconds is dominated by the storage
+	// rather than by etcd.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	BackendBatchLimit *int64 `json:"backendBatchLimit,omitempty"`
+
+	// BackendBatchIntervalMilliseconds sets --backend-batch-interval: how long
+	// before the backend commits a batch. Absent means etcd's default.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	BackendBatchIntervalMilliseconds *int64 `json:"backendBatchIntervalMilliseconds,omitempty"`
 }
 
 // Condition types for EtcdCluster.
@@ -332,6 +399,27 @@ type RestoreSpec struct {
 	// Source is where the snapshot is read from (S3 or PVC). Same shape as
 	// an EtcdSnapshot destination.
 	Source SnapshotLocation `json:"source"`
+
+	// Checksum is the expected SHA-256 of the snapshot file, in the
+	// "sha256:<64 hex>" form EtcdSnapshot records in
+	// status.artifact.checksum. When set, the restore agent verifies the
+	// fetched snapshot against it and refuses to rebuild the data dir on a
+	// mismatch.
+	//
+	// Worth setting for any restore that matters. etcd's own integrity check
+	// is not available here: a snapshot taken through the clientv3
+	// Maintenance API carries no hash, so `etcdutl snapshot restore` has to
+	// run with --skip-hash-check. This checksum is therefore the only thing
+	// standing between a truncated or corrupted object and a data directory
+	// rebuilt from it — and a cluster restored from a bad snapshot looks
+	// healthy until someone reads the missing data.
+	//
+	// Absent means no verification, which is the pre-existing behaviour and
+	// stays the default: a snapshot taken before the operator recorded
+	// checksums, or copied in by hand, has none to check against.
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	// +optional
+	Checksum string `json:"checksum,omitempty"`
 }
 
 // StorageMedium selects the volume backend for each member's etcd data
@@ -363,6 +451,76 @@ const (
 	// StorageMediumMemory uses a tmpfs emptyDir per member.
 	StorageMediumMemory StorageMedium = "Memory"
 )
+
+// StoragePool is one storage backend a cluster's members can be placed on.
+//
+// A cluster that lists several pools spreads its members across them: the
+// cluster controller assigns each new member the least-used enabled pool
+// (ties broken by declaration order), so a 3-replica cluster over three
+// pools lands exactly one member per pool. That makes the storage array
+// itself a failure domain, which a single spec.storage.storageClassName
+// cannot express.
+//
+// Members are named with GenerateName, not ordinals, so there is no
+// "replica i -> pool i" mapping to rely on: the assignment is recorded on
+// each EtcdMember (spec.storagePool, and the
+// etcd-operator.cozystack.io/storage-pool label on the member, its Pod and
+// its PVC) and recomputed from the live members whenever one is created.
+// A replacement member therefore lands back in the pool the lost member
+// vacated, because that pool is the least-used one.
+// The per-pool immutability rules live here rather than on EtcdClusterSpec.
+// Because Pools is a listType=map keyed on name, the apiserver correlates each
+// item with its old self, so these fire per pool and cost O(n) — the
+// equivalent spec-level rules had to scan the list for each entry and blew the
+// CRD's CEL cost budget outright (the whole CRD was then rejected at install).
+// +kubebuilder:validation:XValidation:rule="has(self.storageClassName) == has(oldSelf.storageClassName) && (!has(self.storageClassName) || self.storageClassName == oldSelf.storageClassName)",message="spec.storage.pools[].storageClassName is immutable: a PVC's storageClassName cannot be changed in place and the operator does not roll PVCs. Append a new pool instead."
+// +kubebuilder:validation:XValidation:rule="has(self.size) == has(oldSelf.size) && (!has(self.size) || quantity(string(self.size)).compareTo(quantity(string(oldSelf.size))) >= 0)",message="spec.storage.pools[].size cannot be shrunk or dropped once set (a PVC cannot shrink, and dropping the override falls back to the smaller cluster-wide size)"
+type StoragePool struct {
+	// Name identifies the pool within the cluster. It is recorded on each
+	// member and used as a label value, so it must be a DNS-1123 label.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Name string `json:"name"`
+
+	// StorageClassName is the StorageClass for PVCs provisioned in this
+	// pool. Same semantics as spec.storage.storageClassName: nil uses the
+	// namespace's default StorageClass, "" disables dynamic provisioning,
+	// any other value names a StorageClass.
+	//
+	// Immutable once the pool exists — a PVC's storageClassName cannot be
+	// changed in place and the operator does not roll PVCs.
+	// +optional
+	StorageClassName *string `json:"storageClassName,omitempty"`
+
+	// Size overrides spec.storage.size for members placed in this pool.
+	// Absent means the cluster-wide size. Grow-only, like the cluster-wide
+	// field: PVCs cannot shrink.
+	// +optional
+	Size *resource.Quantity `json:"size,omitempty"`
+
+	// Affinity is merged into the Pod affinity of members placed in this
+	// pool, for arrays that are only reachable from some nodes (a
+	// rack-local or site-local array). Absent means the cluster-wide
+	// spec.affinity applies unchanged. When both are set the pool's
+	// nodeAffinity/podAffinity/podAntiAffinity terms replace the
+	// cluster-wide ones for that member — a member sits in exactly one
+	// pool, so there is nothing to intersect.
+	// +optional
+	Affinity *corev1.Affinity `json:"affinity,omitempty"`
+
+	// Disabled cordons the pool: no NEW member is placed in it. Existing
+	// members and their PVCs are untouched.
+	//
+	// This is the break-glass for a failed array. Without it, a member lost
+	// on a dead array is replaced into that same array (it is the least-used
+	// pool) and the replacement's PVC stays Pending forever. Cordon the pool
+	// and the replacement lands somewhere healthy.
+	//
+	// The only mutable field of a pool.
+	// +optional
+	Disabled bool `json:"disabled,omitempty"`
+}
 
 // StorageSpec configures the per-member data directory.
 type StorageSpec struct {
@@ -408,6 +566,32 @@ type StorageSpec struct {
 	// the field is being added from nil.
 	// +optional
 	StorageClassName *string `json:"storageClassName,omitempty"`
+
+	// Pools spreads the cluster's members across several storage backends,
+	// one member per pool until every pool holds one, so that a storage
+	// array is a failure domain. See StoragePool for the assignment rule.
+	//
+	// Mutually exclusive with StorageClassName (which is the single-backend
+	// form of the same thing) and unsupported with Medium=Memory (no PVC is
+	// created). Set only on EtcdCluster: on an EtcdMember the field is left
+	// empty and the resolved StorageClassName/Size are what the member's PVC
+	// is built from.
+	//
+	// Append-only post-create: new pools may be added (to take on a new
+	// array), but an existing pool cannot be removed or repointed at another
+	// StorageClass, because its PVCs are already bound. Its Size may grow and
+	// its Disabled flag may be flipped.
+	// +listType=map
+	// +listMapKey=name
+	// MaxItems is what bounds the CEL cost of the per-pool transition rules
+	// (cost scales linearly with it) and of the append-only scan below
+	// (quadratically). At 8 the apiserver rejected the CRD outright; 5 leaves
+	// real margin and still covers the realistic layouts, since etcd clusters
+	// are 3, 5 or 7 members and one array per member is the point.
+	// +kubebuilder:validation:MaxItems=5
+	// +kubebuilder:validation:XValidation:rule="oldSelf.all(p, self.exists(q, q.name == p.name))",message="spec.storage.pools is append-only: an existing pool cannot be removed or renamed, because its PVCs are already bound to it. Appending a new pool is allowed."
+	// +optional
+	Pools []StoragePool `json:"pools,omitempty"`
 }
 
 // EtcdClusterSpec defines the desired state of an etcd cluster.
@@ -438,6 +622,15 @@ type StorageSpec struct {
 // +kubebuilder:validation:XValidation:rule="has(self.bootstrap) == has(oldSelf.bootstrap)",message="spec.bootstrap cannot be added to or removed from an existing cluster; it is consulted only at first bootstrap"
 // +kubebuilder:validation:XValidation:rule="!has(self.bootstrap) || !has(oldSelf.bootstrap) || self.bootstrap == oldSelf.bootstrap",message="spec.bootstrap is immutable post-create; it is consulted only at first bootstrap"
 // +kubebuilder:validation:XValidation:rule="!(has(self.bootstrap) && has(self.bootstrap.restore)) || !(has(self.storage) && has(self.storage.medium) && self.storage.medium == 'Memory')",message="spec.bootstrap.restore is unsupported with spec.storage.medium=Memory: the restored data dir is tmpfs, so any seed Pod restart re-restores the snapshot — reverting writes (single member) or breaking the cluster with a fresh ID it can't rejoin (multi-member). Use persistent storage to restore."
+//
+// Storage-pool rules. Pools are the multi-array form of storageClassName, so
+// the two cannot both be set; they need a PVC, so they are incompatible with
+// Medium=Memory; and because each pool's PVCs are already bound to its
+// StorageClass, a pool cannot be removed or repointed once it exists — only
+// added, grown, or cordoned.
+// +kubebuilder:validation:XValidation:rule="!(has(self.storage.pools) && size(self.storage.pools) > 0 && has(self.storage.storageClassName))",message="spec.storage.pools and spec.storage.storageClassName are mutually exclusive: pools is the multi-backend form of the same setting"
+// +kubebuilder:validation:XValidation:rule="!(has(self.storage.pools) && size(self.storage.pools) > 0 && has(self.storage.medium) && self.storage.medium == 'Memory')",message="spec.storage.pools is unsupported with spec.storage.medium=Memory: a memory-backed member has no PVC to place on a StorageClass"
+// +kubebuilder:validation:XValidation:rule="has(self.storage.pools) == has(oldSelf.storage.pools)",message="spec.storage.pools cannot be added to or removed from an existing cluster (its members' PVCs are already bound); delete and recreate"
 type EtcdClusterSpec struct {
 	// Replicas is the desired number of cluster members. Should be odd.
 	// A value of 0 parks the cluster ("scale to zero"): the operator
@@ -644,6 +837,17 @@ type ObservedClusterSpec struct {
 
 // EtcdClusterStatus defines the observed state of an etcd cluster.
 type EtcdClusterStatus struct {
+	// ObservedGeneration is the metadata.generation this controller has
+	// completed a reconcile pass for. Every condition below carries its own
+	// observedGeneration, but a client that waits on the object as a whole
+	// needs one field to compare against metadata.generation: without it a
+	// status left over from the previous spec is indistinguishable from one
+	// that reflects the spec just applied, and `kubectl wait` or a GitOps
+	// health check reports Ready against a generation the operator has not
+	// looked at yet.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
 	// ReadyMembers is the count of members that are healthy and serving.
 	// Also exposed as Scale.Status.Replicas via the /scale subresource so
 	// kubectl scale and clients like VerticalPodAutoscaler can read
@@ -709,6 +913,7 @@ type EtcdClusterStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
+// +kubebuilder:resource:shortName=etcdc,categories=etcd
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.readyMembers,selectorpath=.status.selector

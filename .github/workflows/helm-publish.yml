@@ -51,6 +51,19 @@ jobs:
           # Chart version is semver without the leading v; appVersion keeps it.
           echo "RELEASE_TAG_TRIMMED_V=${TAG#v}" >> "$GITHUB_ENV"
 
+      # Gate the publish on the chart's own tests. ci.yml runs these on PRs, but
+      # this workflow also regenerates the CRDs and RBAC into the chart just
+      # above — so what is about to be pushed is not byte-for-byte what CI saw.
+      # Publishing a broken chart to a tagged version is not something a later
+      # commit can undo.
+      - name: Install helm-unittest
+        run: helm plugin install https://github.com/helm-unittest/helm-unittest --verify=false
+
+      - name: Lint and test the charts
+        run: |
+          helm lint charts/etcd-operator
+          helm unittest charts/etcd-operator
+
       - name: Helm registry login
         env:
           ACTOR: ${{ github.actor }}

@@ -2,6 +2,12 @@ apiVersion: v2
 name: etcd-operator
 description: Kubernetes operator for running etcd clusters (etcd-operator.cozystack.io/v1alpha2)
 type: application
+# The operator's CRDs use CEL validation rules (GA in 1.29) and the quantity()
+# CEL extension. Deliberately NOT >=1.30 even though memberDeletionProtection
+# needs ValidatingAdmissionPolicy: that guard carries its own opt-out, and
+# making its floor the whole chart's floor would lock 1.29 clusters out of an
+# install they can otherwise run correctly.
+kubeVersion: ">= 1.29.0-0"
 # Placeholders. The release pipeline (helm-publish.yml) sets the real values
 # from the git tag: --version <tag without v>, --app-version <tag>.
 version: 0.0.0

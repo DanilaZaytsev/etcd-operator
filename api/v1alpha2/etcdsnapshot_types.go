@@ -72,7 +72,22 @@ type PVCSnapshotLocation struct {
 	// +kubebuilder:validation:MinLength=1
 	ClaimName string `json:"claimName"`
 
-	// SubPath is an optional subdirectory within the volume.
+	// SubPath means two different things depending on which side of the
+	// snapshot lifecycle this location sits on — the same asymmetry S3's
+	// Key field has:
+	//
+	//   - As a DESTINATION (EtcdSnapshot.spec.destination,
+	//     EtcdSnapshotPolicy.spec.destination) it is a subdirectory. The
+	//     agent appends its own generated filename, so consecutive runs do
+	//     not overwrite each other. Setting "backups" yields
+	//     <mount>/backups/<snapshot-name>.db.
+	//
+	//   - As a RESTORE SOURCE (EtcdCluster.spec.bootstrap.restore.source) it
+	//     is the exact path of the snapshot file within the volume, not a
+	//     directory: "backups/my-cluster-29558640.db". Pointing it at a
+	//     directory fails the restore. Take the value from the snapshot's
+	//     status.artifact.uri with the volume's mount path stripped.
+	//
 	// +optional
 	SubPath string `json:"subPath,omitempty"`
 }
@@ -141,8 +156,15 @@ type EtcdSnapshotStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
+// +kubebuilder:resource:shortName=etcdsnap,categories=etcd
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// The snapshot controller names its Job "<snapshot>-snapshot", and the
+// apiserver rejects a Job whose name exceeds 63 characters (the Job controller
+// copies it into a Pod label). Without this cap a snapshot with a long name is
+// accepted, then never runs — the failure surfacing on an object the user did
+// not create, naming a length they did not choose.
+// +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 54",message="metadata.name must be 54 characters or fewer: the snapshot Job is named <snapshot>-snapshot, and the apiserver caps a Job name at 63 characters"
 // +kubebuilder:printcolumn:name="Cluster",type=string,JSONPath=`.spec.clusterRef.name`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`

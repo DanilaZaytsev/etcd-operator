@@ -1,33 +1,33 @@
-# Concepts
+# Концепции
 
-This document explains the operator's design choices and the contracts they create. The goal is to give an operator running etcd clusters a working mental model — enough to predict what the controller will do, debug it when it doesn't, and read the conditions correctly.
+Этот документ объясняет решения, принятые при проектировании оператора, и контракты, которые из них вытекают. Цель — дать тому, кто эксплуатирует кластеры etcd, рабочую модель происходящего: достаточную, чтобы предсказывать действия контроллера, разбираться, когда он делает не то, и правильно читать условия.
 
-The reader is assumed to be k8s-fluent. For deployment steps see [installation](installation.md); for kubectl recipes see [operations](operations.md).
+Предполагается уверенное владение k8s. Шаги развёртывания — в [установке](installation.md); рецепты для kubectl — в [эксплуатации](operations.md).
 
-## API model
+## Модель API
 
-Two custom resources, one of them user-facing.
+Два пользовательских ресурса, из которых пользовательский только один.
 
-**`EtcdCluster`** — the user-facing object. It captures cluster-wide intent: replica count, etcd version, per-member storage size, a progress deadline. This is the only resource users normally touch.
+**`EtcdCluster`** — объект, обращённый к пользователю. Он фиксирует намерение на уровне кластера: число реплик, версию etcd, размер хранилища на члена, предельный срок продвижения. Обычно пользователи трогают только его.
 
-**`EtcdMember`** — one per etcd member. Created and deleted by the cluster controller. Each `EtcdMember` owns its Pod and PVC. Users should not create, edit or **delete** these directly.
+**`EtcdMember`** — по одному на каждого члена etcd. Создаётся и удаляется контроллером кластера. Каждый `EtcdMember` владеет своим подом и PVC. Пользователям не следует создавать, редактировать и тем более **удалять** их напрямую.
 
-Deleting one by hand is not a recoverable mistake: the member's PVC is controller-owned by it, so the data volume is removed with the CR (and on a `Delete`-reclaim StorageClass the data itself), while the member's finalizer removes the member from etcd on the way out. Delete every member of a cluster and it dismembers itself, leaving nothing to restore from. Scale the `EtcdCluster` instead — see [member deletion is denied at admission](#member-deletion-is-denied-at-admission).
+Удаление такого объекта руками — невосстановимая ошибка: PVC члена принадлежит ему как контроллеру, поэтому том с данными удаляется вместе с CR (а на StorageClass с политикой `Delete` — и сами данные), а финализатор члена по пути убирает его из etcd. Удалите всех членов кластера, и он разберёт сам себя, не оставив ничего для восстановления. Вместо этого масштабируйте `EtcdCluster` — см. [удаление члена запрещено на допуске](#удаление-члена-запрещено-на-допуске).
 
-There is **no StatefulSet**. Each member's Pod and PVC are reconciled independently by the member controller. The motivation is protocol awareness: scale-up adds a member as a learner first and only promotes once it's caught up; scale-down runs `MemberRemove` via a finalizer before reclaiming the Pod; pod restarts reuse the existing data dir and rejoin with the same etcd-side member ID. None of these flows fit StatefulSet's "all replicas are one fungible workload" model.
+**StatefulSet здесь нет.** Под и PVC каждого члена обрабатываются независимо контроллером члена. Мотив — осведомлённость о протоколе: увеличение сначала добавляет члена как learner и повышает его только после того, как он догнал; уменьшение выполняет `MemberRemove` через финализатор, прежде чем забрать под; перезапуски пода переиспользуют существующий data-dir и возвращаются в кластер с тем же member ID со стороны etcd. Ни один из этих потоков не укладывается в модель StatefulSet «все реплики — одна взаимозаменяемая нагрузка».
 
-The cluster controller decides *which* members exist and orchestrates the etcd-side state machine (`MemberAddAsLearner` / `MemberPromote` / `MemberRemove`). The member controller decides *how* a member becomes real — Pod, PVC, etcd flags — and reports observed facts (member ID, readiness) back up to its CR's status.
+Контроллер кластера решает, *какие* члены существуют, и управляет конечным автоматом на стороне etcd (`MemberAddAsLearner`, `MemberPromote`, `MemberRemove`). Контроллер члена решает, *как* член становится реальным — под, PVC, флаги etcd — и сообщает наблюдаемые факты (member ID, готовность) обратно в статус своего CR.
 
-## Member deletion is denied at admission
+## Удаление члена запрещено на допуске
 
-The chart installs a `ValidatingAdmissionPolicy` that rejects `DELETE` on `etcdmembers` for everyone except:
+Чарт устанавливает `ValidatingAdmissionPolicy`, которая отклоняет `DELETE` на `etcdmembers` для всех, кроме:
 
-- the operator's own ServiceAccount — scale-down and crash-loop replacement delete members deliberately;
-- `system:serviceaccount:kube-system:generic-garbage-collector` — a deleted `EtcdCluster` must still cascade to its members;
-- `system:serviceaccount:kube-system:namespace-controller` — deleting a namespace must not hang;
-- anything listed in `memberDeletionProtection.additionalAllowedUsers`, for platforms whose own controllers legitimately reap these objects.
+- собственного ServiceAccount оператора — уменьшение состава и замена при crash-loop удаляют членов намеренно;
+- `system:serviceaccount:kube-system:generic-garbage-collector` — удалённый `EtcdCluster` обязан по-прежнему каскадировать на своих членов;
+- `system:serviceaccount:kube-system:namespace-controller` — удаление неймспейса не должно зависать;
+- всего, что перечислено в `memberDeletionProtection.additionalAllowedUsers`, — для платформ, чьи собственные контроллеры законно убирают эти объекты.
 
-The rejection message says what would have happened and how to proceed deliberately. Break-glass without uninstalling the policy:
+Сообщение об отказе говорит, что бы произошло и как поступить осознанно. Разбить стекло, не удаляя политику:
 
 ```sh
 kubectl annotate etcdmember.etcd-operator.cozystack.io <member> -n <ns> \
@@ -35,228 +35,270 @@ kubectl annotate etcdmember.etcd-operator.cozystack.io <member> -n <ns> \
 kubectl delete etcdmember.etcd-operator.cozystack.io <member> -n <ns>
 ```
 
-The guard exists because the accident it prevents is unrecoverable and easy, and because nothing legitimately manages `EtcdMember` objects declaratively — the only sanctioned non-operator writer is `cmd/etcd-migrate`, which creates and never deletes. So a DELETE from anywhere else — a stray `kubectl delete`, a cleanup script sweeping CRs by label, a GitOps tool that wrongly tracks these objects (a tracking misconfiguration, not a workflow to support) — is always an accident. The controllers cannot make it survivable (a member's data volume is bound to its identity, and a replacement gets a fresh name and UID), so the event is stopped at the boundary instead.
+Защита существует потому, что предотвращаемая ею случайность невосстановима и легко совершается, и потому что ничто не управляет объектами `EtcdMember` декларативно на законных основаниях: единственный санкционированный писатель, кроме оператора, — это `cmd/etcd-migrate`, который только создаёт и никогда не удаляет. Поэтому DELETE откуда-либо ещё — случайный `kubectl delete`, скрипт очистки, выметающий CR по метке, инструмент GitOps, ошибочно отслеживающий эти объекты (ошибка в настройке слежения, а не рабочий процесс, который надо поддерживать), — это всегда случайность. Контроллеры не могут сделать её переживаемой (том с данными члена привязан к его идентичности, а замена получает новое имя и UID), поэтому событие останавливается на границе.
 
-Requires Kubernetes 1.30+ (`ValidatingAdmissionPolicy` GA). On older apiservers, install with `memberDeletionProtection.enabled=false`; the operator behaves as before, without the guard.
+Требует Kubernetes 1.30+ (`ValidatingAdmissionPolicy` в GA). На более старых apiserver устанавливайте с `memberDeletionProtection.enabled=false`; оператор ведёт себя как раньше, только без защиты.
 
-**Known limitation:** the guard does not cover member removal driven by *CRD* deletion. When the `etcdmembers` CRD is deleted, apiextensions cleans up the CR instances in-process, through the storage layer rather than the authenticated request path — the same route that keeps admission webhooks from firing for CRs deleted during CRD deletion — so admission (and this policy) never sees those deletes. `crds.keep=true` (the default) is what actually protects against that path.
+**Известное ограничение:** защита не покрывает удаление членов, вызванное удалением *CRD*. Когда удаляется CRD `etcdmembers`, apiextensions прибирает экземпляры CR внутри процесса, через слой хранения, а не через путь аутентифицированного запроса — тот же маршрут, из-за которого не срабатывают вебхуки допуска для CR, удаляемых при удалении CRD, — поэтому допуск (и эта политика) таких удалений просто не видит. От этого пути защищает `crds.keep=true` (умолчание).
 
-**Uninstalling:** `helm uninstall` removes the policy for you. A manual teardown should remove the policy too (see the [teardown runbook](installation.md#teardown)); ordering it before the CRD deletion is tidy but not load-bearing — per the limitation above, CRD cleanup bypasses the policy rather than stalling on it.
+**Удаление:** `helm uninstall` убирает политику за вас. Ручное сворачивание тоже должно её убрать (см. [порядок удаления](installation.md#удаление)); делать это до удаления CRD аккуратно, но не обязательно — согласно ограничению выше, очистка CRD обходит политику, а не упирается в неё.
 
-## Member naming
+## Именование членов
 
-`EtcdMember` CRs are created with `ObjectMeta.GenerateName="<cluster>-"`. Each member's name is an apiserver-assigned random suffix (e.g. `mycluster-7xq2k`). Names are not predictable, and that is deliberate — the previous design used `<cluster>-<ordinal>` and tied cluster identity to ordinal reuse across incarnations, which is exactly the trap to avoid for stateful systems. Now:
+CR `EtcdMember` создаются с `ObjectMeta.GenerateName="<cluster>-"`. Имя каждого члена — это случайный суффикс, назначенный apiserver (например `mycluster-7xq2k`). Имена непредсказуемы, и это сделано намеренно: прежняя схема использовала `<cluster>-<порядковый номер>` и привязывала идентичность кластера к переиспользованию номеров между воплощениями — ровно та ловушка, которой следует избегать для систем с состоянием. Теперь:
 
-- Deleting an `EtcdCluster` and recreating one with the same name produces fresh member names (different suffixes).
-- The `--initial-cluster-token` is derived as `<namespace>-<cluster>-<uid>`, so the token also differs across incarnations.
-- Together: two incarnations of "same-named EtcdCluster" never look alike to etcd, to k8s, or to a stale PVC trying to mount itself back into the new cluster.
+- Удаление `EtcdCluster` и создание нового с тем же именем даёт свежие имена членов (другие суффиксы).
+- `--initial-cluster-token` выводится как `<namespace>-<cluster>-<uid>`, поэтому токен между воплощениями тоже различается.
+- Вместе: два воплощения «одноимённого EtcdCluster» никогда не выглядят одинаково ни для etcd, ни для k8s, ни для устаревшего PVC, пытающегося смонтироваться обратно в новый кластер.
 
-The seed (the original `EtcdMember` created during bootstrap) carries `spec.bootstrap=true`. That flag is the discovery anchor (see [bootstrap](#bootstrap-and-discovery)) and is otherwise just historical metadata — the seed has no permanent special role in raft and can be removed like any other member.
+Сид (первоначальный `EtcdMember`, созданный при бутстрапе) несёт `spec.bootstrap=true`. Этот флаг — якорь обнаружения (см. [бутстрап](#бутстрап-и-обнаружение)), а в остальном просто историческая пометка: у сида нет постоянной особой роли в raft, и он может быть удалён как любой другой член.
 
-## Locking pattern
+## Схема фиксации намерения
 
-A naive operator re-reads `spec` every reconcile and acts on whatever it sees. That breaks etcd in two well-known ways:
+Наивный оператор перечитывает `spec` на каждом reconcile и действует по тому, что видит. Для etcd это ломается двумя хорошо известными способами:
 
-1. **Mid-bootstrap replica change.** Etcd requires every bootstrapping member to start with the same `--initial-cluster` flag. Editing `spec.replicas` mid-bootstrap would have two members agreeing on different cluster shapes; etcd refuses to form.
-2. **Scale-up followed immediately by scale-down.** `MemberAdd` registers the new peer with etcd before its pod is Ready. Reverting `spec.replicas` in that window leaves the operator deleting a member it can't yet identify.
+1. **Смена числа реплик посреди бутстрапа.** Etcd требует, чтобы каждый бутстрапящийся член стартовал с одинаковым флагом `--initial-cluster`. Правка `spec.replicas` посреди бутстрапа привела бы к тому, что два члена договариваются о разной форме кластера; etcd отказывается формироваться.
+2. **Увеличение, сразу за которым следует уменьшение.** `MemberAdd` регистрирует нового узла в etcd раньше, чем его под становится Ready. Откат `spec.replicas` в этом окне оставляет оператора удаляющим члена, которого он ещё не может опознать.
 
-Both failures share a root cause: the user's "desired state" mutates on a faster cadence than the operator can converge.
+У обоих отказов общая первопричина: «желаемое состояние» пользователя меняется быстрее, чем оператор успевает сойтись.
 
-**The fix.** The operator commits to a target. The first time it sees an `EtcdCluster`, it copies the spec into `status.observed` and stamps `status.progressDeadline = now + spec.progressDeadlineSeconds`. From then on the controller reconciles against `status.observed`, not `spec`. Spec changes are *noticed* but not *acted on*; they only get adopted into `observed` when:
+**Решение.** Оператор фиксирует цель. Впервые увидев `EtcdCluster`, он копирует спецификацию в `status.observed` и проставляет `status.progressDeadline = сейчас + spec.progressDeadlineSeconds`. Дальше контроллер обрабатывает против `status.observed`, а не против `spec`. Изменения спецификации *замечаются*, но не *исполняются*; они принимаются в `observed`, только когда:
 
-- the cluster has reached the current `observed` (the in-flight reconcile finished cleanly), or
-- the deadline has elapsed (the in-flight reconcile gave up).
+- кластер достиг текущего `observed` (незавершённый reconcile закончилось чисто), либо
+- срок истёк (незавершённый reconcile сдалось).
 
-This is the same pattern Deployments use with `progressDeadlineSeconds`, applied at a coarser granularity. The trade-off is responsiveness: a spec edit takes effect on the next "complete" boundary, not immediately. In practice this is exactly the property you want for stateful workloads.
+Это та же схема, что Deployment использует с `progressDeadlineSeconds`, применённая на более крупной гранулярности. Плата — отзывчивость: правка спецификации вступает в силу на следующей границе «завершено», а не сразу. На практике для нагрузок с состоянием это ровно то свойство, которое нужно.
 
-### What "complete" means
+### Что означает «завершено»
 
-`reconciliationComplete` returns true when:
+`reconciliationComplete` возвращает истину, когда:
 
-- `status.observed` has been populated (first-reconcile init has happened),
-- the number of non-dormant active members equals `observed.replicas`,
-- all those members report `MemberReady=True`, and
-- if `observed.replicas > 0`, `status.clusterID` is latched.
+- `status.observed` заполнен (инициализация на первом reconcile состоялась),
+- число неспящих активных членов равно `observed.replicas`,
+- все они сообщают `MemberReady=True`, и
+- при `observed.replicas > 0` зафиксирован `status.clusterID`.
 
-The `observed.replicas == 0` case relaxes the ClusterID requirement — a paused or fresh-zero cluster has no running etcd process to source one from. Without this relaxation, a fresh-zero cluster scaled up to 1 would never complete and the spec-change-adoption path would never fire.
+Случай `observed.replicas == 0` ослабляет требование к ClusterID: у приостановленного или свежего нулевого кластера нет работающего процесса etcd, откуда его взять. Без этого послабления свежий нулевой кластер, увеличенный до 1, никогда бы не завершался, и путь принятия изменений спецификации никогда бы не срабатывал.
 
-### Deadlines as terminal errors
+### Истёкший срок — терминальная ошибка
 
-An expired `ProgressDeadline` is a **terminal error**, not a "try again with the latest spec" signal. The operator stops acting on its own and waits for the user. The shape of "intervention" depends on whether the cluster ever bootstrapped:
+Истёкший `ProgressDeadline` — это **терминальная ошибка**, а не сигнал «попробуй ещё раз с последней спецификацией». Оператор прекращает действовать сам и ждёт пользователя. Форма «вмешательства» зависит от того, бутстрапился ли кластер вообще:
 
-- **Before bootstrap finished** (`status.clusterID == ""`): the partial members carry an `--initial-cluster` flag baked into their pod specs. There is no in-place recovery — recovery is to delete the EtcdCluster and recreate. The condition stays `Available=False, Reason=BootstrapFailed`.
-- **After bootstrap finished**: the cluster itself is healthy; only the most recent operation got stuck (e.g. a scale-up to a replica count the cluster can't schedule). The user's spec edit is the intervention — when `spec != status.observed`, the operator treats that as "I'm fixing this", snapshots the new spec, sets a fresh deadline, and resumes. Until that edit, the operator sits in `Available=False, Reason=DeadlineExceeded`.
+- **До завершения бутстрапа** (`status.clusterID == ""`): в спецификации подов недостроенных членов зашит флаг `--initial-cluster`. Восстановления на месте нет — надо удалить EtcdCluster и создать заново. Условие остаётся `Available=False, Reason=BootstrapFailed`.
+- **После завершения бутстрапа**: сам кластер здоров; застряла только последняя операция (например, увеличение до числа реплик, которое кластер не может разместить). Вмешательством считается правка спецификации пользователем: когда `spec != status.observed`, оператор трактует это как «я это чиню», снимает слепок новой спецификации, ставит свежий срок и продолжает. До этой правки оператор сидит в `Available=False, Reason=DeadlineExceeded`.
 
-The operator never silently auto-pivots on deadline expiry. Silent recovery is the wrong default for stateful workloads where the failure modes include data divergence.
+Оператор никогда не разворачивается сам молча по истечении срока. Тихое восстановление — неверное умолчание для нагрузок с состоянием, где в числе отказов есть расхождение данных.
 
-You can force a deadline by patching `status.progressDeadline` to a past time. This is the documented escalation when a slow reconcile is wedged and the standard 10-minute window hasn't elapsed yet.
+Срок можно истечь принудительно, пропатчив `status.progressDeadline` прошедшим временем. Это задокументированная эскалация, когда медленное reconcile заклинило, а стандартное десятиминутное окно ещё не вышло.
 
-## Create-then-Patch
+## Создать, затем пропатчить
 
-Because each member's `--initial-cluster` flag contains its own name, and that name isn't known until the apiserver fills in `GenerateName`, every member moves through three steps in order:
+Поскольку флаг `--initial-cluster` каждого члена содержит его собственное имя, а имя неизвестно, пока apiserver не заполнит `GenerateName`, каждый член проходит три шага строго по порядку:
 
-1. **Create** the `EtcdMember` CR with `GenerateName` and an empty `spec.initialCluster` (for the seed: also `spec.bootstrap=true`).
-2. **MemberAddAsLearner** with the assigned name's peer URL. Skipped for the seed; skipped on scale-up if the peer URL is already registered (crash recovery — see below).
-3. **Patch** `spec.initialCluster` from etcd's authoritative member list.
+1. **Создать** CR `EtcdMember` с `GenerateName` и пустым `spec.initialCluster` (для сида — дополнительно `spec.bootstrap=true`).
+2. **MemberAddAsLearner** с peer URL присвоенного имени. Пропускается для сида; пропускается при увеличении, если peer URL уже зарегистрирован (восстановление после сбоя — см. ниже).
+3. **Пропатчить** `spec.initialCluster` по авторитетному списку членов из etcd.
 
-The member controller refuses to start a Pod while `spec.initialCluster` is empty, so a transient "pending" CR (between steps 1 and 3) never reaches the data plane.
+Контроллер члена отказывается запускать под, пока `spec.initialCluster` пуст, поэтому промежуточный «ожидающий» CR (между шагами 1 и 3) никогда не доходит до data plane.
 
-### Crash recovery
+### Восстановление после сбоя
 
-If a reconcile crashes between steps 1 and 2, the next reconcile sees a pending CR with no matching peer URL in etcd, and calls `MemberAddAsLearner` (then completes the patch).
+Если reconcile упало между шагами 1 и 2, следующее видит ожидающий CR, чьего peer URL в etcd нет, и вызывает `MemberAddAsLearner` (затем завершает патч).
 
-If a reconcile crashes between steps 2 and 3, the next reconcile sees a pending CR whose peer URL is already registered, skips `MemberAddAsLearner`, and completes the patch. This must happen *before* any promotion attempt — the orphan learner cannot sync without its pod, the pod cannot start until `spec.initialCluster` is set, and a promote attempt would block forever on the un-synced learner. The control flow in `scaleUp` orders these steps explicitly.
+Если reconcile упало между шагами 2 и 3, следующее видит ожидающий CR, чей peer URL уже зарегистрирован, пропускает `MemberAddAsLearner` и завершает патч. Это должно произойти *до* любой попытки повышения: осиротевший learner не может синхронизироваться без своего пода, под не может стартовать, пока не задан `spec.initialCluster`, а попытка повышения зависла бы навсегда на несинхронизированном learner. Порядок этих шагов в `scaleUp` задан явно.
 
-Operators inspecting a cluster mid-reconcile may see CRs with empty `spec.initialCluster`. That is the intentional transient state, not corruption.
+Тот, кто разглядывает кластер посреди reconcile, может увидеть CR с пустым `spec.initialCluster`. Это намеренное переходное состояние, а не повреждение.
 
-## Bootstrap and discovery
+## Бутстрап и обнаружение
 
-The cluster forms from a single seed member. Multi-seed bootstrap (multiple members agreeing on `--initial-cluster` upfront) is historically the source of the "mid-flight replica change corrupts consensus" bug. Single-seed bootstrap eliminates that class of failure: the seed forms a one-member cluster with itself in `--initial-cluster`, the operator latches `clusterID` once that member is up, and every subsequent member joins via `MemberAddAsLearner`.
+Кластер формируется из единственного сида. Бутстрап с несколькими сидами (когда несколько членов заранее договариваются об `--initial-cluster`) исторически и есть источник бага «смена числа реплик на лету портит консенсус». Бутстрап с одним сидом устраняет этот класс отказов: сид формирует одночленный кластер, где в `--initial-cluster` только он сам, оператор фиксирует `clusterID`, как только этот член поднялся, а каждый последующий член присоединяется через `MemberAddAsLearner`.
 
-**Discovery** is the bridge between "seed pod is up" and "operator knows the cluster ID". The cluster controller calls `MemberList` against the seed's client URL, validates the response (exactly one member, matching the seed's name or peer URL), and latches `status.clusterID`. Once latched, discovery is never run again.
+**Обнаружение** — это мост между «под сида поднялся» и «оператор знает cluster ID». Контроллер кластера вызывает `MemberList` по клиентскому URL сида, проверяет ответ (ровно один член, совпадающий по имени или peer URL с сидом) и фиксирует `status.clusterID`. После фиксации обнаружение больше не выполняется никогда.
 
-The seed is identified by `spec.bootstrap=true`. Member names being random precludes a name-based lookup, and trusting list order (`members[0]`) silently anchors discovery to the wrong member when scale-up CRs land in front of the seed. Once `clusterID` is set, no *membership* decision re-reads `spec.bootstrap` — the seed is, from that point on, just a regular member. It is not scheduled differently, not weighted in quorum, and not exempt from [crash-loop self-heal](#crash-loop-self-heal). A cluster running with no `spec.bootstrap=true` member at all is a normal, supported state: it is what every cluster adopted by `cmd/etcd-migrate` starts out as, and what any cluster becomes once its seed is replaced.
+Сид опознаётся по `spec.bootstrap=true`. Случайность имён членов исключает поиск по имени, а доверие порядку в списке (`members[0]`) молча привязывает обнаружение не к тому члену, когда CR масштабирования оказываются перед сидом. После установки `clusterID` ни одно решение о *составе* больше не перечитывает `spec.bootstrap` — с этого момента сид просто обычный член. Он не планируется иначе, не имеет веса в кворуме и не освобождён от [самолечения при crash-loop](#самолечение-при-crash-loop). Кластер, работающий вообще без члена с `spec.bootstrap=true`, — нормальное поддерживаемое состояние: именно таким начинает каждый кластер, принятый через `cmd/etcd-migrate`, и таким становится любой кластер, чей сид заменили.
 
-`spec.bootstrap` is never cleared, so it stays a permanent record of which member formed the cluster. One derivation still consults it: `--initial-cluster-state` uses it to gate *which* member may ever be told to bootstrap, and then narrows that by cluster phase — see [Bootstrap state is a phase, not a member](#bootstrap-state-is-a-phase-not-a-member).
+`spec.bootstrap` никогда не сбрасывается, поэтому он остаётся постоянной записью о том, кто сформировал кластер. Один вывод его всё же читает: `--initial-cluster-state` использует его как гейт того, *какому* члену вообще может быть велено бутстрапиться, и затем сужает это фазой кластера — см. [Состояние бутстрапа — это фаза, а не член](#состояние-бутстрапа--это-фаза-а-не-член).
 
-If the seed's pod hasn't been created yet (between Create and Pod-up), the controller surfaces `Progressing=True/WaitingForSeed` rather than dialing a nonexistent endpoint and burning the reconcile budget.
+Если под сида ещё не создан (промежуток между Create и подъёмом пода), контроллер выставляет `Progressing=True/WaitingForSeed`, а не звонит по несуществующему адресу, проедая бюджет reconcile.
 
-## Scale to zero
+## Масштабирование в ноль
 
-`spec.replicas: 0` parks the cluster rather than dismantling it.
+`spec.replicas: 0` паркует кластер, а не разбирает его.
 
-### Pause (1→0)
+### Пауза (1→0)
 
-When the cluster controller's `scaleDown` observes `desired==0 && len(running)==1`, it Patches `spec.dormant=true` on the surviving member. The CR is **not** deleted. On the next reconcile of that member, the member controller observes `spec.dormant=true` and runs `ensurePodAbsent` — deletes the Pod, clears `status.podName`, surfaces `Ready=False/Paused`. The PVC is not touched. It keeps its existing owner-ref to the `EtcdMember`, which still exists. So nothing reparents, nothing cascade-deletes.
+Когда `scaleDown` контроллера кластера видит `desired==0 && len(running)==1`, он патчит `spec.dormant=true` у уцелевшего члена. CR при этом **не** удаляется. На следующем reconcile этого члена контроллер члена видит `spec.dormant=true` и выполняет `ensurePodAbsent`: удаляет под, очищает `status.podName`, выставляет `Ready=False/Paused`. PVC не трогается. Он сохраняет свою владельческую ссылку на `EtcdMember`, который продолжает существовать. Поэтому ничто не меняет владельца и ничто не удаляется каскадом.
 
-Intermediate steps of a multi-member descent (3→2, 2→1) are normal scale-downs: pick newest, Delete CR, finalizer runs `MemberRemove`. Only the final 1→0 step flips dormant.
+Промежуточные шаги спуска многочленного кластера (3→2, 2→1) — обычные уменьшения: выбрать самого нового, удалить CR, финализатор выполняет `MemberRemove`. Только последний шаг 1→0 переключает dormant.
 
-### Wake (0→1+)
+### Пробуждение (0→1 и выше)
 
-When the user sets `spec.replicas >= 1`, the cluster controller's spec-change-adoption path snapshots the new spec into `observed`. On the next reconcile, `scaleUp` finds the dormant member and Patches `spec.dormant=false`. No name lookup, no Create, no etcd RPC at this stage. The member controller then runs the normal `ensurePVC` (which finds the existing PVC by UID match and accepts it) + `ensurePod` (which creates the Pod). Etcd resumes from the data dir with the same `ClusterID` and member ID.
+Когда пользователь ставит `spec.replicas >= 1`, путь принятия изменений спецификации в контроллере кластера снимает слепок новой спецификации в `observed`. На следующем reconcile `scaleUp` находит спящего члена и патчит `spec.dormant=false`. Ни поиска по имени, ни Create, ни RPC к etcd на этой стадии. Затем контроллер члена выполняет обычные `ensurePVC` (который находит существующий PVC по совпадению UID и принимает его) и `ensurePod` (который создаёт под). Etcd продолжает с data-dir с тем же `ClusterID` и member ID.
 
-Further scale-up proceeds normally via `MemberAddAsLearner` + `MemberPromote`.
+Дальнейшее увеличение идёт обычным порядком через `MemberAddAsLearner` и `MemberPromote`.
 
-### Why "dormant on the member" instead of "delete the CR + reparent the PVC"
+### Почему «спящий флаг на члене», а не «удалить CR и переподчинить PVC»
 
-An earlier iteration of this feature deleted the CR, reparented the PVC to the `EtcdCluster`, latched the member's name in `status.dormantMember`, and recreated the member by name on resume. Every iteration accumulated edge cases: cross-resource cache races on the pause trigger (Status update visible before Delete event delivery, or vice versa), foreign-CR-by-fixed-name adoption on resurrection, stale status field after a missed update, fresh-zero-vs-dormant message divergence. The redesigned mechanism — pause is a Patch, resume is a Patch, CR is never deleted — removes all those failure modes by construction. The mechanism the operator needs to support is "the EtcdMember CR is preserved across the pause and the user can scale to 0 and back without external coordination". It now is.
+Более ранняя версия этой возможности удаляла CR, переподчиняла PVC объекту `EtcdCluster`, запоминала имя члена в `status.dormantMember` и пересоздавала члена по имени при возобновлении. Каждая итерация накапливала краевые случаи: гонки кэша между ресурсами на срабатывании паузы (обновление статуса становилось видно раньше доставки события Delete или наоборот), присвоение чужого CR по фиксированному имени при воскрешении, устаревшее поле статуса после пропущенного обновления, расхождение сообщений между «свежим нулём» и спящим состоянием. Переработанный механизм — пауза это патч, возобновление это патч, CR не удаляется никогда — снимает все эти отказы по построению. Механизм, который оператору нужно поддерживать, звучит как «CR EtcdMember сохраняется через паузу, и пользователь может уйти в 0 и вернуться без внешней координации». Теперь так и есть.
 
-### Replica accounting
+### Учёт реплик
 
-`current` is computed from `filterRunningMembers(...)` — non-deleted, non-dormant. A dormant member contributes zero capacity, so it must not count against `desired`, otherwise:
+`current` считается из `filterRunningMembers(...)` — неудаляемые, неспящие. Спящий член даёт нулевую ёмкость, поэтому он не должен идти в зачёт против `desired`, иначе:
 
-- A 1-member cluster paused at replicas=0 would look like "we have 1 member, target is 0" and the cluster controller would try to scale down again, finding nothing valid to do.
-- Scaling a paused cluster back up to >=1 would never decide to wake the dormant member because `current==desired` would already be satisfied.
+- Одночленный кластер, приостановленный при replicas=0, выглядел бы как «у нас 1 член, цель 0», и контроллер кластера снова пытался бы уменьшать состав, не находя ничего допустимого.
+- Увеличение приостановленного кластера обратно до ≥1 никогда бы не решило разбудить спящего члена, потому что `current==desired` уже выполнялось бы.
 
-The single exception is the steady-state call to `updateStatus`, which receives the full active set (including dormant). `updateStatus`'s Paused branch uses `findDormantMember(members)` to name the parked PVC in the `Available=False/Paused` message. Stripping the dormant member at that call site would silently fall back to the fresh-zero "no data has been written" message even on real dormant clusters. The asymmetry is deliberate and the call site is commented.
+Единственное исключение — вызов `updateStatus` в установившемся режиме, который получает полный активный набор (включая спящего). Ветка Paused в `updateStatus` использует `findDormantMember(members)`, чтобы назвать припаркованный PVC в сообщении `Available=False/Paused`. Отсечение спящего члена в этой точке вызова молча откатывало бы на сообщение «данные не записывались» даже на настоящих спящих кластерах. Асимметрия намеренная, и точка вызова снабжена комментарием.
 
-## Storage
+## Хранилище
 
-Each member's data dir is configured via `spec.storage`, a struct with `size`, `medium`, and an optional `storageClassName`. The medium chooses between a PVC and a tmpfs `emptyDir`; the locking pattern protects size and medium just like `replicas` and `version` — a mid-flight flip is locked out until the current target is reached or the deadline expires.
+Data-dir каждого члена настраивается через `spec.storage` — структуру с полями `size`, `medium` и необязательным `storageClassName`. Носитель выбирает между PVC и tmpfs `emptyDir`; схема фиксации намерения защищает размер и носитель так же, как `replicas` и `version`: смена на лету заблокирована, пока текущая цель не достигнута или не истёк срок.
 
-| `spec.storage.medium` | Backend | Lifetime | Pod loss → |
+| `spec.storage.medium` | Бэкенд | Время жизни | Потеря пода → |
 |---|---|---|---|
-| `""` (default) | PVC; `spec.storage.storageClassName` if set, else the namespace default; `ReadWriteOnce` | Survives Pod restart, eviction, node failure (re-attached to new Pod). | Same Pod / new Pod re-uses existing data dir; etcd rejoins with the same member ID and `ClusterID`. **Exception:** if the data dir is lost or corrupt so etcd cannot boot and the member crash-loops past the threshold, the operator deletes and replaces it with a *fresh* member ID (quorum-gated) — see [Crash-loop self-heal](#crash-loop-self-heal) below. |
-| `"Memory"` | `emptyDir{medium: Memory}` with `sizeLimit: spec.storage.size` | Bound to the Pod. Container restart preserves tmpfs; Pod deletion / eviction / node failure destroys it. | Operator detects Pod loss via recorded `Status.PodUID`, self-deletes the `EtcdMember`, finalizer calls `MemberRemove`, scale-up gap-fill creates a replacement with a fresh member ID. A member whose Pod is *alive* but whose etcd can never start (e.g. a learner baked with a stale `--initial-cluster`) is instead caught by [Crash-loop self-heal](#crash-loop-self-heal). |
+| `""` (умолчание) | PVC; `spec.storage.storageClassName`, если задан, иначе умолчание неймспейса; `ReadWriteOnce` | Переживает перезапуск пода, вытеснение, отказ ноды (переподключается к новому поду). | Тот же или новый под переиспользует существующий data-dir; etcd возвращается с тем же member ID и `ClusterID`. **Исключение:** если data-dir потерян или повреждён так, что etcd не может стартовать, и член крутится в crash-loop дольше порога, оператор удаляет его и заменяет со *свежим* member ID (гейтится кворумом) — см. [Самолечение при crash-loop](#самолечение-при-crash-loop) ниже. |
+| `"Memory"` | `emptyDir{medium: Memory}` с `sizeLimit: spec.storage.size` | Привязано к поду. Перезапуск контейнера сохраняет tmpfs; удаление пода, вытеснение или отказ ноды его уничтожают. | Оператор обнаруживает потерю пода по записанному `Status.PodUID`, удаляет `EtcdMember` сам, финализатор вызывает `MemberRemove`, заполнение пробела при масштабировании создаёт замену со свежим member ID. Члена, чей под *жив*, но чья etcd не может стартовать (например, learner с зашитым устаревшим `--initial-cluster`), ловит [самолечение при crash-loop](#самолечение-при-crash-loop). |
 
-`spec.storage.storageClassName` mirrors the corev1 PVC field of the same name: **nil** uses the namespace's default `StorageClass`, the **empty string** explicitly disables dynamic provisioning (a pre-provisioned PV must already match), any other value names a specific `StorageClass`. It's immutable post-create — `PersistentVolumeClaim.spec.storageClassName` is itself immutable, so there is no in-place change a controller could honour without rolling every PVC. Ignored when `medium=Memory` (no PVC is created).
+`spec.storage.storageClassName` повторяет одноимённое поле PVC из corev1: **nil** использует `StorageClass` по умолчанию для неймспейса, **пустая строка** явно отключает динамический провижининг (заранее созданный PV должен уже подходить), любое другое значение называет конкретный `StorageClass`. Он неизменяем после создания: `PersistentVolumeClaim.spec.storageClassName` сам по себе неизменяем, поэтому изменения на месте, которое контроллер мог бы исполнить без перекатки каждого PVC, не существует. Игнорируется при `medium=Memory` (PVC не создаётся).
 
-### Why memory-backed is opt-in
+### Пулы хранения: массив как домен отказа
 
-It trades durability for speed and isolation from node-level storage. Suits:
+`spec.storage.storageClassName` ставит PVC каждого члена на один `StorageClass`, из-за чего массив хранения становится единым доменом отказа: потеряйте его — и кластер потеряет кворум при любом числе реплик. `spec.storage.pools` — это многобэкендная форма той же настройки, и эти две взаимоисключимы.
 
-- Kubernetes-in-Kubernetes apiservers whose state is GitOps-managed and reconstructable.
-- Throwaway test clusters.
-- Workloads where etcd is a transient cache, not the system of record.
+```yaml
+spec:
+  replicas: 3
+  storage:
+    size: 20Gi
+    pools:
+      - name: array-a
+        storageClassName: san-a
+      - name: array-b
+        storageClassName: san-b
+      - name: array-c
+        storageClassName: san-c
+```
 
-It is **not** appropriate as a general-purpose etcd backend. A node drain or simultaneous evictions of more-than-quorum members destroys the cluster permanently — there is no data to restart from.
+Каждый новый член размещается в **наименее занятом включённом пуле**, при равенстве решает порядок объявления. Поэтому три реплики на три пула дают ровно по одному на пул.
 
-### Pod-loss detection (memory only)
+Отображения «реплика *i* → пул *i*», на которое можно было бы опереться, нет, потому что члены создаются через `GenerateName`, а не по порядковым номерам (см. [Именование членов](#именование-членов)). Устойчивость размещению придаёт подсчёт живых членов, и он же бесплатно даёт три свойства, без всякого отдельного прохода перебалансировки:
 
-On every reconcile of a memory-backed member the controller stamps `Status.PodUID` with the live Pod's UID. On a subsequent reconcile:
+- **сид** бутстрапа детерминированно попадает в `pools[0]` — членов ещё нет, все счётчики нулевые, поэтому решает порядок объявления. Именно это делает восстановление воспроизводимым: пересоздание кластера из снапшота всякий раз ставит сид на тот же массив.
+- пул потерянного члена становится наименее занятым, поэтому **замена возвращается на тот массив, который член освободил**, и раскладка чинится сама.
+- когда этот массив и есть *причина* потери члена, `pools[].disabled: true` ставит на него кордон, и замена уходит на здоровый. Это единственное изменяемое поле пула, и это не факультативное изящество: без него замена встаёт прямо обратно на мёртвый массив (он же наименее занят), а её PVC навсегда остаётся в `Pending`.
 
-- Pod present, UID matches → steady state.
-- Pod absent (or UID differs) with a previously recorded UID → loss confirmed.
+Размещение записывается на члене в `spec.storagePool` и проставляется меткой `etcd-operator.cozystack.io/storage-pool` на `EtcdMember`, его поде и его PVC — поэтому раскладка читается через `kubectl get etcdmember -L etcd-operator.cozystack.io/storage-pool`, а не вычитыванием спецификаций.
 
-The member controller self-deletes the `EtcdMember`. The existing finalizer runs `MemberRemove` against quorum-reachable peers and the Pod / PVC owner-refs handle the rest of GC. The cluster controller's normal `current < desired` arm then scales up: a fresh `EtcdMember` is created with a new `GenerateName` and a new etcd-side member ID. There is no in-place "rejoin with empty data dir" — that path would require lying to raft.
+Пул может нести также `size` (переопределяющий общий `spec.storage.size` для размещённых в нём членов) и `affinity` (сливается на поды этих членов, для массива, доступного лишь части кластера, — член состоит ровно в одном пуле, поэтому условия пула заменяют, а не пересекают общий `spec.affinity`).
 
-If quorum is already lost across multiple simultaneous failures, `MemberRemove` will fail and the dying members stay in `Terminating` until quorum returns. That is the correct outcome: the cluster is dead and the user has to recreate it. The operator does not try to be clever about restoring a quorum from inconsistent half-states.
+Список после создания **только дополняется**, а не полностью неизменяем: принятие нового массива не должно требовать пересоздания кластера, но удаление пула или его перенаправление на другой `StorageClass` бросило бы PVC, уже к нему привязанные. Размеры могут расти, но не уменьшаться.
 
-`Status.BrokenMembers` stays at 0 in normal operation, including across a memory pod-loss + auto-replacement cycle. The `isBroken` predicate is implemented for memory members (lost-Pod state), but the member controller intercepts the loss and self-deletes the member in the same reconcile pass — by the time the cluster controller computes the count, the lost member is already `Terminating` and excluded from the running set. The field exists as a future hook for broken-member detection policies that don't immediately tear the member down. Crash-loop self-heal (next section) does **not** flow through `isBroken`/`BrokenMembers` — it triggers off the Pod's container restart count directly, so `BrokenMembers` stays 0 across that cycle too.
+Число реплик, не делящееся нацело на число включённых пулов, законно, но перекошено: один массив в итоге держит больше членов, чем остальные, а значит, держит кворум в одиночку. Это выдаётся предупреждающим событием `UnevenStoragePools`, а не отклоняется: запрос законный (3 реплики на 2 массива), просто о нём стоит знать. И это намеренно не условие `Degraded`, которое означает «члены нездоровы» и заставило бы алертинг уровня кластера сработать на совершенно здоровом кластере.
 
-### Crash-loop self-heal
+### Почему хранилище в памяти включается явно
 
-A member can end up with a Pod that is alive but whose etcd can never start. For a PVC member the classic cause is a data dir lost or corrupt (a volume lost on node failure) while the cluster membership moved on, leaving the member's *frozen* `--initial-cluster` stale — etcd refuses to boot (`error validating peerURLs ... member count is unequal`) and the Pod crash-loops forever. For a memory member the same wedge hits a *replacement learner*: its `--initial-cluster` is baked into the immutable Pod spec at creation, so if membership changes again before its first successful boot, every restart re-fails the same validation. In both cases the Pod itself never dies, so the memory-style `Status.PodUID` loss check never fires — this restart-count trigger is the only recovery path.
+Оно меняет надёжность на скорость и на независимость от хранилища уровня ноды. Подходит для:
 
-The member controller detects this and replaces the member:
+- apiserver Kubernetes-в-Kubernetes, чьё состояние управляется GitOps и восстановимо;
+- одноразовых тестовых кластеров;
+- нагрузок, где etcd — это временный кэш, а не источник истины.
 
-- **Trigger.** The etcd container is not ready and has restarted at least `dataLossRestartThreshold` (5) times. `OOMKilled` is excluded (whether it's the current or the last termination) — that's a resource problem re-creating the member would not fix — and a Pod that is itself being deleted (drain/eviction/manual restart) is never treated as stuck.
-- **Quorum gate.** The operator deletes the member only when the *rest* of the cluster still has quorum, so a cluster-wide outage (many members crashing at once) never cascades into mass deletion. The count is read from `Status.ReadyMembers`, which the cluster controller maintains and which can lag; if the stuck member is still counted ready, the gate subtracts it. As a second line of defence the finalizer's `MemberRemove` is itself quorum-gated, so even a stale-high count cannot delete data below quorum.
-- **No seed exemption.** The trigger is the member's *state*, never its identity, so the bootstrap seed is replaced on the same terms as anyone else. Only the bootstrap *window* needs protecting, and the quorum gate delivers that for free: `updateStatus` does not run until `clusterID` is latched, so `ReadyMembers` is 0 throughout bootstrap and nothing can pass the gate. Phase expires; identity does not.
-- **Replacement.** Deleting the `EtcdMember` runs the finalizer's clean `MemberRemove`, any member-owned PVC is GC'd (discarding the corrupt data dir; memory members have none), and the cluster controller gap-fills a fresh `GenerateName` member with a current `--initial-cluster` and a **new** etcd member ID — not a same-ID rejoin.
-- **Latency.** `CrashLoopBackOff` caps its backoff at 5 minutes, so reaching 5 restarts takes on the order of **tens of minutes**, not the ~5s of the memory Pod-loss path. A deliberately-deleted-and-replaced member during this window is expected operator behavior, not a fault. A slow restore or slow learner join on the *replacement* can itself trip the threshold and be replaced again; this is quorum-gated and self-limiting, but expect it on a struggling cluster.
+Оно **не** годится как etcd общего назначения. Вытеснение с ноды или одновременное вытеснение больше чем кворума членов уничтожает кластер безвозвратно — данных, с которых можно перезапуститься, не остаётся.
 
-### Bootstrap state is a phase, not a member
+### Обнаружение потери пода (только для памяти)
 
-`--initial-cluster-state` is the one flag that decides whether etcd *forms* a cluster or *joins* one. etcd reads it only when the data dir is empty, which makes it invisible on every ordinary restart and decisive in exactly one situation: a member coming back with nothing on disk.
+На каждом reconcile члена в памяти контроллер проставляет `Status.PodUID` с UID живого пода. На последующем reconcile:
 
-That makes it a statement about where the cluster is in its life, not merely about which member is which. Identity remains a precondition — only the seed can ever bootstrap — but it is no longer sufficient on its own. `new` requires **all three** of:
+- под есть, UID совпадает → установившийся режим;
+- пода нет (или UID отличается) при ранее записанном UID → потеря подтверждена.
 
-- `spec.bootstrap=true`, so a scale-up member is never a candidate under any circumstances;
-- the member has never been seen in etcd's member list (`status.memberID` is empty); and
-- the cluster has not latched a `status.clusterID`.
+Контроллер члена удаляет `EtcdMember` сам. Существующий финализатор выполняет `MemberRemove` у соседей, доступных по кворуму, а владельческие ссылки пода и PVC доделывают остальную сборку. Затем обычная ветка контроллера кластера `current < desired` увеличивает состав: создаётся свежий `EtcdMember` с новым именем от `GenerateName` и новым member ID со стороны etcd. Пути «вернуться на месте с пустым data-dir» нет — он потребовал бы лгать raft.
 
-The first is a hard identity gate that never expires. The other two are the phase signals, and either of them being set proves the cluster already formed — which makes an empty data dir data loss rather than a pending bootstrap. `=existing` is then correct: etcd fails to start against the stale `--initial-cluster`, the Pod crash-loops, and [self-heal](#crash-loop-self-heal) replaces the member.
+Если кворум уже потерян из-за нескольких одновременных отказов, `MemberRemove` не пройдёт, и умирающие члены останутся в `Terminating`, пока кворум не вернётся. Это верный исход: кластер мёртв, и пользователю придётся создавать его заново. Оператор не пытается умничать с восстановлением кворума из несогласованных половинчатых состояний.
 
-Keeping the identity gate matters for a reason the phase signals alone do not cover: the cluster-formed signal is read from the parent `EtcdCluster` and falls back to "not formed" when that read fails, while a scale-up member's `status.memberID` stays empty until its Pod is Ready. Without `spec.bootstrap` a transient API error during that window would hand a scale-up member `=new`.
+`Status.BrokenMembers` в нормальной работе остаётся 0, в том числе через цикл потери пода в памяти и автозамены. Предикат `isBroken` реализован для членов в памяти (состояние потерянного пода), но контроллер члена перехватывает потерю и удаляет члена в том же проходе reconcile — к моменту, когда контроллер кластера считает число, потерянный член уже в `Terminating` и исключён из работающего набора. Поле существует как задел на будущие политики обнаружения сломанных членов, которые не сносят члена немедленно. Самолечение при crash-loop (следующий раздел) **не** проходит через `isBroken` и `BrokenMembers` — оно срабатывает прямо по счётчику перезапусков контейнера в поде, поэтому и в этом цикле `BrokenMembers` остаётся 0.
 
-Deriving it from `spec.bootstrap` instead — a field set once and never cleared — meant the seed carried `new` for the life of the cluster. That is inert on a *corrupt* data dir (etcd fails to boot either way) but not on an **empty** one: `new` against the seed's frozen self-only `--initial-cluster` is a complete, internally consistent bootstrap instruction, so etcd would not error. It would form a fresh one-member cluster on the empty dir, elect itself leader of it, and pass its `/health` readiness probe.
+### Самолечение при crash-loop
 
-Two consequences follow, and it is worth separating what is certain from what is not.
+Член может оказаться с живым подом, чья etcd никогда не сможет стартовать. Для члена на PVC классическая причина — потерянный или повреждённый data-dir (том, потерянный при отказе ноды), пока состав кластера ушёл вперёд, из-за чего *замороженный* `--initial-cluster` члена устарел: etcd отказывается загружаться (`error validating peerURLs ... member count is unequal`), и под крутится в crash-loop бесконечно. Для члена в памяти тот же затык бьёт по *learner-замене*: её `--initial-cluster` зашит в неизменяемую спецификацию пода при создании, поэтому если состав изменится ещё раз до её первого удачного старта, каждый перезапуск заново провалит ту же проверку. В обоих случаях сам под не умирает, поэтому проверка потери по `Status.PodUID` не срабатывает — этот триггер по счётчику перезапусков и есть единственный путь восстановления.
 
-**Certain: the member goes Ready on an empty data dir.** The readiness probe is `/health`, which a healthy one-member cluster answers 200. `<cluster>-client` selects every member Pod with no role filter, so the member immediately takes a share of client traffic — serving reads from an empty keyspace, and accepting writes into a log the rest of the cluster knows nothing about. Neither self-heal trigger can see any of this: one needs a lost Pod, the other a not-ready container.
+Контроллер члена это обнаруживает и заменяет члена:
 
-**Certain: etcd's own guard against strangers does not fire.** `EtcdServer.Process` rejects an incoming raft message whose `m.To` is not the local member ID (`cannot process message to mismatch member`) — the check that would normally fence off a member belonging to a different cluster. Because the member ID is derived deterministically and nothing about this member changed, the re-booted member's ID is *identical* to the one the surviving members still have on file, so their messages address it correctly and are admitted straight into raft. The same holds one level up for the cluster ID, so the peer transport's `X-Etcd-Cluster-ID` check passes too. The collision is what removes the loud failure.
+- **Триггер.** Контейнер etcd не готов и перезапускался не менее `dataLossRestartThreshold` (5) раз. `OOMKilled` исключён (и как текущее, и как последнее завершение) — это проблема ресурсов, которую пересоздание члена не исправит, — а под, который сам удаляется (drain, вытеснение, ручной перезапуск), застрявшим не считается никогда.
+- **Гейт по кворуму.** Оператор удаляет члена, только когда у *остальной* части кластера сохраняется кворум, поэтому общая авария (когда много членов падает разом) никогда не превращается в массовое удаление. Счёт читается из `Status.ReadyMembers`, который ведёт контроллер кластера и который может отставать; если застрявший член ещё посчитан готовым, гейт его вычитает. Второй линией обороны служит то, что `MemberRemove` в финализаторе сам гейтится кворумом, поэтому даже завышенный устаревший счёт не может удалить данные ниже кворума.
+- **Никаких поблажек сиду.** Триггером служит *состояние* члена, а не его идентичность, поэтому сид бутстрапа заменяется на тех же условиях, что и все. Защищать нужно только *окно* бутстрапа, и гейт по кворуму делает это бесплатно: `updateStatus` не запускается, пока не зафиксирован `clusterID`, поэтому во время бутстрапа `ReadyMembers` равен 0 и гейт не проходит никто. Фаза истекает; идентичность нет.
+- **Замена.** Удаление `EtcdMember` запускает чистый `MemberRemove` в финализаторе, PVC, принадлежащий члену, собирается сборщиком мусора (повреждённый data-dir выбрасывается; у членов в памяти его нет), а контроллер кластера заполняет пробел свежим членом с именем от `GenerateName`, актуальным `--initial-cluster` и **новым** member ID в etcd — а не возвращением с тем же ID.
+- **Задержка.** `CrashLoopBackOff` упирается в потолок в 5 минут, поэтому набрать 5 перезапусков занимает порядка **десятков минут**, а не около 5 секунд, как на пути потери пода в памяти. Намеренно удалённый и заменённый член в этом окне — ожидаемое поведение оператора, а не сбой. Медленное восстановление или медленное присоединение learner у *замены* могут сами перешагнуть порог и привести к ещё одной замене; это гейтится кворумом и самоограничивается, но на страдающем кластере этого следует ожидать.
 
-**Not established: how long the divergence lasts.** Once those messages reach raft, the surviving leader's higher term and mismatched log should drive the member back into line — most likely via an `InstallSnapshot` that overwrites its empty state and restores the real membership and data. If so, the window is short. That is the expected behaviour rather than something observed here, and it is *not* what makes the flag wrong: a brief window is still wrong reads served to clients, and any write acknowledged in that window is silently discarded when the snapshot lands — an acknowledged-write loss, which is worse than a stale read.
+### Состояние бутстрапа — это фаза, а не член
 
-The argument for `=existing` does not rest on the divergence being durable. It rests on not issuing a bootstrap instruction to a member that is not bootstrapping: `=existing` fails immediately and deterministically into a designed, tested recovery path, instead of relying on raft to repair a state the operator should never have created.
+`--initial-cluster-state` — тот единственный флаг, который решает, *формирует* ли etcd кластер или *присоединяется* к нему. Etcd читает его, только когда data-dir пуст, из-за чего он незаметен при каждом обычном перезапуске и решающ ровно в одной ситуации: член возвращается, а на диске ничего нет.
 
-The `<namespace>-<cluster>-<uid>` token derivation does not prevent the collision, and it is worth being precise about why, because it protects against a neighbouring failure. Its randomness lives in the `EtcdCluster`'s UID, so it varies **across incarnations** — delete and recreate a same-named cluster and the token differs, which is what stops a stale PVC from the previous incarnation rejoining ([member naming](#member-naming)). A member rebooting inside *one* incarnation has the same object, hence the same UID, hence the same token; its peer URL is unchanged because it keeps its name, and its `--initial-cluster` is frozen at the bootstrap value. The token defends the boundary between clusters, not between boots.
+Это делает его утверждением о том, где находится кластер в своей жизни, а не только о том, какой член какой. Идентичность остаётся предусловием — бутстрапиться может только сид, — но сама по себе больше недостаточна. `new` требует **всех трёх** условий:
 
-### What is missing from memory clusters today
+- `spec.bootstrap=true`, чтобы член, добавленный масштабированием, ни при каких обстоятельствах не стал кандидатом;
+- члена никогда не видели в списке членов etcd (`status.memberID` пуст); и
+- кластер не зафиксировал `status.clusterID`.
 
-Two things are not auto-defaulted and matter for production memory clusters — both tracked in [issue #16](https://github.com/lllamnyp/etcd-operator/issues/16):
+Первое — жёсткий гейт по идентичности, который не истекает никогда. Два других — сигналы фазы, и установка любого из них доказывает, что кластер уже сформировался, а значит пустой data-dir — это потеря данных, а не ожидающий бутстрап. Тогда верно `=existing`: etcd не стартует против устаревшего `--initial-cluster`, под уходит в crash-loop, и [самолечение](#самолечение-при-crash-loop) заменяет члена.
 
-- **Pod anti-affinity**. Configurable via `spec.affinity` (see [Pod scheduling and additional metadata](#pod-scheduling-and-additional-metadata)) but not defaulted. Without it, scheduling can co-locate voters on one node; a single node failure then loses quorum on a 3-member cluster.
-- **Container memory limits**. Without `limits.memory`, tmpfs writes count against node memory rather than the pod's cgroup and the etcd container ends up in BestEffort/Burstable QoS — first to be evicted under pressure. Set `spec.resources.limits.memory` ≥ `spec.storage.size` + ~128Mi for etcd headroom on memory-backed clusters.
+Сохранение гейта по идентичности важно по причине, которую сигналы фазы сами по себе не покрывают: сигнал о сформированности кластера читается из родительского `EtcdCluster` и при неудаче чтения откатывается в «не сформирован», а `status.memberID` члена, добавленного масштабированием, остаётся пустым, пока его под не станет Ready. Без `spec.bootstrap` временная ошибка API в этом окне выдала бы такому члену `=new`.
 
-The `PodDisruptionBudget` *is* auto-emitted now — see the [PodDisruptionBudget section](#poddisruptionbudget) below.
+Вывод его из одного лишь `spec.bootstrap` — поля, устанавливаемого однажды и никогда не сбрасываемого — означал бы, что сид несёт `new` всю жизнь кластера. На *повреждённом* data-dir это безвредно (etcd не загрузится в любом случае), но не на **пустом**: `new` против замороженного `--initial-cluster` сида, где только он сам, — это полная, внутренне непротиворечивая инструкция бутстрапа, поэтому etcd не выдаст ошибки. Он сформировал бы свежий одночленный кластер на пустом каталоге, избрал бы себя его лидером и прошёл бы свою проверку готовности `/health`.
 
-### Apiserver-enforced validation
+Отсюда следуют два вывода, и стоит отделить достоверное от недостоверного.
 
-Four CEL `x-kubernetes-validations` rules on `EtcdClusterSpec` are evaluated at admission time. **k8s 1.29+ is the safe floor**: CEL CRD validation (`CustomResourceValidationExpressions`) went GA in 1.29, and the `quantity()` extension function used by two of the rules was added in 1.28. The CEL gate was beta-on-by-default from 1.25, so 1.28 *may* work in practice — but 1.29 is the first version where both pieces are GA and the project doesn't have to chase feature-gate state across releases.
+**Достоверно: член становится Ready на пустом data-dir.** Проверка готовности — это `/health`, на который здоровый одночленный кластер отвечает 200. `<cluster>-client` отбирает поды всех членов без фильтра по роли, поэтому член немедленно берёт свою долю клиентского трафика — обслуживая чтения из пустого набора ключей и принимая записи в журнал, о котором остальная часть кластера ничего не знает. Ни один из двух триггеров самолечения этого не видит: одному нужен потерянный под, другому — неготовый контейнер.
 
-| Rule | When | Why |
+**Достоверно: собственная защита etcd от чужаков не срабатывает.** `EtcdServer.Process` отклоняет входящее сообщение raft, чей `m.To` не совпадает с локальным member ID (`cannot process message to mismatch member`), — та самая проверка, которая обычно отгораживает члена, принадлежащего другому кластеру. Поскольку member ID выводится детерминированно и в этом члене ничего не менялось, ID перезагрузившегося члена *идентичен* тому, что уцелевшие члены по-прежнему держат у себя, поэтому их сообщения адресуются ему верно и попадают прямиком в raft. То же справедливо уровнем выше для cluster ID, поэтому и проверка `X-Etcd-Cluster-ID` в транспорте peer тоже проходит. Именно совпадение убирает громкий отказ.
+
+**Не установлено: как долго держится расхождение.** Как только эти сообщения дойдут до raft, более высокий срок и несовпадающий журнал уцелевшего лидера должны вернуть члена в строй — вероятнее всего, через `InstallSnapshot`, который перезапишет его пустое состояние и восстановит настоящий состав и данные. Если так, окно короткое. Это ожидаемое поведение, а не то, что здесь наблюдали, и **не** оно делает флаг неверным: короткое окно — это всё равно неверные чтения, отданные клиентам, а любая запись, подтверждённая в этом окне, молча выбрасывается, когда прилетает снапшот, — то есть потеря подтверждённой записи, что хуже устаревшего чтения.
+
+Довод в пользу `=existing` не опирается на длительность расхождения. Он опирается на то, что нельзя выдавать инструкцию бутстрапа члену, который не бутстрапится: `=existing` падает немедленно и детерминированно в спроектированный и проверенный путь восстановления, вместо того чтобы полагаться на raft в починке состояния, которого оператор вообще не должен был создавать.
+
+Вывод токена как `<namespace>-<cluster>-<uid>` эту коллизию не предотвращает, и стоит уточнить, почему, — потому что он защищает от соседнего отказа. Его случайность живёт в UID объекта `EtcdCluster`, поэтому она меняется **между воплощениями**: удалите и создайте одноимённый кластер, и токен будет другим, что и мешает устаревшему PVC из прошлого воплощения вернуться в кластер ([именование членов](#именование-членов)). У члена, перезагружающегося внутри *одного* воплощения, тот же объект, а значит тот же UID и тот же токен; его peer URL не изменился, потому что имя осталось прежним, а его `--initial-cluster` заморожен на значении времён бутстрапа. Токен защищает границу между кластерами, а не между загрузками.
+
+### Чего сегодня не хватает кластерам в памяти
+
+Две вещи не проставляются автоматически и важны для продакшен-кластеров в памяти — обе отслеживаются в [issue #16](https://github.com/lllamnyp/etcd-operator/issues/16):
+
+- **Anti-affinity подов**. Настраивается через `spec.affinity` (см. [Планирование подов и дополнительные метаданные](#планирование-подов-и-дополнительные-метаданные)), но по умолчанию не проставляется. Без неё планировщик может собрать голосующих на одной ноде, и отказ единственной ноды теряет кворум на трёхчленном кластере.
+- **Лимиты памяти контейнера**. Без `limits.memory` записи в tmpfs учитываются в памяти ноды, а не в cgroup пода, и контейнер etcd оказывается в классе BestEffort или Burstable — первым на вытеснение под давлением. Для кластеров в памяти ставьте `spec.resources.limits.memory` ≥ `spec.storage.size` + около 128Mi запаса для etcd.
+
+`PodDisruptionBudget` *теперь* выпускается автоматически — см. [раздел про PodDisruptionBudget](#poddisruptionbudget) ниже.
+
+### Проверки на стороне apiserver
+
+Правила CEL `x-kubernetes-validations` на `EtcdClusterSpec`, приведённые ниже, вычисляются во время допуска. **Безопасный минимум — k8s 1.29+**: проверки CEL в CRD (`CustomResourceValidationExpressions`) вышли в GA в 1.29, а функция расширения `quantity()`, используемая двумя правилами, добавлена в 1.28. Гейт CEL был включён как бета с 1.25, поэтому 1.28 *может* работать на практике, но 1.29 — первая версия, где обе части в GA и проекту не приходится гоняться за состоянием feature gate по релизам.
+
+| Правило | Когда | Почему |
 |---|---|---|
-| `storage.medium` immutable | UPDATE | Flipping the medium would orphan the previous PVC (or tmpfs); rolling-migrate is not implemented. |
-| `replicas: 0` + `storage.medium: Memory` rejected | CREATE + UPDATE | The pause path deletes the Pod, the tmpfs evaporates, and resume would silently produce an empty data dir; etcd refuses to start. |
-| `storage.size > 0` when `storage.medium: Memory` | CREATE + UPDATE | Zero `storage.size` produces an unbounded tmpfs `SizeLimit` against node memory. |
-| `storage.size` cannot shrink | UPDATE | PVCs cannot shrink and tmpfs `SizeLimit` reduction does not free allocated memory. |
-| `storage.storageClassName` cannot be added or removed | UPDATE | `PersistentVolumeClaim.spec.storageClassName` is immutable; honouring a mid-life add/remove would require rolling every PVC. |
-| `storage.storageClassName` value immutable | UPDATE | Same reason — the StorageClass chosen at cluster creation is the only one PVCs will ever carry. |
-| `tls` cannot be added or removed | UPDATE | Toggling TLS on an existing cluster is a rolling restart that has to land on the operator's etcd client and every member Pod in lockstep; not implemented. |
-| `tls` subtree immutable | UPDATE | Same reason — secret-ref swaps, mTLS-flip via `operatorClientSecretRef`, peer-only ↔ both toggles are all in-place rolling changes that v1 doesn't perform. |
+| `storage.medium` неизменяем | UPDATE | Смена носителя осиротила бы прежний PVC (или tmpfs); плавная миграция не реализована. |
+| `replicas: 0` вместе с `storage.medium: Memory` отклоняется | CREATE + UPDATE | Путь паузы удаляет под, tmpfs испаряется, а возобновление молча дало бы пустой data-dir; etcd откажется стартовать. |
+| `storage.size > 0` при `storage.medium: Memory` | CREATE + UPDATE | Нулевой `storage.size` даёт неограниченный `SizeLimit` tmpfs против памяти ноды. |
+| `storage.size` нельзя уменьшить | UPDATE | PVC не умеют уменьшаться, а снижение `SizeLimit` у tmpfs не освобождает уже выделенную память. |
+| `storage.storageClassName` нельзя добавить или убрать | UPDATE | `PersistentVolumeClaim.spec.storageClassName` неизменяем; исполнение добавления или удаления по ходу жизни потребовало бы перекатки каждого PVC. |
+| значение `storage.storageClassName` неизменяемо | UPDATE | По той же причине: StorageClass, выбранный при создании кластера, — единственный, который когда-либо будут нести его PVC. |
+| `storage.pools` и `storage.storageClassName` взаимоисключимы | CREATE + UPDATE | Два написания одной настройки; принятие обоих оставляет неясным, что именно провижинит PVC. |
+| `storage.pools` отклоняется при `medium: Memory` | CREATE + UPDATE | У члена в памяти нет PVC, который можно было бы разместить на `StorageClass`. |
+| `storage.pools` нельзя добавить или убрать целиком | UPDATE | У кластера, созданного без пулов, PVC стоят на одном StorageClass; введение пулов задним числом заявило бы раскладку, которой у существующих томов нет. |
+| `storage.pools` только дополняется (по имени пула) | UPDATE | Удаление пула осиротило бы уже привязанные к нему PVC. Добавление разрешено: принятие нового массива не должно требовать пересоздания кластера. |
+| `storage.pools[].storageClassName` неизменяем | UPDATE | По той же причине, что и общее поле: `storageClassName` у PVC не меняется на месте. Проверяется по каждому пулу, что делает возможным `listType=map`, соотнося каждый элемент с его прежней версией. |
+| `storage.pools[].size` нельзя уменьшить или убрать | UPDATE | PVC не умеют уменьшаться, а снятие переопределения молча откатывает на меньший общий размер. |
+| `options.electionTimeoutMilliseconds` ≥ 5× `heartbeatIntervalMilliseconds` | CREATE + UPDATE | Собственная рекомендация etcd. Ниже этого отношения один медленный раунд heartbeat начинает выборы, и кластер на сетевом хранилище дребезжит лидером под обычной нагрузкой на запись — не оставляя следа ни в одном логе. |
+| `options.heartbeatIntervalMilliseconds` требует `electionTimeoutMilliseconds` | CREATE + UPDATE | Поднять один только heartbeat — та ловушка, которую правило про отношение само по себе не ловит: при election timeout, оставшемся на умолчании etcd в 1000 мс, любой heartbeat выше 200 мс уже ниже отношения. |
+| `tls` нельзя добавить или убрать | UPDATE | Переключение TLS на существующем кластере — это плавающий перезапуск, который должен согласованно лечь и на клиент etcd оператора, и на каждый под члена; не реализовано. |
+| поддерево `tls` неизменяемо | UPDATE | По той же причине: подмена ссылок на Secret, переключение mTLS через `operatorClientSecretRef`, переходы «только peer ↔ оба plane» — всё это плавающие изменения на месте, которых v1 не выполняет. |
 
-These rules live in the CRD itself; the apiserver enforces them with no separate webhook, no cert-manager, no extra Deployment. Errors come back as standard apiserver admission rejections (`kubectl apply` prints the rule's `message` field).
+Эти правила живут в самом CRD; apiserver применяет их без отдельного вебхука, без cert-manager и без дополнительного Deployment. Ошибки возвращаются как обычные отказы допуска apiserver (`kubectl apply` печатает поле `message` правила).
 
-## Pod scheduling and additional metadata
+## Планирование подов и дополнительные метаданные
 
-Three spec fields shape where member Pods land and what metadata the operator's child objects carry. All three are latched through `status.observed` like the rest of the target spec (see [Locking pattern](#locking-pattern)) and apply **at object creation only** — the operator does not roll existing Pods or re-stamp existing objects when they change.
+Три поля спецификации определяют, где оказываются поды членов и какие метаданные несут дочерние объекты оператора. Все три фиксируются через `status.observed`, как и остальная целевая спецификация (см. [Схема фиксации намерения](#схема-фиксации-намерения)), и применяются **только при создании объекта** — существующие поды оператор не перекатывает и существующие объекты заново не помечает.
 
-### `spec.affinity` and `spec.topologySpreadConstraints`
+### `spec.affinity` и `spec.topologySpreadConstraints`
 
-Passed through verbatim to each member Pod's `spec.affinity` / `spec.topologySpreadConstraints`. The common production use is a required pod anti-affinity keyed on the cluster label, so two voters never share a node:
+Передаются каждому поду члена в `spec.affinity` и `spec.topologySpreadConstraints` как есть. Обычное продакшен-применение — обязательная anti-affinity подов по метке кластера, чтобы два голосующих никогда не делили ноду:
 
 ```yaml
 spec:
@@ -269,21 +311,21 @@ spec:
           topologyKey: kubernetes.io/hostname
 ```
 
-Changes take effect on newly-created members (scale-up, replacement). To apply a scheduling change to an existing cluster, delete one Pod at a time and let the operator recreate it with the new constraints.
+Изменения действуют на вновь создаваемых членов (масштабирование, замена). Чтобы применить изменение планирования к существующему кластеру, удаляйте по одному поду за раз и дайте оператору пересоздать его с новыми ограничениями.
 
 ### `spec.additionalMetadata`
 
-Extra labels and annotations the operator merges onto **every object it creates** for the cluster: member Pods, the per-member data PVCs (`data-<member>`), the client and headless Services, the PodDisruptionBudget, and the `EtcdMember` CRs. Typical uses are backup-tool selectors on the PVCs and cost-allocation/tenancy labels across the board.
+Дополнительные метки и аннотации, которые оператор сливает на **каждый создаваемый им объект** кластера: поды членов, PVC данных отдельных членов (`data-<member>`), клиентский и headless Service, PodDisruptionBudget и CR `EtcdMember`. Типичные применения — селекторы средств резервного копирования на PVC и метки принадлежности и учёта затрат по всему набору.
 
-Merge semantics:
+Семантика слияния:
 
-- **Operator-owned keys win.** A user-supplied key that collides with a key the operator already sets (the `app.kubernetes.io/*` set, the cluster/role labels, or any operator-set annotation) is silently ignored — the field cannot shadow the operator's own selectors or metadata. The rule holds symmetrically for labels and annotations.
-- **Apply-on-create.** Objects are stamped when created; editing the field re-stamps nothing retroactively. Newly-created objects (scale-up members and their PVCs, replacements) pick up the latest latched value.
-- **Latched.** A mid-flight edit only takes effect once the current `status.observed` target is reached, like every other latched field.
+- **Ключи оператора побеждают.** Ключ пользователя, столкнувшийся с ключом, который оператор уже проставляет (набор `app.kubernetes.io/*`, метки кластера и роли, любая аннотация, установленная оператором), молча игнорируется — поле не может затенить собственные селекторы и метаданные оператора. Правило действует симметрично для меток и аннотаций.
+- **Применение при создании.** Объекты помечаются при создании; правка поля ничего не перештамповывает задним числом. Вновь создаваемые объекты (члены при масштабировании и их PVC, замены) подхватывают последнее зафиксированное значение.
+- **Фиксируется.** Правка на лету вступает в силу только после достижения текущей цели `status.observed`, как и любое другое фиксируемое поле.
 
-## etcd tuning options
+## Настройки тюнинга etcd
 
-`spec.options` carries the etcd server tuning flags the operator renders onto each member's command line:
+`spec.options` несёт флаги тюнинга сервера etcd, которые оператор выкладывает в командную строку каждого члена:
 
 ```yaml
 spec:
@@ -291,78 +333,98 @@ spec:
     quotaBackendBytes: 10200547328   # --quota-backend-bytes
     autoCompactionMode: periodic     # --auto-compaction-mode (periodic | revision)
     autoCompactionRetention: "5m"    # --auto-compaction-retention
-    snapshotCount: 10000             # --snapshot-count (raft entries, not backups)
+    snapshotCount: 10000             # --snapshot-count (записи raft, не бэкапы)
+
+    # Тайминги консенсуса. См. «Тюнинг под сетевое хранилище» ниже.
+    heartbeatIntervalMilliseconds: 500   # --heartbeat-interval
+    electionTimeoutMilliseconds: 2500    # --election-timeout
+
+    # Хранение в data-dir и поведение коммитов бэкенда.
+    maxWals: 5                           # --max-wals
+    maxSnapshots: 5                      # --max-snapshots
+    backendBatchLimit: 5000              # --backend-batch-limit
+    backendBatchIntervalMilliseconds: 100 # --backend-batch-interval
 ```
 
-Every field is optional; an unset field emits no flag, leaving etcd's built-in default in force.
+Каждое поле необязательно; незаданное поле не порождает флага и оставляет в силе встроенное умолчание etcd.
 
-The set is deliberately **closed and typed**. The legacy aenix operator exposed `spec.options` as a free-form `map[string]string`, which let users inject arbitrary flags — including ones that conflict with flags the operator itself manages (listen URLs, initial-cluster wiring, TLS paths). This operator types exactly the keys Cozystack's etcd package actually used; a new tuning knob lands as a new typed field with validation, not via an escape hatch.
+### Тюнинг под сетевое хранилище
 
-Like `spec.resources`, options are latched through `status.observed` and apply **to newly-created members only** (scale-up, replacement) — the operator does not roll existing Pods when they change. To apply a tuning change to an existing cluster, delete one Pod at a time and let the operator recreate it with the new flags. A transient mix of old- and new-flag members is harmless: these are per-member settings (backend quota, compaction cadence, raft snapshot interval), the same heterogeneity any manual rolling flag change passes through.
+Умолчания etcd рассчитаны на локальный SSD и время оборота около миллисекунды. Когда каталог данных каждого члена лежит на массиве хранения, а не на локальном диске ноды, задержка fsync выходит на критический путь, и два умолчания перестают быть верными.
 
-## Member DNS identity (adoption annotations)
+`--heartbeat-interval` (100 мс) и `--election-timeout` (1000 мс) — та самая пара, которая имеет значение. Раунд heartbeat, вынужденный ждать за fsync на порядок медленнее, чем предполагало умолчание, заставляет последователей объявить лидера мёртвым; кластер переизбирает лидера, и нигде не появляется ни одной ошибки — просто становится медленнее и дребезжит. Рекомендация etcd — задать heartbeat близко ко времени оборота между членами и поднять вместе с ним election timeout, сохраняя отношение не менее 5×. Типичные значения на сетевом хранилище — heartbeat 250–500 мс при election timeout 1250–2500 мс. Обе границы проверяет CEL, включая случай подъёма *только* heartbeat (см. таблицу проверок выше).
 
-The operator's headless Service (per-member DNS for peer discovery) is always named after the cluster, and every URL the operator constructs for a member — peer/client dial endpoints, `--initial-cluster`, the Pod's `spec.subdomain` — derives from that member's resolved Service name. There is **no cluster-level override**: a natively-created member always resolves under the cluster's own name.
+`--max-wals` и `--max-snapshots` ограничивают размер каталога данных в установившемся режиме, что важно там, где ёмкость тарифицируется потомно; их снижение сокращает окно, в котором член может восстановиться по собственному WAL, а не пересинхронизацией от лидера. `--backend-batch-limit` и `--backend-batch-interval` меняют задержку коммита на число fsync и служат рычагом для кластера, у которого `etcd_disk_backend_commit_duration_seconds` определяется массивом, а не самой etcd.
 
-For [in-place migration from the legacy operator](migration.md#tool-driven-in-place-migration-etcd-migrate), the migration tool stamps two **reserved annotations** on the `EtcdMember`s it creates for adopted pods — never on members the operator itself creates:
+За чем следить: `etcd_disk_wal_fsync_duration_seconds` и `etcd_disk_backend_commit_duration_seconds`, обе отдаются на порту метрик `:2381` каждого члена. p99 fsync WAL выше примерно 25 мс — обычный порог «это хранилище слишком медленное для etcd»; см. [руководство по эксплуатации](operations.md#наблюдение-за-задержками-хранилища).
 
-- `etcd-operator.cozystack.io/headless-service-name` — overrides the Service name that member's DNS keys off. Adopted StatefulSet pods carry an immutable subdomain of `<cluster>-headless`, so the annotation makes the operator's URL convention match the adopted pods' actual DNS exactly.
-- `etcd-operator.cozystack.io/data-dir-subpath` — records where the legacy layout kept etcd's data inside the PVC (`default.etcd/`), so replacement Pods of adopted members resume from the existing data dir. The value is validated in code (a single safe path component — no `/`, no `..`) and fails closed to the volume root.
+Набор намеренно **закрыт и типизирован**. Старый оператор aenix отдавал `spec.options` свободной формой `map[string]string`, что позволяло пользователям подсовывать произвольные флаги, в том числе конфликтующие с теми, которыми управляет сам оператор (listen URL, обвязка initial-cluster, пути TLS). Этот оператор типизирует ровно те ключи, которые фактически использовал пакет etcd в Cozystack; новая ручка тюнинга появляется как новое типизированное поле с проверкой, а не через лазейку.
 
-Because the operator never stamps these annotations, every rolled or replaced member comes up native, and the override **self-wipes** as the cluster rolls — once fully rolled, the cluster is indistinguishable from one created natively. `additionalMetadata` cannot set keys under the `etcd-operator.cozystack.io/` reserved prefix, so the annotations can be neither forged by a user nor inherited by operator-created members.
+Как и `spec.resources`, настройки фиксируются через `status.observed` и применяются **только к вновь создаваемым членам** (масштабирование, замена) — существующие поды оператор при их изменении не перекатывает. Чтобы применить изменение тюнинга к существующему кластеру, удаляйте по одному поду за раз и дайте оператору пересоздать его с новыми флагами. Временная смесь членов со старыми и новыми флагами безвредна: это настройки уровня члена (квота бэкенда, каденция компакции, интервал снапшота raft), та же разнородность, через которую проходит любая ручная поочерёдная смена флага.
+
+## DNS-идентичность члена (аннотации присвоения)
+
+Headless-Service оператора (DNS отдельных членов для обнаружения соседей) всегда называется по имени кластера, и каждый URL, который оператор строит для члена — адреса подключения peer и клиента, `--initial-cluster`, `spec.subdomain` пода, — выводится из разрешённого имени Service этого члена. Переопределения на уровне кластера **нет**: член, созданный нативно, всегда разрешается под собственным именем кластера.
+
+Для [миграции на месте со старого оператора](migration.md#миграция-на-месте-инструментом-etcd-migrate) инструмент миграции проставляет две **зарезервированные аннотации** на тех `EtcdMember`, которые он создаёт для присваиваемых подов, — и никогда на членах, создаваемых самим оператором:
+
+- `etcd-operator.cozystack.io/headless-service-name` — переопределяет имя Service, от которого отсчитывается DNS этого члена. Присваиваемые поды StatefulSet несут неизменяемый субдомен `<cluster>-headless`, поэтому аннотация приводит соглашение оператора об URL в точное соответствие с фактическим DNS присвоенных подов.
+- `etcd-operator.cozystack.io/data-dir-subpath` — записывает, где старая раскладка держала данные etcd внутри PVC (`default.etcd/`), чтобы заменяющие поды присвоенных членов продолжали с существующего data-dir. Значение проверяется в коде (единственный безопасный компонент пути — без `/` и без `..`) и при неудаче откатывается к корню тома.
+
+Поскольку оператор никогда эти аннотации не проставляет, каждый перекатанный или заменённый член поднимается нативным, а переопределение **стирается само** по мере перекатки кластера: полностью перекатанный кластер неотличим от созданного нативно. `additionalMetadata` не может задавать ключи под зарезервированным префиксом `etcd-operator.cozystack.io/`, поэтому аннотации нельзя ни подделать пользователем, ни унаследовать членам, созданным оператором.
 
 ## TLS
 
-`spec.tls` configures transport-layer security for the cluster's two etcd surfaces: the client API (port 2379) and the peer API (port 2380). Each subtree is independently optional — you can opt one surface into TLS without the other. The whole `tls` subtree is immutable post-create (see the validation table above): toggling TLS on an existing cluster is a rolling change that v1 doesn't perform, so the policy is delete-and-recreate.
+`spec.tls` настраивает защиту транспортного уровня для двух поверхностей etcd в кластере: клиентского API (порт 2379) и peer-API (порт 2380). Каждое поддерево независимо необязательно — можно включить TLS на одной поверхности, не включая на другой. Всё поддерево `tls` неизменяемо после создания (см. таблицу проверок выше): переключение TLS на существующем кластере — плавающее изменение, которого v1 не выполняет, поэтому политика такая: удалить и создать заново.
 
-Material can come from one of two sources per subtree, mutually exclusive:
+Материал может приходить из одного из двух источников на поддерево, взаимоисключающих:
 
-- **BYO Secrets** — user provides `kubernetes.io/tls`-shaped Secrets and points `serverSecretRef` / `operatorClientSecretRef` / `secretRef` at them.
-- **cert-manager** — user provides an Issuer or ClusterIssuer and the operator emits `cert-manager.io/v1` `Certificate` resources at reconcile time. See [cert-manager-driven TLS](#cert-manager-driven-tls) below.
+- **Свои Secret** — пользователь предоставляет Secret вида `kubernetes.io/tls` и направляет на них `serverSecretRef`, `operatorClientSecretRef` или `secretRef`.
+- **cert-manager** — пользователь предоставляет Issuer или ClusterIssuer, а оператор при reconcile выпускает ресурсы `cert-manager.io/v1 Certificate`. См. [TLS через cert-manager](#tls-через-cert-manager) ниже.
 
-### Census of certs
+### Перепись сертификатов
 
-| Artifact | Mount / location | etcd flag | Source (BYO) | Source (cert-manager) |
+| Артефакт | Монтирование / расположение | Флаг etcd | Источник (свои) | Источник (cert-manager) |
 |---|---|---|---|---|
-| Server cert + key (client API) | each etcd Pod, `/etc/etcd/tls/client/{tls.crt,tls.key}` | `--cert-file`, `--key-file` | `spec.tls.client.serverSecretRef` | Secret `<cluster>-server-tls` produced by a Certificate signed by `serverIssuerRef` |
-| Client trust bundle (client API) | each etcd Pod, `/etc/etcd/tls/client/ca.crt` | `--trusted-ca-file` (mTLS only) | `ca.crt` key of `serverSecretRef`'s Secret | `ca.crt` key of `<cluster>-server-tls` (the Issuer's CA cert) |
-| Operator's client cert + key | operator Pod (not mounted into etcd Pods — read by the operator's etcd client) | n/a (Go `tls.Config.Certificates`) | `spec.tls.client.operatorClientSecretRef` | Secret `<cluster>-operator-client-tls` produced by a Certificate signed by `operatorClientIssuerRef` |
-| Peer cert + key + trust | each etcd Pod, `/etc/etcd/tls/peer/{tls.crt,tls.key,ca.crt}` | `--peer-cert-file`, `--peer-key-file`, `--peer-trusted-ca-file` | `spec.tls.peer.secretRef` | Secret `<cluster>-peer-tls` produced by a Certificate signed by `issuerRef` |
+| Серверный сертификат и ключ (клиентский API) | каждый под etcd, `/etc/etcd/tls/client/{tls.crt,tls.key}` | `--cert-file`, `--key-file` | `spec.tls.client.serverSecretRef` | Secret `<cluster>-server-tls`, созданный из Certificate, подписанного `serverIssuerRef` |
+| Бандл доверия клиента (клиентский API) | каждый под etcd, `/etc/etcd/tls/client/ca.crt` | `--trusted-ca-file` (только при mTLS) | ключ `ca.crt` в Secret из `serverSecretRef` | ключ `ca.crt` в `<cluster>-server-tls` (сертификат CA у Issuer) |
+| Клиентский сертификат и ключ оператора | под оператора (в поды etcd не монтируется — его читает клиент etcd в операторе) | нет (Go `tls.Config.Certificates`) | `spec.tls.client.operatorClientSecretRef` | Secret `<cluster>-operator-client-tls`, созданный из Certificate, подписанного `operatorClientIssuerRef` |
+| Peer-сертификат, ключ и доверие | каждый под etcd, `/etc/etcd/tls/peer/{tls.crt,tls.key,ca.crt}` | `--peer-cert-file`, `--peer-key-file`, `--peer-trusted-ca-file` | `spec.tls.peer.secretRef` | Secret `<cluster>-peer-tls`, созданный из Certificate, подписанного `issuerRef` |
 
-The cluster controller propagates the per-Pod secret references (server, peer) onto each `EtcdMember` at creation, so the member controller builds Pods without re-reading the cluster spec. Operator-side material (the operator-client secret) stays on the parent cluster — the member controller fetches the cluster only when it needs an etcd client itself.
+Контроллер кластера при создании передаёт ссылки на Secret уровня пода (серверный, peer) каждому `EtcdMember`, поэтому контроллер члена собирает поды, не перечитывая спецификацию кластера. Материал стороны оператора (клиентский Secret оператора) остаётся на родительском кластере — контроллер члена читает кластер только тогда, когда ему самому нужен клиент etcd.
 
-### Modes from field presence
+### Режимы выводятся из наличия полей
 
-Two boolean knobs on the client plane, each derived from which fields are populated:
+На client plane две логические ручки, каждая выводится из того, какие поля заполнены:
 
-- **Client TLS off** → `spec.tls.client` absent. Plaintext on 2379.
-- **Server TLS only** → `serverSecretRef` set, `operatorClientSecretRef` absent. Encryption, no client identity. `serverSecretRef`'s `ca.crt` is required for the operator to verify the server.
-- **Full mTLS** → both refs set. `--client-cert-auth=true` and `--trusted-ca-file` pointed at the server-secret's `ca.crt`. Operator presents its own cert when dialing.
+- **Клиентский TLS выключен** → `spec.tls.client` отсутствует. Открытый обмен на 2379.
+- **Только серверный TLS** → `serverSecretRef` задан, `operatorClientSecretRef` отсутствует. Шифрование без клиентской идентичности. `ca.crt` из `serverSecretRef` обязателен, чтобы оператор мог проверить сервер.
+- **Полный mTLS** → заданы обе ссылки. Включаются `--client-cert-auth=true` и `--trusted-ca-file`, указывающий на `ca.crt` из серверного Secret. Оператор предъявляет собственный сертификат при обращении.
 
-Peer is simpler — it's a closed mesh:
+С peer проще — это закрытая сетка:
 
-- **Peer TLS off** → `spec.tls.peer` absent. Plaintext on 2380.
-- **Peer TLS on** → `secretRef` set. Always mTLS (`--peer-client-cert-auth=true`); there is no useful encrypt-only mode for a symmetric peer plane.
+- **Peer TLS выключен** → `spec.tls.peer` отсутствует. Открытый обмен на 2380.
+- **Peer TLS включён** → задан `secretRef`. Всегда mTLS (`--peer-client-cert-auth=true`); полезного режима «только шифрование» для симметричной peer plane не существует.
 
-### Constraints on the client-plane CA topology
+### Ограничения на топологию CA client plane
 
-The trust bundle in `serverSecretRef.ca.crt` is consumed twice when mTLS is on: as the operator's `RootCAs` (for verifying the server) and as etcd's `--trusted-ca-file` (for verifying incoming client certs). The trust bundle MUST therefore include both **the CA that signed the server cert** and **the CA that signed the operator-client cert**. In the common one-CA-per-cluster topology these are the same content; with two CAs on the client plane the user bundles both PEM blocks into a single `ca.crt`.
+Бандл доверия в `serverSecretRef.ca.crt` при включённом mTLS потребляется дважды: как `RootCAs` оператора (для проверки сервера) и как `--trusted-ca-file` в etcd (для проверки входящих клиентских сертификатов). Поэтому бандл доверия ОБЯЗАН включать и **CA, подписавший серверный сертификат**, и **CA, подписавший клиентский сертификат оператора**. В обычной топологии «один CA на кластер» это одно и то же содержимое; при двух CA на client plane пользователь складывает оба PEM-блока в один `ca.crt`.
 
-This isn't a documentation preference — etcd's grpc-gateway loopback dials its own client API and presents the **server cert as a client cert** for that self-dial. If the server's issuing CA isn't in `--trusted-ca-file`, the loopback fails chain validation and the server logs become a steady stream of `x509: certificate signed by unknown authority` errors. For the same reason the server cert MUST carry `clientAuth` in its EKU alongside `serverAuth` — Go's `crypto/tls` enforces `ExtKeyUsageClientAuth` server-side when verifying client certs.
+Это не документационное предпочтение: петля grpc-gateway в etcd обращается к собственному клиентскому API и предъявляет **серверный сертификат как клиентский** для этого самообращения. Если CA, выпустивший серверный сертификат, не входит в `--trusted-ca-file`, петля не проходит проверку цепочки, и логи сервера превращаются в ровный поток ошибок `x509: certificate signed by unknown authority`. По той же причине EKU серверного сертификата ОБЯЗАН нести `clientAuth` наряду с `serverAuth` — `crypto/tls` в Go требует `ExtKeyUsageClientAuth` со стороны сервера при проверке клиентских сертификатов.
 
-### Peer-plane SAN constraint
+### Ограничение на SAN у peer plane
 
-The peer-plane verification in etcd does *more* than the standard Go TLS chain check: it reverse-DNS-looks-up the connecting peer's source IP and matches the resulting PTR record against the cert's DNS SANs (`client/pkg/transport/listener_tls.go`'s `checkCertSAN`). Kubernetes' DNS returns the fully-qualified `<pod>.<svc>.<ns>.svc.<cluster-domain>` form for pod IPs, so the peer cert SAN list MUST include `*.<cluster>.<ns>.svc.<cluster-domain>` (the wildcard with the cluster DNS suffix appended) in addition to `*.<cluster>.<ns>.svc`. Without the second wildcard the seed will silently EOF every incoming peer-TLS connection from a non-seed member with a hard-to-diagnose `rejected connection on peer endpoint` log line, and the new pods crashloop on `discovery failed`.
+Проверка peer plane в etcd делает *больше*, чем стандартная проверка цепочки TLS в Go: она выполняет обратное разрешение исходного IP подключающегося узла и сверяет полученную PTR-запись с DNS SAN сертификата (`checkCertSAN` в `client/pkg/transport/listener_tls.go`). DNS Kubernetes возвращает для IP подов полностью квалифицированную форму `<pod>.<svc>.<ns>.svc.<cluster-domain>`, поэтому список SAN у peer-сертификата ОБЯЗАН включать `*.<cluster>.<ns>.svc.<cluster-domain>` (подстановку с добавленным DNS-суффиксом кластера) в дополнение к `*.<cluster>.<ns>.svc`. Без второй подстановки сид будет молча закрывать по EOF каждое входящее peer-TLS-соединение от не-сида, оставляя трудно диагностируемую строку `rejected connection on peer endpoint` в логе, а новые поды будут уходить в crashloop с `discovery failed`.
 
-The cluster DNS suffix is environment-dependent — `cluster.local` on most upstream k8s, `cozy.local` on Cozystack — see [installation: TLS-enabled variant](installation.md#tls-enabled-variant) for how to identify it.
+DNS-суффикс кластера зависит от окружения — `cluster.local` на большинстве апстримных k8s, `cozy.local` в Cozystack; о том, как его определить, см. [установка: вариант с TLS](installation.md#вариант-с-tls).
 
-### Readiness probe under TLS
+### Проверка готовности при TLS
 
-Every member Pod exposes a plaintext metrics listener on container port 2381 (named `metrics`) regardless of TLS state. etcd is started with `--listen-metrics-urls=http://0.0.0.0:2381`; the readiness probe targets `:2381/health` unconditionally. Bound to `0.0.0.0` rather than `localhost` because kubelet's HTTPGet probe dials the Pod IP, not loopback — a `127.0.0.1`-only listener would be unreachable from the kubelet. The same listener is what Prometheus-style scrapers (Cozystack's `VMPodScrape`, kube-prometheus's `PodMonitor`, etc.) target via the named `metrics` port. `/health` and `/metrics` are the only things exposed on this port; neither is sensitive (both are already reachable via the TLS-protected client API).
+Каждый под члена отдаёт открытый слушатель метрик на порту контейнера 2381 (с именем `metrics`) независимо от состояния TLS. Etcd запускается с `--listen-metrics-urls=http://0.0.0.0:2381`; проверка готовности безусловно обращается к `:2381/health`. Привязка к `0.0.0.0`, а не к `localhost`, потому что HTTPGet-проба kubelet обращается к IP пода, а не к петле, — слушатель только на `127.0.0.1` был бы для kubelet недостижим. Тот же слушатель используют сборщики метрик в стиле Prometheus (`VMPodScrape` в Cozystack, `PodMonitor` в kube-prometheus и подобные) через именованный порт `metrics`. На этом порту доступны только `/health` и `/metrics`; ни то, ни другое не чувствительно (и то, и другое уже доступно через защищённый TLS клиентский API).
 
-### cert-manager-driven TLS
+### TLS через cert-manager
 
-Instead of authoring Secrets out-of-band, point each subtree at a cert-manager Issuer (or ClusterIssuer) under `spec.tls.{client,peer}.certManager`:
+Вместо составления Secret вне оператора направьте каждое поддерево на Issuer (или ClusterIssuer) в cert-manager под `spec.tls.{client,peer}.certManager`:
 
 ```yaml
 spec:
@@ -370,44 +432,44 @@ spec:
     client:
       certManager:
         serverIssuerRef:         { name: my-ca, kind: Issuer }
-        operatorClientIssuerRef: { name: my-ca, kind: Issuer }   # presence ⇒ mTLS on
+        operatorClientIssuerRef: { name: my-ca, kind: Issuer }   # наличие ⇒ mTLS включён
     peer:
       certManager:
         issuerRef: { name: my-peer-ca, kind: Issuer }
 ```
 
-The cluster controller emits up to three `cert-manager.io/v1` `Certificate` resources per cluster (server, optional operator-client, peer). Each `Certificate`:
+Контроллер кластера выпускает до трёх ресурсов `cert-manager.io/v1 Certificate` на кластер (серверный, необязательный клиентский оператора, peer). Каждый `Certificate`:
 
-- Is owned by the `EtcdCluster` (cascading GC on cluster delete, which also GCs the resulting Secret).
-- Specifies the SANs, EKUs, and `ipAddresses` etcd needs (server gets the wildcard short + FQDN, the headless and client service DNS, `localhost`, `127.0.0.1`; peer gets the wildcard short + FQDN; operator-client has no SAN).
-- Writes the cert into a conventionally-named Secret (`<cluster>-server-tls`, `<cluster>-operator-client-tls`, `<cluster>-peer-tls`) which the rest of the operator consumes the same way it consumes a BYO Secret — `buildPod` and `buildOperatorTLSConfig` are source-agnostic.
+- Принадлежит `EtcdCluster` (каскадная сборка при удалении кластера, которая заодно убирает получившийся Secret).
+- Задаёт SAN, EKU и `ipAddresses`, нужные etcd (серверный получает короткую подстановку и FQDN, DNS headless- и клиентского Service, `localhost`, `127.0.0.1`; peer получает короткую подстановку и FQDN; у клиентского оператора SAN нет).
+- Пишет сертификат в Secret с общепринятым именем (`<cluster>-server-tls`, `<cluster>-operator-client-tls`, `<cluster>-peer-tls`), который остальная часть оператора потребляет так же, как потребляла бы свой Secret: `buildPod` и `buildOperatorTLSConfig` к источнику безразличны.
 
-The CRD shape enforces exactly one source per subtree via CEL (`secretRef` XOR `certManager`), and `tls.client.operatorClientSecretRef` cannot coexist with `tls.client.certManager` — the mTLS toggle in cert-manager mode lives at `certManager.operatorClientIssuerRef`.
+Форма CRD через CEL обеспечивает ровно один источник на поддерево (`secretRef` ИСКЛЮЧАЮЩЕЕ ИЛИ `certManager`), а `tls.client.operatorClientSecretRef` не может сосуществовать с `tls.client.certManager` — переключатель mTLS в режиме cert-manager живёт в `certManager.operatorClientIssuerRef`.
 
-**Cluster DNS suffix.** The FQDN form of the emitted SANs (`*.<cluster>.<ns>.svc.<cluster-domain>`) needs the cluster's actual DNS suffix. The operator auto-discovers it from `/etc/resolv.conf`'s `search` line at startup — covering `cluster.local`, Cozystack's `cozy.local`, and any other kubelet-injected suffix for normal cluster-pod deployments — and falls back to `cluster.local` only when auto-discovery yields nothing (hostNetwork pods, custom `dnsPolicy`). Override explicitly with `--cluster-domain=<suffix>` when neither path finds the right value. See [installation: prerequisites for cert-manager mode](installation.md#prerequisites-for-cert-manager-mode).
+**DNS-суффикс кластера.** Форма FQDN у выпускаемых SAN (`*.<cluster>.<ns>.svc.<cluster-domain>`) требует настоящего DNS-суффикса кластера. Оператор при старте определяет его по строке `search` в `/etc/resolv.conf`, покрывая `cluster.local`, `cozy.local` в Cozystack и любой другой суффикс, который kubelet подставляет обычным подам кластера, и откатывается на `cluster.local`, только когда автоопределение ничего не вернуло (поды с hostNetwork, нестандартный `dnsPolicy`). Переопределяйте явно через `--cluster-domain=<суффикс>`, когда ни один путь не даёт нужного значения. См. [установка: предварительные требования для режима cert-manager](installation.md#предварительные-требования-для-режима-cert-manager).
 
-**Single-Issuer assumption.** In the happy path the same Issuer signs both the server cert and the operator-client cert, so the CA visible in each Secret's `ca.crt` is the same content — doubling as etcd's `--trusted-ca-file`. Splitting the two Issuers across different root CAs would require the user to ensure both root CAs reach the server's trust bundle; that case is an edge to discuss later.
+**Допущение об одном Issuer.** В счастливом случае один и тот же Issuer подписывает и серверный сертификат, и клиентский сертификат оператора, поэтому CA, видимый в `ca.crt` каждого Secret, — одно и то же содержимое, служащее заодно `--trusted-ca-file` для etcd. Разнесение двух Issuer по разным корневым CA потребовало бы от пользователя обеспечить попадание обоих корневых CA в бандл доверия сервера; этот случай стоит обсудить отдельно.
 
-**cert-manager not installed.** The operator probes the discovery API for `cert-manager.io/v1` at startup. When it isn't registered, a cluster whose `spec.tls` references `certManager` is parked at `Available=False / CertManagerNotInstalled` and the operator never touches the cert-manager.io GVK — avoiding the controller-runtime cached-client failure mode where a missing CRD traps the reflector in a permanent LIST retry. Recovery is "install cert-manager, restart the operator"; the discovery probe re-runs at every operator start.
+**cert-manager не установлен.** Оператор при старте опрашивает discovery API на предмет `cert-manager.io/v1`. Когда тот не зарегистрирован, кластер, чей `spec.tls` ссылается на `certManager`, паркуется в `Available=False / CertManagerNotInstalled`, и оператор к GVK cert-manager.io не притрагивается — избегая отказа кэшированного клиента в controller-runtime, при котором отсутствующий CRD загоняет reflector в вечный цикл повторов LIST. Восстановление — «установить cert-manager, перезапустить оператора»; проба обнаружения выполняется при каждом его старте.
 
-### What the operator does NOT manage (yet)
+### Чем оператор пока НЕ управляет
 
-- **Cert rotation.** cert-manager handles renewal of operator-emitted Certificates automatically (the resulting Secret gets new bytes); the operator does NOT yet watch the Secret and roll Pods. In-place rotation requires manual one-Pod-at-a-time `kubectl delete pod`.
-- **Trust-bundle separate ref.** Use cases like multi-CA trust during rotation or cert-manager `trust-manager` `Bundle` resources still require a custom BYO Secret with a hand-constructed `ca.crt`. Not in the happy path.
-- **SAN validation on BYO certs.** The operator does not parse the user's cert to verify SANs cover the required DNS / IP names; etcd will fail to start (or self-dial loops will spam logs) if the cert is wrong. Required SANs are listed in [`docs/installation.md`](installation.md#tls-enabled-variant).
+- **Ротация сертификатов.** cert-manager сам обновляет выпущенные оператором Certificate (в получившемся Secret появляются новые байты); оператор пока НЕ следит за Secret и не перекатывает поды. Ротация на месте требует ручного `kubectl delete pod` по одному.
+- **Отдельная ссылка на бандл доверия.** Случаи вроде доверия нескольким CA во время ротации или ресурсов `Bundle` из cert-manager `trust-manager` по-прежнему требуют собственного Secret с составленным вручную `ca.crt`. Это вне счастливого пути.
+- **Проверка SAN у своих сертификатов.** Оператор не разбирает сертификат пользователя, чтобы удостовериться, что SAN покрывают нужные имена DNS и IP; etcd просто не стартует (или петли самообращения засорят логи), если сертификат неверен. Обязательные SAN перечислены в [`docs/installation.md`](installation.md#вариант-с-tls).
 
-## Authentication
+## Аутентификация
 
-Transport TLS encrypts the wire; etcd's own **authentication** layer controls *who* may talk to the store. Set `spec.auth.enabled: true` and point at a Secret holding the root credentials:
+Транспортный TLS шифрует провод; собственный уровень **аутентификации** в etcd управляет тем, *кому* можно обращаться к хранилищу. Поставьте `spec.auth.enabled: true` и укажите Secret с учётными данными root:
 
 ```yaml
 spec:
   tls:
     client:
-      serverSecretRef: { name: my-server-tls }   # required — see below
+      serverSecretRef: { name: my-server-tls }   # обязательно — см. ниже
   auth:
     enabled: true
-    rootCredentialsSecretRef: { name: my-etcd-root }   # required
+    rootCredentialsSecretRef: { name: my-etcd-root }   # обязательно
 ---
 apiVersion: v1
 kind: Secret
@@ -415,129 +477,209 @@ metadata:
   name: my-etcd-root
 type: kubernetes.io/basic-auth
 stringData:
-  username: root        # for consumers; the etcd user is always root
-  password: <choose>
+  username: root        # для потребителей; пользователь в etcd всегда root
+  password: <выберите>
 ```
 
-When enabled, the operator provisions a single `root` user — with the **`password` from the referenced Secret** — granted etcd's built-in `root` role, and runs `auth enable`, after which the client API rejects anonymous access. This is a **single-user** model at parity with the legacy operator. Per-tenant users / RBAC are out of scope for now (a future `spec.auth.users`-style extension).
+При включении оператор заводит единственного пользователя `root` — с **паролем из указанного Secret** — с встроенной ролью `root` в etcd и выполняет `auth enable`, после чего клиентский API отклоняет анонимный доступ. Это **однопользовательская** модель на паритете со старым оператором. Пользователи и RBAC внутри etcd пока вне области (в будущем возможно расширение вида `spec.auth.users`).
 
-Mechanics worth knowing:
+Механика, которую стоит знать:
 
-- **Requires `spec.tls.client`** (CEL-enforced). Auth credentials must not cross a plaintext wire, so server-TLS is the minimum; full mTLS also satisfies it.
-- **Requires `spec.auth.rootCredentialsSecretRef`** (CEL-enforced). A `kubernetes.io/basic-auth` Secret in the cluster's namespace; the operator reads its `password` key. The etcd user is always `root` (etcd requires a user named `root` to enable auth), so the Secret's `username` should be `root`.
-- **Immutable post-create** (CEL), like `spec.tls`. Enabling/disabling auth on a live cluster mutates persisted data-store state in lockstep with the operator's own client; v1 punts that to delete-and-recreate. The Secret *reference* is frozen too, and **in-place password rotation is not supported** — the operator reads the password fresh on every dial, so changing the Secret's contents after auth is on would desync it from etcd. Recreate to change the password.
-- **No etcd startup flag, no Pod change.** Auth is a runtime operation persisted in the data store. The operator enables it via the etcd API *after* the cluster has converged to a healthy quorum — there is nothing to add to the member command line, so `EtcdMember` and the Pod spec are untouched.
-- **`status.authEnabled`** latches `true` once `auth enable` succeeds. It is the single signal every operator etcd dial consults: `false` ⇒ dial anonymously (the bootstrap window, before the cluster is up), `true` ⇒ read the Secret and present the root credentials. This is what lets the operator keep managing membership before *and* after the flip — `clientv3` attempts an `Authenticate` RPC on connect only when a username is set, which would fail until auth is on. Provisioning is idempotent: a crash between `auth enable` and the status write is recovered on the next reconcile via `AuthStatus`.
+- **Требует `spec.tls.client`** (проверяет CEL). Учётные данные аутентификации не должны идти по открытому проводу, поэтому серверный TLS — минимум; полный mTLS его тоже удовлетворяет.
+- **Требует `spec.auth.rootCredentialsSecretRef`** (проверяет CEL). Secret вида `kubernetes.io/basic-auth` в неймспейсе кластера; оператор читает его ключ `password`. Пользователь в etcd всегда `root` (etcd требует пользователя с именем `root`, чтобы включить аутентификацию), поэтому `username` в Secret должен быть `root`.
+- **Неизменяемо после создания** (CEL), как и `spec.tls`. Включение или выключение аутентификации на живом кластере согласованно меняет сохранённое состояние хранилища и собственного клиента оператора; v1 отдаёт это удалению и созданию заново. *Ссылка* на Secret тоже заморожена, и **ротация пароля на месте не поддерживается**: оператор читает пароль заново при каждом обращении, поэтому изменение содержимого Secret после включения аутентификации рассинхронизировало бы его с etcd. Чтобы сменить пароль, пересоздайте кластер.
+- **Никакого флага запуска etcd, никаких изменений пода.** Аутентификация — это операция времени выполнения, сохраняемая в хранилище. Оператор включает её через API etcd *после* того, как кластер сошёлся к здоровому кворуму: добавлять в командную строку члена нечего, поэтому `EtcdMember` и спецификация пода не трогаются.
+- **`status.authEnabled`** фиксируется в `true`, как только `auth enable` прошёл. Это единственный сигнал, к которому обращается каждое обращение оператора к etcd: `false` ⇒ обращаться анонимно (окно бутстрапа, пока кластер не поднялся), `true` ⇒ прочитать Secret и предъявить учётные данные root. Именно это позволяет оператору управлять составом и до, и после переключения: `clientv3` пытается выполнить RPC `Authenticate` при подключении только тогда, когда задано имя пользователя, а до включения аутентификации это падало бы. Заведение идемпотентно: сбой между `auth enable` и записью статуса восстанавливается на следующем reconcile через `AuthStatus`.
 
-Consumers of the cluster (e.g. a Kamaji `DataStore`) can point their own `basicAuth` at the same Secret once auth is enabled.
+Потребители кластера (например, `DataStore` в Kamaji) могут направить свой `basicAuth` на тот же Secret, как только аутентификация включена.
 
-Enabling auth on an existing cluster — or migrating from the legacy operator's implicit `root:root` — has ordering and password-matching gotchas; see [migration: root credentials](migration.md#authentication-root-credentials-are-byo-and-required).
+Включение аутентификации на существующем кластере — или переход со старого оператора с неявным `root:root` — имеет тонкости с порядком действий и совпадением паролей; см. [миграция: учётные данные root](migration.md#аутентификация-учётные-данные-root-свои-и-обязательны).
 
 ## PodDisruptionBudget
 
-Every `EtcdCluster` gets a per-cluster `PodDisruptionBudget` (`policy/v1`) named after the cluster. The PDB is what makes `kubectl drain` safe: it tells the apiserver "this many of my Pods may be voluntarily unavailable at once". Without it, a drain can evict more-than-quorum voters before the operator can react and the cluster loses consensus.
+Каждый `EtcdCluster` получает собственный `PodDisruptionBudget` (`policy/v1`), названный по имени кластера. PDB — это то, что делает `kubectl drain` безопасным: он сообщает apiserver, сколько подов может быть добровольно недоступно одновременно. Без него drain может вытеснить больше чем кворум голосующих раньше, чем оператор успеет отреагировать, и кластер потеряет консенсус.
 
-### Selector and budget
+### Селектор и бюджет
 
-- **Selector**: `etcd-operator.cozystack.io/cluster=<name>, etcd-operator.cozystack.io/role=voter`. Only voting members are protected; learners can be evicted freely (a learner-only loss does not affect quorum, and the operator's existing scale-up flow will re-add a learner if the cluster was mid-promotion).
-- **MinAvailable**: the quorum (`n/2 + 1`, integer-divided) of `max(votingMembers, status.observed.replicas)`. For 1 voter → 1, 3 → 2, 4 → 3, 5 → 3, 7 → 4.
+- **Селектор**: `etcd-operator.cozystack.io/cluster=<name>, etcd-operator.cozystack.io/role=voter`. Защищены только голосующие члены; learner можно вытеснять свободно (потеря одного learner не влияет на кворум, а существующий поток масштабирования оператора добавит learner заново, если кластер был посреди повышения).
+- **MinAvailable**: кворум (`n/2 + 1` с целочисленным делением) от `max(голосующие члены, status.observed.replicas)`. Для 1 голосующего → 1, для 3 → 2, для 4 → 3, для 5 → 3, для 7 → 4.
 
-Allowed disruptions = healthy voters − `minAvailable`; there is no `expectedCount` term for churn to re-base the budget against. Anchored to `max(live, target)`, the floor holds at the target's quorum while a node rotation shrinks live membership, steps down with the live count during an intentional scale-down (member removal goes through `MemberRemove`, not the eviction API, so the PDB never blocks it), and sits at the target's quorum before the cluster has reached size (bootstrap, scale-up). Whenever the cluster is below target the floor stays put while healthy voters drop, so the budget tightens with each missing voter and reaches zero once healthy voters fall to `⌊target/2⌋ + 1` — for a 3-member target that is any shortfall at all, for larger targets it takes a shortfall of more than one (target 5 with 4 healthy voters still allows 1 eviction; target 7 with 6 allows 2). Learners are outside the selector and evict freely throughout.
+Разрешённые вытеснения равны числу здоровых голосующих минус `minAvailable`; слагаемого `expectedCount`, относительно которого дребезг мог бы пересчитывать бюджет, здесь нет. Привязанная к `max(живые, цель)`, граница держится на кворуме цели, пока ротация нод сокращает живой состав, снижается вместе с живым счётом при намеренном уменьшении (удаление члена идёт через `MemberRemove`, а не через API вытеснения, поэтому PDB его никогда не блокирует) и стоит на кворуме цели, пока кластер до размера ещё не дошёл (бутстрап, увеличение). Всякий раз, когда кластер ниже цели, граница остаётся на месте, а число здоровых голосующих падает, поэтому бюджет ужимается с каждым недостающим и достигает нуля, как только здоровых голосующих становится `⌊цель/2⌋ + 1`: для цели в 3 члена это любая нехватка вообще, для больших целей нужна нехватка больше одного (цель 5 при 4 здоровых голосующих всё ещё разрешает 1 вытеснение, цель 7 при 6 разрешает 2). Learner находятся вне селектора и вытесняются свободно всё это время.
 
-### Where the `role=voter` label comes from
+### Откуда берётся метка `role=voter`
 
-The cluster controller is the source of truth for whether a member is a voter; it learns this from etcd's `MemberList` (specifically `IsLearner=false`). It writes `Status.IsVoter` onto each `EtcdMember`. The member controller reads `Status.IsVoter` and patches its Pod's `etcd-operator.cozystack.io/role=voter` label accordingly. The new label is visible to the PDB by the next cluster-controller reconcile after promotion — three reconcile cycles end-to-end (cluster writes `IsVoter` → member patches Pod label → cluster's next pass picks up the new voter Pod via `reconcilePDB`). The controller boundaries stay clean: the cluster controller never patches a Pod directly.
+Источник истины о том, голосующий ли член, — контроллер кластера; он узнаёт это из `MemberList` в etcd (а именно из `IsLearner=false`). Он записывает `Status.IsVoter` на каждый `EtcdMember`. Контроллер члена читает `Status.IsVoter` и соответственно патчит метку `etcd-operator.cozystack.io/role=voter` на своём поде. Новая метка становится видна PDB на следующем reconcile контроллера кластера после повышения — три цикла reconcile от края до края (кластер пишет `IsVoter` → член патчит метку пода → следующий проход кластера подхватывает новый под голосующего через `reconcilePDB`). Границы контроллеров остаются чистыми: контроллер кластера никогда не патчит под напрямую.
 
-The seed is **pre-stamped** with `Status.IsVoter=true` at creation — it's never a learner, so the operator skips the round-trip and the Pod gets the role label on the very first reconcile, closing the bootstrap-window protection gap.
+Сиду `Status.IsVoter=true` **проставляется заранее**, при создании: он никогда не бывает learner, поэтому оператор пропускает круг обмена, и под получает метку роли на самом первом reconcile, закрывая прореху в защите на окне бутстрапа.
 
-### Transient races
+### Переходные гонки
 
-Two windows exist; both are safe:
+Существуют два окна, и оба безопасны:
 
-- **Scale-up (after promote).** Etcd's `MemberList` reports N+1 voters but `Status.IsVoter` for the freshly-promoted member hasn't been patched yet, so the PDB selects only the N old voter Pods. A drain in this window could evict the unlabelled new voter (no PDB protection) — etcd is left with N voters running of N+1 registered, which an M=N+1-voter cluster (write quorum `⌊M/2⌋+1`) tolerates for any N ≥ 2. That exposure is unchanged from the old budget. The N labelled voters are protected at least as strongly as before: the floor is the quorum of the scale-up *target* (≥ N+1), so `allowed = currentHealthy - minAvailable` in this window is never more permissive than the old `(N-1)/2` budget, and is often 0.
-- **Scale-down (after `MemberRemove`).** Etcd has N-1 voters but the victim's Pod is briefly Terminating. The PDB's own selector still matches the Terminating Pod, but the k8s PDB controller's `currentHealthy` counts only Pods whose `Ready` condition is `True` — once kubelet flips the Terminating Pod's `Ready` to `False` (which happens at the start of graceful shutdown, before the Pod is gone), it stops counting toward the budget's healthy total. Under `minAvailable` that is the whole story: `allowed = currentHealthy - minAvailable`, and — unlike `maxUnavailable` — there is no `expectedCount` for the disappearing member's scale subresource to shrink, so an in-flight removal consumes budget instead of refilling it.
+- **Увеличение (после повышения).** `MemberList` в etcd сообщает N+1 голосующих, но `Status.IsVoter` для только что повышенного члена ещё не пропатчен, поэтому PDB отбирает только N старых подов голосующих. Drain в этом окне мог бы вытеснить непомеченного нового голосующего (защиты PDB нет) — у etcd останется N работающих голосующих из N+1 зарегистрированных, что кластер с M=N+1 голосующими (кворум записи `⌊M/2⌋+1`) переживает при любом N ≥ 2. Эта уязвимость не изменилась по сравнению со старым бюджетом. N помеченных голосующих защищены как минимум не хуже прежнего: граница — это кворум *цели* увеличения (≥ N+1), поэтому `allowed = currentHealthy - minAvailable` в этом окне никогда не либеральнее старого бюджета `(N-1)/2`, а часто равен 0.
+- **Уменьшение (после `MemberRemove`).** У etcd N-1 голосующих, но под жертвы кратковременно в Terminating. Собственный селектор PDB всё ещё совпадает с этим подом, но `currentHealthy` в контроллере PDB у k8s считает только поды, чьё условие `Ready` равно `True`; как только kubelet переводит `Ready` уходящего пода в `False` (а это происходит в начале мягкого завершения, ещё до исчезновения пода), тот перестаёт учитываться в здоровом итоге бюджета. При `minAvailable` этим всё и исчерпывается: `allowed = currentHealthy - minAvailable`, и — в отличие от `maxUnavailable` — здесь нет `expectedCount`, который подресурс scale исчезающего члена мог бы уменьшить, поэтому идущее удаление расходует бюджет, а не пополняет его.
 
-Both windows are one reconcile cycle wide.
+Оба окна шириной в один цикл reconcile.
 
-### What happens with zero voters
+### Что происходит при нуле голосующих
 
-Pre-bootstrap, paused (PVC clusters at `replicas: 0`), or wedged: voter count is 0 and the operator **deletes** the PDB entirely. A PDB with zero matching Pods and a stale `minAvailable` from a prior state would mislead `kubectl get pdb`; better to leave nothing than to leave noise.
+До бутстрапа, при паузе (кластеры на PVC с `replicas: 0`) или при заклинивании число голосующих равно 0, и оператор **удаляет** PDB целиком. PDB без совпадающих подов и с устаревшим `minAvailable` от прошлого состояния вводил бы в заблуждение в `kubectl get pdb`; лучше не оставить ничего, чем оставить шум.
 
-## Conditions
+## Условия
 
-The cluster surfaces three conditions: `Available`, `Progressing`, `Degraded`. The interesting state space is on `Available`:
+Кластер выставляет три условия: `Available`, `Progressing`, `Degraded`. Интересное пространство состояний — у `Available`:
 
-| `Available` | `Reason` | Meaning |
+| `Available` | `Reason` | Значение |
 |---|---|---|
-| `True` | `QuorumHealthy` | All members ready, target reached. The good state. |
-| `True` | `QuorumAvailable` | More than half ready, less than all. Cluster serves; some members unhealthy. Paired with `Degraded=True/MembersUnhealthy`. |
-| `True` | `ClusterDiscovered` | Bootstrap discovery just succeeded; `clusterID` latched. Transient. |
-| `False` | `Paused` | `spec.replicas=0`. Message names the parked PVC if a dormant member exists, otherwise says no data was ever written. |
-| `False` | `QuorumLost` | Less than half ready. Cluster cannot make progress. |
-| `False` | `ClusterUnreachable` | Discovery couldn't dial etcd (DNS failure, network partition, etcd not yet listening). |
-| `False` | `BootstrapFailed` | Deadline expired before `clusterID` was latched. Terminal — recovery is delete and recreate. |
-| `False` | `DeadlineExceeded` | Deadline expired after bootstrap. Terminal — recovery is to edit spec. |
+| `True` | `QuorumHealthy` | Все члены готовы, цель достигнута. Хорошее состояние. |
+| `True` | `QuorumAvailable` | Готовы больше половины, но не все. Кластер обслуживает; часть членов нездорова. Сопровождается `Degraded=True/MembersUnhealthy`. |
+| `True` | `ClusterDiscovered` | Обнаружение при бутстрапе только что удалось; `clusterID` зафиксирован. Переходное. |
+| `False` | `Paused` | `spec.replicas=0`. Сообщение называет припаркованный PVC, если спящий член есть, иначе говорит, что данные никогда не записывались. |
+| `False` | `QuorumLost` | Готовы меньше половины. Кластер не может продвигаться. |
+| `False` | `ClusterUnreachable` | Обнаружение не смогло подключиться до etcd (отказ DNS, разрыв сети, etcd ещё не слушает). |
+| `False` | `BootstrapFailed` | Срок истёк до фиксации `clusterID`. Терминально — восстановление через удаление и создание заново. |
+| `False` | `DeadlineExceeded` | Срок истёк после бутстрапа. Терминально — восстановление через правку спецификации. |
 
-`Progressing` distinguishes "actively reconciling" from "we hit a wall":
+`Progressing` отличает «активно согласуем» от «упёрлись в стену»:
 
-| `Progressing` | `Reason` | Meaning |
+| `Progressing` | `Reason` | Значение |
 |---|---|---|
-| `True` | `InitialSnapshot` | First-reconcile token + observed latch just happened. |
-| `True` | `SpecChanged` | Previous target reached; adopting the new spec. |
-| `True` | `WaitingForSeed` | Bootstrap seed CR exists but its Pod hasn't been created yet. |
-| `True` | `RetryAfterDeadline` | Deadline-exceeded recovery: user edited spec after a steady-state deadline. |
-| `False` | `Reconciled` | At steady state with the current `observed`. |
-| `False` | `Paused` | Same as Available; emitted when `desired==0`. |
-| `False` | `BootstrapFailed` / `DeadlineExceeded` | Terminal states; see Available. |
+| `True` | `InitialSnapshot` | Только что произошли токен первого reconcile и фиксация observed. |
+| `True` | `SpecChanged` | Прежняя цель достигнута; принимается новая спецификация. |
+| `True` | `WaitingForSeed` | CR сида бутстрапа существует, но его под ещё не создан. |
+| `True` | `RetryAfterDeadline` | Восстановление после истечения срока: пользователь отредактировал спецификацию после срока в установившемся режиме. |
+| `False` | `Reconciled` | Установившийся режим при текущем `observed`. |
+| `False` | `Paused` | То же, что у Available; выставляется при `desired==0`. |
+| `False` | `BootstrapFailed` / `DeadlineExceeded` | Терминальные состояния; см. Available. |
 
-`Degraded` is `True` whenever `Available=True/QuorumAvailable` (partial outage) or `Available=False/QuorumLost`. `False` in healthy or paused states. In other words, `Degraded` means "the cluster is not delivering its full intended capacity right now"; reading `Degraded` alone tells an alerting layer whether to page someone.
+`Degraded` равно `True` всякий раз, когда `Available=True/QuorumAvailable` (частичная авария) или `Available=False/QuorumLost`. `False` в здоровых и приостановленных состояниях. Иначе говоря, `Degraded` означает «кластер сейчас не выдаёт заложенную ёмкость целиком»; чтения одного лишь `Degraded` достаточно слою алертинга, чтобы решить, будить ли человека.
 
-All conditions carry `observedGeneration` so consumers can tell whether a condition reflects the latest spec. Status writes are gated on "did anything actually change" — the operator does not bump `resourceVersion` every 30 s just because of the periodic reconcile.
+Все условия несут `observedGeneration`, поэтому потребители могут понять, отражает ли условие последнюю спецификацию. Записи статуса гейтятся вопросом «изменилось ли что-нибудь на самом деле» — оператор не поднимает `resourceVersion` каждые 30 с просто из-за периодического reconcile.
 
-### Observed member version
+### Наблюдаемая версия члена
 
-`spec.version` is *intent* — it pins the image tag (`v<version>`), which is also the etcd image whose `etcdutl` the restore agent runs. What etcd is **actually running** is a separate, observed fact. Once a member's Pod is Ready, the member controller reads the running version from that member's own etcd endpoint (the Maintenance `Status` RPC) and records it in `EtcdMember.status.version` (surfaced as the `Running` print column). The read is best-effort: a dial or RPC failure leaves the previous value in place and never affects `Ready` — readiness stays driven by Pod readiness and member-ID discovery alone.
+`spec.version` — это *намерение*: она закрепляет тег образа (`v<версия>`), а это ещё и тот образ etcd, чей `etcdutl` запускает агент восстановления. Что etcd **на самом деле выполняет** — отдельный, наблюдаемый факт. Как только под члена становится Ready, контроллер члена читает работающую версию с собственного эндпоинта этого члена (RPC `Status` из Maintenance) и записывает её в `EtcdMember.status.version` (она же печатная колонка `Running`). Чтение выполняется по возможности: неудача подключения или RPC оставляет прежнее значение и никогда не влияет на `Ready` — готовность по-прежнему определяется только готовностью пода и обнаружением member ID.
 
-When the observed version diverges from the member's intended `spec.version`, the member surfaces `VersionDrifted=True/VersionMismatch`; when they agree it is `False/VersionMatched`; when intent is not yet known (`spec.version` empty) the condition is left unset. This condition is **informational only** — the operator does not act on it (it never keys reconciliation off the observed value). It exists so intent-vs-reality drift is *detectable rather than assumed*, which is the prerequisite for safely reconsidering a per-cluster image/version override.
+Когда наблюдаемая версия расходится с заданной у члена `spec.version`, член выставляет `VersionDrifted=True/VersionMismatch`; когда они совпадают — `False/VersionMatched`; когда намерение ещё неизвестно (`spec.version` пуста), условие не выставляется. Это условие **только информационное**: оператор по нему не действует (он никогда не строит reconcile на наблюдаемом значении). Оно существует, чтобы расхождение намерения и реальности было *обнаружимым, а не предполагаемым*, — а это предпосылка для безопасного возвращения к вопросу о переопределении образа или версии на кластер.
 
-## Snapshots & restore
+## Снапшоты и восстановление
 
-Two surfaces, one agent. The operator image doubles as a snapshot agent: `main.go` dispatches on `os.Args[1]` so `manager snapshot-agent` / `manager restore-agent` run the agent and exit, while a bare `manager` runs the controller. This keeps one binary and one image — no separate agent build — and means the agent always matches the operator it ships with.
+Две поверхности, один агент. Образ оператора служит заодно агентом снапшота: `main.go` разбирает `os.Args[1]`, поэтому `manager snapshot-agent` и `manager restore-agent` запускают агента и выходят, а голый `manager` запускает контроллер. Это оставляет один бинарь и один образ — отдельной сборки агента нет, — и означает, что агент всегда соответствует оператору, с которым поставляется.
 
-### Snapshot (`EtcdSnapshot`)
+### Снапшот (`EtcdSnapshot`)
 
-An `EtcdSnapshot` is a one-shot record. The controller resolves `spec.clusterRef`, builds a Job (owned by the `EtcdSnapshot`, with `ttlSecondsAfterFinished` so it self-GCs, `automountServiceAccountToken: false`, and a restricted security context), and tracks `status.phase` through `Pending → Started → Complete | Failed`. The Job's Pod runs the snapshot agent, which:
+`EtcdSnapshot` — разовая запись. Контроллер разрешает `spec.clusterRef`, собирает Job (принадлежащий `EtcdSnapshot`, с `ttlSecondsAfterFinished` для самосборки, `automountServiceAccountToken: false` и ограниченным контекстом безопасности) и ведёт `status.phase` через `Pending → Started → Complete | Failed`. Под этого Job запускает агента снапшота, который:
 
-1. dials the cluster's client Service — TLS material (server CA + operator-client cert) is mounted from the same Secrets the operator dials with, and when `status.authEnabled` is latched the agent authenticates as `root` using the password from `spec.auth.rootCredentialsSecretRef`;
-2. streams `clientv3` `Maintenance.Snapshot` to a local file (PVC destination) or directly to S3 via the transfer manager — no local staging, multipart above the manager's 5 MiB part size — hashing (sha256) and counting bytes as it goes;
-3. prints a marker line — `snapshot uploaded: uri="..." size=N sha256=<hex>` — that the controller scans out of the Pod log (via an uncached `APIReader` to find the Pod and the typed Clientset to read its log) to populate `status.artifact{uri,sizeBytes,checksum}`.
+1. обращается к клиентскому Service кластера — материал TLS (серверный CA и клиентский сертификат оператора) монтируется из тех же Secret, с которыми обращается сам оператор, а когда зафиксирован `status.authEnabled`, агент аутентифицируется как `root` паролем из `spec.auth.rootCredentialsSecretRef`;
+2. передаёт поток `Maintenance.Snapshot` из `clientv3` в локальный файл (назначение на PVC) или прямо в S3 через менеджер передачи — без локального промежуточного хранения, многочастно выше размера части в 5 МиБ у менеджера, — попутно считая хэш (sha256) и байты;
+3. печатает строку-маркер `snapshot uploaded: uri="..." size=N sha256=<hex>`, которую контроллер вычитывает из лога пода (находя под через некэшированный `APIReader` и читая лог типизированным Clientset), чтобы заполнить `status.artifact{uri,sizeBytes,checksum}`.
 
-Why parse a log line rather than have the agent write status? The agent has no Kubernetes API access by design (`automountServiceAccountToken: false`), so the controller — which does — is the one that records the result. The marker is the agent→controller channel. Terminal phases are sticky: a `Complete`/`Failed` snapshot is a historical record and never re-runs.
+Почему разбирать строку лога, а не давать агенту писать статус? У агента по замыслу нет доступа к API Kubernetes (`automountServiceAccountToken: false`), поэтому результат записывает контроллер, у которого он есть. Маркер — это канал от агента к контроллеру. Терминальные фазы липкие: снапшот в `Complete` или `Failed` — историческая запись, и он никогда не перезапускается.
 
-Snapshot integrity note: a `Maintenance.Snapshot` stream carries no appended hash (unlike `etcdutl snapshot save`), so the sha256 in `status.artifact.checksum` is computed by the agent over the bytes it stored, and restore runs with `SkipHashCheck`.
+#### Снапшот снимается с произвольного члена
 
-### Restore (`spec.bootstrap.restore`)
+Агент обращается к **клиентскому Service** кластера, а не к конкретному поду, поэтому снимок берётся с того члена, которого выбрал Service. Для консистентности это безразлично — `Maintenance.Snapshot` отдаёт согласованный образ бэкенда с любого члена. Но ревизия у членов разная: снапшот, снятый с отставшего последователя, при восстановлении выглядит как «потеряли последние секунды записи». Это свойство etcd, а не оператора; заметно оно становится ровно тогда, когда из снапшота восстанавливаются.
 
-Restore is a first-bootstrap-only path, not a controller that mutates a running cluster. When `spec.bootstrap.restore.source` is set, the cluster controller stamps the `RestoreSpec` onto the bootstrap **seed** `EtcdMember` (only the seed — scale-up members join the live cluster normally). The member controller's `buildPod` then prepends two init containers that share the etcd data volume: `install-tools` (operator image) copies the operator binary onto a shared volume, and `restore` runs that binary (`manager restore-agent`) — but from the **target etcd image**, so it reaches the version-matched `etcdutl` bundled there. Before etcd starts, the agent fetches the snapshot (S3 download / PVC read) and execs `etcdutl snapshot restore` into the data dir, using the seed's exact identity — member name, `--initial-cluster`, cluster token, peer URL — so etcd accepts the rebuilt data dir.
+#### Как запись переживает сбой посередине
 
-The init container is idempotent: it no-ops if the data dir already contains a `member/` directory, so Pod restarts after first boot leave live data untouched and never re-download. Because `spec.bootstrap` is CEL-immutable post-create, the restore intent can't be added to or changed on a live cluster — restore happens once, at birth, or not at all. A restored cluster gets a fresh etcd cluster ID: it is a new cluster seeded with old data, not a continuation.
+Назначение решает, чем защищаться, потому что у файловой системы и у объектного хранилища разная механика.
 
-The rebuild's `etcdutl` is the one bundled in the target etcd image (`v<spec.version>`), not one compiled into the operator. Since a data dir's on-disk storage format is minor-version-specific, running the `etcdutl` that ships with the very etcd that will boot on the result keeps the two in lockstep by construction — so restore works for any etcd version the operator supports, not only the operator's own minor. That lockstep is `etcdutl`↔etcd only: the snapshot's own origin version is neither recorded nor checked, so restoring a snapshot taken from a newer etcd into an older `spec.version` remains unsupported (see the [restore runbook](operations.md#restoring-a-cluster-from-a-snapshot)). The two init containers exist to bridge two distroless images that share no binaries: the etcd image has `etcdutl` but no way to copy it out, so `install-tools` brings the operator binary to the etcd image instead.
+**PVC.** Агент пишет во временный файл рядом с целевым и переименовывает его на место. Переименование в пределах файловой системы атомарно, поэтому наблюдатель видит либо прежний файл, либо новый целиком, но никогда — половину. Прерванный на полпути Job оставляет мусорный временный файл, а не правдоподобно выглядящий усечённый снапшот.
 
-This idempotency relies on the data dir being **persistent**. Restore is therefore rejected (by CEL) together with `spec.storage.medium: Memory`: a tmpfs data dir is wiped on every Pod restart, which would defeat the `member/`-exists guard and silently re-restore the original snapshot — reverting any writes since the restore, or breaking a multi-member cluster whose other members already moved past the restored cluster ID. Restore onto memory-backed storage is unsupported; use a PVC-backed cluster.
+**S3.** Поток идёт прямо в загрузку, без локального промежуточного файла: у пода снапшота нет тома под многогигабайтный образ, и требовать его означало бы заранее знать размер бэкенда. Объект появляется в бакете только по завершении загрузки, поэтому отдельного механизма атомарности не нужно.
 
-**Restoring an auth-enabled snapshot.** A snapshot serializes the whole data store, *including etcd's auth state* (users, roles, and the auth-enabled flag). Restoring a snapshot taken while auth was on yields a seed that boots with auth already enabled — so the new `EtcdCluster` must carry a matching `spec.auth` (`enabled: true` + `rootCredentialsSecretRef`, which transitively requires `spec.tls.client`). `reconcileAuth` is built for exactly this: when `spec.auth.enabled` is set it probes `AuthStatus` first, finds auth already on, and latches `status.authEnabled` *without* re-running `UserAdd`/`AuthEnable` — so the password is never reset and the operator simply adopts the restored credentials. The catch is that those credentials must be the *original* ones: etcd stores the root password's bcrypt hash in the snapshot, so the referenced Secret's `password` must equal the password in effect when the snapshot was taken. If `spec.auth` is omitted entirely, the decoupling that makes the bootstrap window correct works against you — `status.authEnabled` never latches, every operator dial stays anonymous (`resolveEtcdCredentials` returns no creds), and the restored etcd rejects them all. Rather than loop on an opaque error, the cluster controller detects the auth-required rejection while no credentials are configured and surfaces `Available=False` / `Degraded=True` with reason `AuthRequiredNotConfigured` and an actionable message, then stops retrying (auth is immutable post-create, so no spec edit recovers it — the fix is delete-and-recreate with `spec.auth`). The operator does **not** inspect the snapshot's auth state to pre-empt this, so the [restore runbook](operations.md#restoring-a-cluster-from-a-snapshot) calls it out as the operator's responsibility.
+**Отказ перезаписать чужой файл.** В обоих случаях агент помечает написанное владельцем — UID объекта `EtcdSnapshot` (отдельным файлом-отметкой рядом на PVC, user-metadata в S3). Прежде чем писать, он проверяет метку уже существующего объекта: свою собственную перезаписать можно (это повтор того же Job после сбоя), чужую — отказ. Без этого два снапшота, случайно нацеленные на один ключ, молча затирали бы друг друга, и обнаружилось бы это при восстановлении.
 
-### Intentionally out of scope: scheduling
+#### Почему у Job есть предельный срок
 
-There is no `EtcdSnapshotSchedule`. Recurring snapshots are a `CronJob` that `kubectl apply`s date-stamped `EtcdSnapshot` objects — composable with the one-shot primitive without adding a cron surface (and its timezone/missed-run/concurrency semantics) to the operator. See the [snapshot runbook](operations.md#taking-a-snapshot) and [restore runbook](operations.md#restoring-a-cluster-from-a-snapshot).
+```go
+snapshotJobActiveDeadlineSeconds int64 = 1800
+```
 
-## What is not in the design
+`backoffLimit` считает только поды, **вышедшие с ненулевым кодом**. Под, который *завис*, он не считает вообще — а снапшот против кластера без готовых эндпоинтов блокируется в RPC `Snapshot` и не завершается никогда. `activeDeadlineSeconds` — единственное, что ограничивает такой под по календарному времени; без него неудачный снапшот держал бы под и своё место в назначении бесконечно.
 
-A few things that recur in similar operators but are intentionally absent here:
+Замечание о целостности снапшота: поток `Maintenance.Snapshot` не несёт приписанного хэша (в отличие от `etcdutl snapshot save`), поэтому sha256 в `status.artifact.checksum` считает агент по тем байтам, которые он сохранил, а восстановление выполняется со `SkipHashCheck`. Поэтому эта контрольная сумма — *единственная* доступная проверка целостности на пути восстановления; см. [проверку снапшота](#проверка-снапшота) ниже.
 
-- **No automatic broken-member replacement for PVC clusters.** `isBroken` is a real predicate only for memory-backed members (Pod lost → memory gone → member replaced); for PVC-backed members it stays a stub. The replacement policy (corruption? irrecoverable crashloop? quorum-loss handling?) is a richer decision and not yet wired up. Broken PVC members stay broken and require an explicit user action (see [operations.md](operations.md#broken-member)).
-- **No leader-aware client routing.** Each etcd-client call balanced by clientv3 lands on whatever endpoint is first responsive. Filtering to non-learner endpoints (the issue #12 fix) handles the "rpc not supported for learner" case, but heavy `MemberList` traffic can still spread across followers. A leader-aware proxy or a sidecar that intercepts apiserver→etcd traffic is the proper fix; not in scope here.
-- **No multi-user / RBAC inside etcd.** Single-user `root` authentication is available via `spec.auth.enabled` (password sourced from a referenced Secret — see [Authentication](#authentication)), but per-tenant users and role-based authorization are not yet wired up — every authenticated client is `root`.
+### Восстановление (`spec.bootstrap.restore`)
 
-See [`What's not supported`](../README.md#whats-not-supported-yet) in the README for the running follow-up list.
+Восстановление — путь только для первого бутстрапа, а не контроллер, меняющий работающий кластер. Когда задан `spec.bootstrap.restore.source`, контроллер кластера проставляет `RestoreSpec` на **сид** `EtcdMember` (только на сид — члены, добавляемые масштабированием, присоединяются к живому кластеру обычным порядком). Затем `buildPod` контроллера члена добавляет впереди два init-контейнера, разделяющих том данных etcd: `install-tools` (образ оператора) копирует бинарь оператора на общий том, а `restore` запускает этот бинарь (`manager restore-agent`), но уже из **целевого образа etcd**, чтобы дотянуться до вложенного туда `etcdutl` нужной версии. До старта etcd агент забирает снапшот (загрузка из S3 или чтение с PVC) и выполняет `etcdutl snapshot restore` в data-dir, используя точную идентичность сида — имя члена, `--initial-cluster`, токен кластера, peer URL, — чтобы etcd принял пересобранный каталог.
+
+Init-контейнер идемпотентен: он ничего не делает, если в data-dir уже есть каталог `member/`, поэтому перезапуски пода после первого старта оставляют живые данные нетронутыми и никогда не перезагружают снапшот. Поскольку `spec.bootstrap` неизменяем после создания (CEL), намерение восстановиться нельзя ни добавить, ни изменить на живом кластере: восстановление случается один раз, при рождении, либо не случается вовсе. Восстановленный кластер получает свежий cluster ID в etcd: это новый кластер, засеянный старыми данными, а не продолжение прежнего.
+
+`etcdutl` для пересборки берётся из целевого образа etcd (`v<spec.version>`), а не компилируется в оператора. Поскольку формат хранения data-dir на диске специфичен для минорной версии, запуск того `etcdutl`, что поставляется с той самой etcd, которая на результате и стартует, держит их в связке по построению — поэтому восстановление работает для любой поддерживаемой оператором версии etcd, а не только для его собственной минорной. Эта связка касается только пары `etcdutl`↔etcd: версия происхождения самого снапшота не записывается и не проверяется, поэтому восстановление снапшота от более новой etcd в более старую `spec.version` остаётся неподдерживаемым (см. [порядок восстановления](operations.md#восстановление-кластера-из-снапшота)). Два init-контейнера нужны, чтобы навести мост между двумя distroless-образами, не разделяющими ни одного бинаря: в образе etcd есть `etcdutl`, но нет способа его оттуда скопировать, поэтому `install-tools` вместо этого приносит бинарь оператора в образ etcd.
+
+Эта идемпотентность опирается на то, что data-dir **постоянен**. Поэтому восстановление отклоняется (через CEL) вместе с `spec.storage.medium: Memory`: data-dir на tmpfs стирается при каждом перезапуске пода, что свело бы на нет защиту по наличию `member/` и молча восстанавливало бы исходный снапшот заново — откатывая любые записи, сделанные после восстановления, или ломая многочленный кластер, чьи остальные члены уже ушли дальше восстановленного cluster ID. Восстановление на хранилище в памяти не поддерживается; используйте кластер на PVC.
+
+#### Проверка снапшота
+
+`bootstrap.restore.checksum` несёт ожидаемую контрольную сумму в том же виде `sha256:<hex>`, в каком её сообщает `EtcdSnapshot`, и агент восстановления сверяет с ней полученный файл, прежде чем `etcdutl` к чему-либо притронется.
+
+Это важнее, чем выглядит по необязательному полю. Поскольку поток `Maintenance.Snapshot` не несёт собственного хэша, `etcdutl snapshot restore` вынужден работать с `--skip-hash-check`; без внешней контрольной суммы на этом пути не проверяется ничего. Усечённая загрузка или повреждённый объект дают каталог данных, на котором etcd спокойно стартует, и кластер выглядит здоровым, пока кто-нибудь не прочитает недостающую часть — во время аварийного восстановления, то есть в самый неподходящий момент.
+
+Отсутствие означает отсутствие проверки, и это прежнее поведение, которое остаётся умолчанием: у снапшота, снятого до того, как оператор начал записывать контрольные суммы, или скопированного руками, сверять просто не с чем. А вот *некорректное* значение — это ошибка, а не тихий пропуск: опечатка, молча отключающая единственную проверку целостности на пути, хуже, чем восстановление, которое отказывается стартовать.
+
+**Восстановление снапшота с включённой аутентификацией.** Снапшот сериализует всё хранилище, *включая состояние аутентификации etcd* (пользователей, роли и флаг включённости). Восстановление снапшота, снятого при включённой аутентификации, даёт сид, который стартует с уже включённой аутентификацией, — поэтому новый `EtcdCluster` обязан нести соответствующий `spec.auth` (`enabled: true` и `rootCredentialsSecretRef`, что транзитивно требует `spec.tls.client`). `reconcileAuth` построен ровно под это: при заданном `spec.auth.enabled` он сначала опрашивает `AuthStatus`, обнаруживает, что аутентификация уже включена, и фиксирует `status.authEnabled`, *не* выполняя заново `UserAdd` и `AuthEnable`, — поэтому пароль не сбрасывается, и оператор просто принимает восстановленные учётные данные. Загвоздка в том, что эти учётные данные должны быть *исходными*: etcd хранит bcrypt-хэш пароля root в снапшоте, поэтому `password` в указанном Secret обязан совпадать с паролем, действовавшим на момент снятия. Если `spec.auth` опущен целиком, то развязка, делающая окно бутстрапа корректным, оборачивается против вас: `status.authEnabled` не фиксируется никогда, каждое обращение оператора остаётся анонимным (`resolveEtcdCredentials` не возвращает учётных данных), и восстановленная etcd их все отклоняет. Вместо того чтобы зациклиться на непонятной ошибке, контроллер кластера распознаёт отказ по причине требуемой аутентификации при ненастроенных учётных данных, выставляет `Available=False` и `Degraded=True` с причиной `AuthRequiredNotConfigured` и внятным сообщением и перестаёт повторять (аутентификация неизменяема после создания, поэтому никакая правка спецификации это не исправит — лечится удалением и созданием заново с заданным `spec.auth`). Оператор **не** заглядывает в состояние аутентификации снапшота, чтобы это предупредить, поэтому [порядок восстановления](operations.md#восстановление-кластера-из-снапшота) прямо называет это вашей ответственностью.
+
+### Расписание (`EtcdSnapshotPolicy`)
+
+`EtcdSnapshot` по замыслу разовый, и это долго оставляло каденцию бэкапов каждого кластера чему-то за пределами оператора: внешнему `CronJob` — или ничему. Там, где оператор держит много кластеров, «или ничему» становится обычным исходом, и первым, кто это замечает, оказывается восстановление.
+
+`EtcdSnapshotPolicy` создаёт объекты `EtcdSnapshot` по расписанию cron. Она намеренно той же формы, что и [`EtcdDefragPolicy`](etcd-defrag.md) — `schedule` (cron и зона IANA), `suspend`, `concurrencyPolicy`, `startingDeadlineSeconds`, лимиты истории, — и разделяет с ней вспомогательные функции планирования, а не переписывает их: семантика догона и предельного срока запуска достаточно тонка, чтобы две копии со временем разошлись.
+
+```yaml
+apiVersion: etcd-operator.cozystack.io/v1alpha2
+kind: EtcdSnapshotPolicy
+metadata:
+  name: tenant-a-backup
+spec:
+  clusterRef: {name: tenant-a}
+  schedule:
+    cron: "0 */6 * * *"
+    timezone: Europe/Moscow
+  destination:
+    s3: {endpoint: ..., bucket: etcd-backups, key: tenant-a/, credentialsSecretRef: {name: s3-creds}}
+  successfulHistoryLimit: 10
+  failedHistoryLimit: 3
+  deleteArtifactOnPrune: true
+```
+
+Имя каждого создаваемого снапшота детерминировано его запланированной минутой, и это работает вдвойне: повторное reconcile того же тика сталкивается по имени, а не создаёт дубль, и — поскольку агент дописывает собственное имя снапшота к ключу назначения — последовательные запуски никогда не перезаписывают артефакты друг друга.
+
+#### Цепочка имён и откуда взялось ограничение в 44 символа
+
+Детерминированные имена выстраиваются в цепочку, и последнее её звено упирается в лимит Kubernetes:
+
+```
+<политика>-<тик>          ->  имя EtcdSnapshot
+<снапшот>-snapshot        ->  имя Job
+```
+
+Имя Job обязано уложиться в **63 символа**: контроллер Job копирует его в метку пода, а значение метки длиннее 63 символов apiserver отклоняет. Считая назад через оба звена, получаем предел на исходное имя: `EtcdSnapshotPolicy` — не длиннее **44** символов, `EtcdSnapshot` — не длиннее **54**.
+
+Проверяется это CEL-правилами в CRD, а не документацией, потому что отказ иначе всплыл бы не при создании политики, а месяцем позже — при первом же тике, чей Job не удалось создать. Чарт по той же причине усекает имена, которые генерирует сам.
+
+Три решения, которые стоит назвать.
+
+**Успехи и отказы хранятся под раздельными лимитами**, как это делает `CronJob`. Единый лимит означал бы, что серия отказов вытесняет успешные снапшоты — единственные объекты, на которые можно указать при восстановлении.
+
+**Вычистка истории удаляет только те снапшоты, которыми политика действительно управляет**, что определяется владельческой ссылкой. Метка `etcd-operator.cozystack.io/snapshot-policy` лишь сужает List; скопированный руками снапшот, сохранивший метку, ни считается активным, ни удаляется.
+
+**`status.lastSuccessfulTime` и `status.lastSuccessfulArtifact` живут на политике**, а не на `EtcdCluster`. «Не было успешного бэкапа N часов» — вопрос, по которому стоит настраивать алерт, а ответ на него из политики — это один Get вместо перебора с фильтрацией по всем `EtcdSnapshot` в неймспейсе.
+
+#### Удаление сохранённого снапшота
+
+Хранение, которое удаляет только объекты `EtcdSnapshot`, оставляет назначение растущим бесконечно. `deleteArtifactOnPrune` заставляет вычистку истории удалять и сохранённый снапшот — через Job `manager prune-agent`, то есть обвязку назначения из Job снапшота с убранным всем остальным (без эндпоинта etcd, без TLS кластера).
+
+По умолчанию это выключено, а агент удаляет **ровно один объект**: ключ, выведенный из собственного имени вычищаемого снапшота и префикса назначения, — то же выведение, что использовала загрузка. Он никогда не перечисляет содержимое бакета или каталога. Префикс назначения часто общий — один бакет на много кластеров или вместе с бэкапами, которые этот оператор не снимал, — и «удалить всё под этим префиксом старше N» это ровно тот способ, которым политика хранения съедает чужие данные.
+
+Порядок такой: сначала артефакт, потом объект. `status.artifact` у `EtcdSnapshot` — единственная запись о том, где лежит сохранённый снапшот, поэтому удаление объекта первым при любом сбое оставило бы сироту, которую никто не найдёт. Снапшот, чьё удаление артефакта не удалось, сохраняется и сообщается, а не выбрасывается: придержать один объект сверх лимита — намного меньшее зло. По той же причине Job удаления принадлежит *политике*, а не снапшоту, который он вычищает: Job, принадлежащий объекту, который вот-вот удалят, был бы собран сборщиком мусора посреди работы.
+
+## Чего нет в устройстве
+
+Несколько вещей, которые повторяются в похожих операторах, здесь отсутствуют намеренно:
+
+- **Нет автоматической замены сломанного члена для кластеров на PVC.** `isBroken` — настоящий предикат только для членов в памяти (потерян под → память исчезла → член заменён); для членов на PVC он остаётся заглушкой. Политика замены (повреждение? неисправимый crashloop? обработка потери кворума?) — более богатое решение, и оно пока не подключено. Сломанные члены на PVC остаются сломанными и требуют явного действия пользователя (см. [operations.md](operations.md#сломанный-член)).
+- **Нет маршрутизации клиента с учётом лидера.** Каждый вызов клиента etcd, балансируемый clientv3, попадает на первый отозвавшийся эндпоинт. Фильтрация до не-learner эндпоинтов (исправление issue #12) закрывает случай «rpc not supported for learner», но интенсивный трафик `MemberList` всё ещё может расходиться по последователям. Правильное решение — прокси с учётом лидера или sidecar, перехватывающий трафик apiserver→etcd; в область этого проекта не входит.
+- **Нет многопользовательского доступа и RBAC внутри etcd.** Однопользовательская аутентификация под `root` доступна через `spec.auth.enabled` (пароль берётся из указанного Secret — см. [Аутентификация](#аутентификация)), но отдельные пользователи и авторизация по ролям пока не подключены: каждый аутентифицированный клиент — это `root`.
+
+Текущий список того, что ещё предстоит, — в разделе [«Чего пока нет»](../README.md#чего-пока-нет) в README.

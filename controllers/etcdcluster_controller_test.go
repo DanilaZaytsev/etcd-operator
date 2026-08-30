@@ -3955,3 +3955,60 @@ func TestEnsureCertificate_DoesNotPatchExistingCertificate(t *testing.T) {
 		t.Fatalf("spec.privateKey.encoding lost or mutated; got %v (found=%v)", enc, found)
 	}
 }
+
+// TestUpdateStatus_ObservedGenerationLagsUntilPassCompletes: status.
+// observedGeneration must name the spec generation the operator has
+// actually finished a pass for, and must stay behind metadata.generation
+// until then. A client (kubectl wait, an Argo CD health check) that reads
+// conditions without this field cannot tell a status left over from the
+// previous spec from one describing the spec it just applied.
+func TestUpdateStatus_ObservedGenerationLagsUntilPassCompletes(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", Generation: 7},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(0),
+			Version:  "3.5.17",
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 0, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
+			},
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	if _, err := r.updateStatus(ctx, cluster, nil); err != nil {
+		t.Fatalf("updateStatus: %v", err)
+	}
+	mustGet(t, c, "test", "ns", cluster)
+	if cluster.Status.ObservedGeneration != 7 {
+		t.Fatalf("after a completed pass ObservedGeneration = %d, want 7", cluster.Status.ObservedGeneration)
+	}
+
+	// The spec changes: metadata.generation moves to 8 while the operator
+	// has not run a pass for it yet. The persisted stamp must still read 7,
+	// otherwise the object would advertise readiness for a spec nobody
+	// has acted on.
+	cluster.Generation = 8
+	if err := c.Update(ctx, cluster); err != nil {
+		t.Fatalf("bumping generation: %v", err)
+	}
+	fresh := &lll.EtcdCluster{}
+	mustGet(t, c, "test", "ns", fresh)
+	if fresh.Status.ObservedGeneration != 7 {
+		t.Fatalf("before the next pass ObservedGeneration = %d, want it to lag at 7", fresh.Status.ObservedGeneration)
+	}
+
+	// A completed pass over generation 8 catches the stamp up.
+	if _, err := r.updateStatus(ctx, fresh, nil); err != nil {
+		t.Fatalf("updateStatus (gen 8): %v", err)
+	}
+	mustGet(t, c, "test", "ns", fresh)
+	if fresh.Status.ObservedGeneration != 8 {
+		t.Fatalf("after the second pass ObservedGeneration = %d, want 8", fresh.Status.ObservedGeneration)
+	}
+}

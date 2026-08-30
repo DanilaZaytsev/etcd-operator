@@ -1,26 +1,28 @@
-# Migration
+# Миграция
 
-Notes for migrating onto this operator (`etcd-operator.cozystack.io/v1alpha2`)
-from the legacy aenix operator (`etcd.aenix.io/v1alpha1`), and for behavioural
-changes that need an explicit migration step.
+Заметки о переходе на этот оператор (`etcd-operator.cozystack.io/v1alpha2`) со
+старого оператора aenix (`etcd.aenix.io/v1alpha1`), а также об изменениях
+поведения, требующих явного шага миграции.
 
-This document covers the **tool-driven migration from the legacy operator**
-(`etcd-migrate`), the **`EtcdBackup` → `EtcdSnapshot` rename** (a pre-GA naming
-change), the **`spec.options` map → typed fields** change, and the one change
-that has a hard migration requirement: **etcd authentication credentials**.
+Документ покрывает **миграцию со старого оператора инструментом**
+(`etcd-migrate`), **переименование `EtcdBackup` → `EtcdSnapshot`** (изменение
+имени до GA), переход **`spec.options` из карты в типизированные поля** и то
+единственное изменение, у которого есть жёсткое требование к миграции:
+**учётные данные аутентификации etcd**.
 
-## Tool-driven in-place migration (`etcd-migrate`)
+## Миграция на месте инструментом (`etcd-migrate`)
 
-`etcd-migrate` adopts running legacy clusters **in place**: the etcd pods and
-their PVCs stay exactly as they are — only ownership, labels, member
-annotations and CRs change, and the new operator takes over the live data
-plane. No data is moved, no pod is restarted, and quorum is never touched.
-Clients that connect by DNS name keep working; one Service changes shape
-(ClusterIP → headless) and has consumer prerequisites — see
-[Endpoint compatibility](#endpoint-compatibility) before you `--apply`.
+`etcd-migrate` присваивает работающие старые кластеры **на месте**: поды etcd и
+их PVC остаются ровно такими, какие есть, — меняются только владение, метки,
+аннотации членов и CR, а новый оператор перенимает живую data plane.
+Данные никуда не переносятся, ни один под не перезапускается, кворум не
+затрагивается вовсе. Клиенты, подключающиеся по DNS-имени, продолжают работать;
+один Service меняет форму (ClusterIP → headless) и имеет предпосылки со стороны
+потребителей — прочтите [Совместимость эндпоинтов](#совместимость-эндпоинтов) до
+того, как выполните `--apply`.
 
-Get it from the GitHub release — each release attaches
-`etcd-migrate-<os>-<arch>` binaries (with a `cli-SHA256SUMS.txt`):
+Возьмите его из релиза на GitHub — к каждому релизу прикладываются бинарники
+`etcd-migrate-<os>-<arch>` (вместе с `cli-SHA256SUMS.txt`):
 
 ```sh
 VERSION=v0.5.0; OS=$(uname -s | tr A-Z a-z); ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
@@ -28,162 +30,171 @@ curl -sSLo etcd-migrate "https://github.com/cozystack/etcd-operator/releases/dow
 chmod +x etcd-migrate && ./etcd-migrate version
 ```
 
-Or build from a checkout with `make etcd-migrate` (lands in `bin/etcd-migrate`).
+Либо соберите из клона репозитория через `make etcd-migrate` (результат в
+`bin/etcd-migrate`).
 
-### How adoption works
+### Как работает присвоение
 
-The adopted pods are made to look native through **durable identity stamped
-as two reserved annotations on each adopted `EtcdMember`** — there is no
-permanent, user-facing API knob for this, and the annotations **self-wipe** as
-the cluster rolls:
+Присвоенные поды приводятся к нативному виду **устойчивой идентичностью,
+проставленной двумя зарезервированными аннотациями на каждом присвоенном
+`EtcdMember`**: постоянной пользовательской ручки API для этого нет, а сами
+аннотации **стираются сами** по мере перекатки кластера.
 
-- **`etcd-operator.cozystack.io/headless-service-name`**. Legacy StatefulSet
-  pods carry an immutable `spec.subdomain` of `<cluster>-headless`, and the
-  peer URLs persisted *inside etcd* use that DNS domain. The annotation makes
-  every URL the operator constructs for that member (dial endpoints,
-  `--initial-cluster`, replacement-pod DNS) match the adopted pod's actual
-  identity — no special cases.
-- **`etcd-operator.cozystack.io/data-dir-subpath`**. The legacy operator kept
-  etcd's data under the `default.etcd/` subdirectory of the PVC; the annotation
-  relocates `--data-dir` so a future replacement Pod resumes from the existing
-  data dir instead of crashlooping with a fresh identity. The controller
-  validates the value in code (single safe path component — no `/`, no `..`)
-  and fails closed to the volume root on anything malformed.
+- **`etcd-operator.cozystack.io/headless-service-name`**. Поды старого
+  StatefulSet несут неизменяемый `spec.subdomain` со значением
+  `<cluster>-headless`, и peer URL, сохранённые *внутри самой etcd*, используют
+  этот домен DNS. Аннотация приводит каждый URL, который оператор строит для
+  этого члена (адреса подключения, `--initial-cluster`, DNS заменяющего пода), в
+  точное соответствие с фактической идентичностью присвоенного пода — без
+  особых случаев.
+- **`etcd-operator.cozystack.io/data-dir-subpath`**. Старый оператор держал
+  данные etcd в подкаталоге `default.etcd/` внутри PVC; аннотация переносит
+  `--data-dir` так, чтобы будущий заменяющий под продолжил с существующего
+  каталога данных, а не ушёл в crashloop со свежей идентичностью. Контроллер
+  проверяет значение в коде (единственный безопасный компонент пути — без `/` и
+  без `..`) и при любой некорректности откатывается к корню тома.
 
-The operator **never stamps these annotations on members it creates**. So
-every member the operator rolls or replaces comes up *native* (cluster-name
-DNS, data dir at the volume root); once the cluster has fully rolled, no member
-carries either annotation and the cluster is indistinguishable from one created
-natively — no permanent knob, nothing to deprecate later. `additionalMetadata`
-cannot set keys under the `etcd-operator.cozystack.io/` reserved prefix, so a
-user can neither forge these annotations nor break the self-wipe.
+Оператор **никогда не проставляет эти аннотации на членах, которых создаёт
+сам**. Поэтому каждый член, который оператор перекатывает или заменяет,
+поднимается *нативным* (DNS по имени кластера, каталог данных в корне тома); а
+как только кластер полностью перекатан, ни один член ни одной из аннотаций не
+несёт, и кластер неотличим от созданного нативно — никакой постоянной ручки,
+нечего потом объявлять устаревшим. `additionalMetadata` не может задавать ключи
+под зарезервированным префиксом `etcd-operator.cozystack.io/`, поэтому
+пользователь не может ни подделать эти аннотации, ни сломать самостирание.
 
-Per cluster, the tool:
+По каждому кластеру инструмент:
 
-1. **Inspects** the live etcd (read-only, over a port-forward with the legacy
-   operator's client certificate): member list, cluster ID, auth status.
-   Runs in dry-run too, so the printed plan shows the real IDs.
-2. **Disables legacy auth** if enabled (the legacy NoPassword root can never
-   match a credentials Secret; the new operator re-enables auth itself). This
-   runs **before** the backup on purpose: the snapshot Job dials etcd
-   anonymously, and etcd rejects the Maintenance Snapshot RPC while auth is on.
-3. **Backs up** the cluster (see below) — before anything is mutated.
-4. **Creates the new CRs with prefilled status**: the `EtcdCluster` gets
-   `status.clusterID`/`clusterToken`/`observed` (so the operator's bootstrap
-   branch never fires against a cluster that already exists), and one
-   `EtcdMember` per pod — named exactly like the pod, carrying the reserved
-   adoption annotations above — gets its `status.memberID` and `isVoter=true`.
-5. **Owner-references the legacy headless Service to the adopted members,
-   then dismantles the legacy control plane** — in that order. The legacy
-   headless Service (`<cluster>-headless`) has its `ownerReferences` replaced
-   with one non-controller entry per adopted `EtcdMember`, so Kubernetes GC
-   removes it exactly when the last adopted member rolls away (new members
-   aren't owners, so they never keep it alive). Only then are the legacy
-   `EtcdCluster` and its StatefulSet deleted with **Orphan** propagation (pods
-   survive) and the cluster-state ConfigMap + legacy PDB removed. Doing the
-   owner-ref rewrite first avoids a window where the Service is sole-owned by
-   a now-deleted object and gets reaped prematurely.
-6. **Re-owns the data plane**: each pod and PVC gets the operator's labels
-   and a controller owner reference to its `EtcdMember` (only after the
-   StatefulSet is gone, so its controller can't re-adopt the pods).
-7. **Cuts over the client Service**: the legacy client Service is named after
-   the cluster (`<cluster>`), which collides with the operator's *native*
-   headless Service of the same name. The tool deletes the legacy client
-   Service and immediately recreates it as the native headless Service (owned
-   by the new `EtcdCluster`), so the DNS name keeps resolving with the minimum
-   possible gap rather than waiting for the operator's first reconcile. See
-   [Endpoint compatibility](#endpoint-compatibility) for what this means for
-   consumers.
+1. **Осматривает** живую etcd (только чтение, через port-forward с клиентским
+   сертификатом старого оператора): список членов, cluster ID, состояние
+   аутентификации. Выполняется и в режиме dry-run, поэтому напечатанный план
+   показывает настоящие ID.
+2. **Отключает старую аутентификацию**, если она включена (у старого root с
+   NoPassword никогда не совпадёт Secret с учётными данными; новый оператор
+   включит аутентификацию сам). Это делается **до** бэкапа намеренно: Job
+   снапшота обращается к etcd анонимно, а etcd отклоняет RPC Maintenance
+   Snapshot, пока аутентификация включена.
+3. **Делает бэкап** кластера (см. ниже) — до того, как что-либо изменено.
+4. **Создаёт новые CR с заранее заполненным статусом**: `EtcdCluster` получает
+   `status.clusterID`, `clusterToken` и `observed` (чтобы ветка бутстрапа в
+   операторе никогда не сработала против уже существующего кластера), а по
+   одному `EtcdMember` на под — названному точно как под и несущему
+   зарезервированные аннотации присвоения выше — получает свой
+   `status.memberID` и `isVoter=true`.
+5. **Переводит владение старым headless-Service на присвоенных членов, а затем
+   разбирает старую control plane** — именно в этом порядке. У старого
+   headless-Service (`<cluster>-headless`) поле `ownerReferences` заменяется на
+   по одной неконтроллерной записи на каждого присвоенного `EtcdMember`, поэтому
+   сборщик мусора Kubernetes удалит его ровно тогда, когда уйдёт последний
+   присвоенный член (новые члены владельцами не становятся и потому не держат
+   его живым). Только после этого старый `EtcdCluster` и его StatefulSet
+   удаляются с распространением **Orphan** (поды выживают), а ConfigMap
+   состояния кластера и старый PDB убираются. Перестановка владельческих ссылок
+   первой исключает окно, в котором Service остаётся в единоличном владении уже
+   удалённого объекта и собирается преждевременно.
+6. **Перенимает data plane**: каждый под и PVC получает метки оператора и
+   контроллерную владельческую ссылку на свой `EtcdMember` (только после того,
+   как StatefulSet удалён, чтобы его контроллер не мог присвоить поды обратно).
+7. **Переключает клиентский Service**: старый клиентский Service назван по имени
+   кластера (`<cluster>`), что сталкивается с *нативным* headless-Service
+   оператора с тем же именем. Инструмент удаляет старый клиентский Service и
+   немедленно пересоздаёт его как нативный headless-Service (во владении нового
+   `EtcdCluster`), чтобы DNS-имя продолжало разрешаться с минимально возможным
+   разрывом, а не ждало первого reconcile оператора. Что это означает для
+   потребителей, см. в [Совместимости эндпоинтов](#совместимость-эндпоинтов).
 
-Every step is idempotent — re-running the tool completes a partially-applied
-adoption.
+Каждый шаг идемпотентен — повторный запуск инструмента доводит частично
+применённое присвоение до конца.
 
-### Prerequisites
+### Предварительные требования
 
-1. **Scale both operators to zero.** The legacy etcd Pods keep running — only
-   the controllers must be quiet. The legacy (v1alpha1) controller is
-   `etcd-operator-controller-manager`; this operator's Helm release is named
-   `etcd-operator`:
+1. **Отмасштабируйте оба оператора в ноль.** Поды etcd старого оператора
+   продолжают работать — замолчать должны только контроллеры. Старый контроллер
+   (v1alpha1) называется `etcd-operator-controller-manager`, а релиз Helm этого
+   оператора — `etcd-operator`:
 
    ```sh
-   kubectl -n etcd-operator-system scale deploy etcd-operator-controller-manager --replicas=0  # legacy
-   kubectl -n etcd-operator-system scale deploy etcd-operator --replicas=0                     # new
+   kubectl -n etcd-operator-system scale deploy etcd-operator-controller-manager --replicas=0  # старый
+   kubectl -n etcd-operator-system scale deploy etcd-operator --replicas=0                     # новый
    ```
 
-   The tool verifies this for both Deployments before doing anything
-   (`--legacy-controller` / `--new-controller` override the coordinates,
-   `--skip-controller-check` bypasses the gate).
-2. The new CRDs (`etcd-operator.cozystack.io/v1alpha2`) must be installed —
-   they ship with the operator chart (`make deploy IMG=...`, or `helm install`;
-   see [installation](installation.md)).
-3. A kubeconfig that can list/delete the legacy CRs cluster-wide, create the
-   new ones, and patch pods/PVCs/Services.
-4. **All etcd pods Ready.** Adoption refuses clusters with missing members,
-   learners, or unreachable etcd.
+   Инструмент проверяет это по обоим Deployment, прежде чем что-либо делать
+   (`--legacy-controller` и `--new-controller` переопределяют координаты,
+   `--skip-controller-check` снимает проверку).
+2. Новые CRD (`etcd-operator.cozystack.io/v1alpha2`) должны быть установлены —
+   они поставляются с чартом оператора (`make deploy IMG=...` или
+   `helm install`; см. [установку](installation.md)).
+3. kubeconfig, которым можно перечислять и удалять старые CR на весь кластер,
+   создавать новые и патчить поды, PVC и Service.
+4. **Все поды etcd готовы.** Присвоение отказывается от кластеров с
+   отсутствующими членами, с learner или с недостижимой etcd.
 
-### Workflow: dry-run first
+### Порядок: сначала dry-run
 
 ```sh
-# Dry-run (the default): inspects each live cluster and prints the planned
-# v1alpha2 manifests, the adoption steps, and warnings for legacy settings
-# that do not carry over.
+# Dry-run (режим по умолчанию): осматривает каждый живой кластер и печатает
+# планируемые манифесты v1alpha2, шаги присвоения и предупреждения о старых
+# настройках, которые не переносятся.
 bin/etcd-migrate
 
-# Execute the adoption (backup destination required — see below).
+# Выполнить присвоение (назначение бэкапа обязательно — см. ниже).
 bin/etcd-migrate --apply \
   --backup-s3-endpoint=https://s3.example.com \
   --backup-s3-bucket=etcd-migration \
-  --backup-s3-credentials-secret=s3-creds   # needed in EVERY migrated namespace
+  --backup-s3-credentials-secret=s3-creds   # нужен в КАЖДОМ мигрируемом неймспейсе
 ```
 
-What gets migrated:
+Что мигрирует:
 
-| Legacy (`etcd.aenix.io/v1alpha1`) | New (`etcd-operator.cozystack.io/v1alpha2`) |
+| Старое (`etcd.aenix.io/v1alpha1`) | Новое (`etcd-operator.cozystack.io/v1alpha2`) |
 |---|---|
-| `EtcdCluster` | `EtcdCluster` + `EtcdMember`s **adopting the running pods in place** |
-| `EtcdBackup` | `EtcdSnapshot` (created; legacy CR deleted) |
-| `EtcdBackupSchedule` | a `CronJob` manifest creating `EtcdSnapshot`s — **printed only**, never applied; the legacy CR is left for you to delete |
+| `EtcdCluster` | `EtcdCluster` и `EtcdMember`, **присваивающие работающие поды на месте** |
+| `EtcdBackup` | `EtcdSnapshot` (создаётся; старый CR удаляется) |
+| `EtcdBackupSchedule` | манифест `CronJob`, создающего `EtcdSnapshot`, — **только печатается**, никогда не применяется; старый CR остаётся вам на удаление |
 
-Every legacy knob with no v1alpha2 equivalent (`spec.options` keys beyond the
-[four typed ones](#specoptions-free-form-map--typed-fields), service/PDB
-templates, podTemplate overrides beyond affinity/topology-spread/resources/
-metadata) is reported as a warning — review them before `--apply`.
-`podTemplate.spec.imagePullSecrets` is **carried** into `spec.imagePullSecrets`
-(it used to be dropped) — so an air-gapped cluster keeps its credentials to pull
-from its mirror after the operator rolls a replacement Pod. (The etcd image's
-registry/tag is not carried; repoint the mirror operator-wide via
-`--etcd-image-repository`, since the operator pins the image to `spec.version`.)
-Hard
-blockers (`emptyDir` storage — nothing to adopt, an unparsable etcd image tag
-without `--version`, `enableAuth` without server TLS, a non-integer
-`quota-backend-bytes`/`snapshot-count`, a failed inspection) skip that
-cluster and exit non-zero.
+Каждая старая настройка без эквивалента в v1alpha2 (ключи `spec.options` сверх
+[четырёх типизированных](#specoptions-свободная-карта--типизированные-поля),
+шаблоны Service и PDB, переопределения podTemplate сверх affinity,
+topology-spread, ресурсов и метаданных) сообщается предупреждением — просмотрите
+их до `--apply`. `podTemplate.spec.imagePullSecrets` **переносится** в
+`spec.imagePullSecrets` (раньше отбрасывался), поэтому кластер в закрытом
+контуре сохраняет учётные данные для загрузки со своего зеркала после того, как
+оператор перекатит заменяющий под. (Реестр и тег образа etcd не переносятся;
+перенаправьте зеркало на уровне всего оператора через
+`--etcd-image-repository`, поскольку оператор закрепляет образ на
+`spec.version`.) Жёсткие блокеры (хранилище `emptyDir` — присваивать нечего,
+неразбираемый тег образа etcd без `--version`, `enableAuth` без серверного TLS,
+нецелочисленные `quota-backend-bytes` или `snapshot-count`, неудавшийся осмотр)
+исключают такой кластер и дают ненулевой код выхода.
 
-TLS needs preparation that the dry-run only partly catches — the CA location,
-and (the one that bites *after* a clean-looking migration) the cert SAN coverage
-for replacement members. Read [TLS](#tls) below before `--apply`.
+TLS требует подготовки, которую dry-run улавливает лишь частично: расположение
+CA и — то, что бьёт уже *после* внешне удачной миграции, — покрытие SAN
+сертификата для заменяющих членов. Прочтите [TLS](#tls) ниже до `--apply`.
 
-### Peer auto-TLS (legacy `--peer-auto-tls`)
+### Peer auto-TLS (старый `--peer-auto-tls`)
 
-The legacy operator ran etcd with `--peer-auto-tls` **unconditionally** unless
-you supplied a BYO peer Secret. Under that flag each member generates its own
-self-signed peer certificate and there is **no shared CA**: peer traffic is
-encrypted but **not authenticated** — any TLS-capable workload that can reach a
-member's `:2380` can peer with the cluster or impersonate a member. This is a
-weaker posture than the real mutual-TLS the native operator offers via
-`spec.tls.peer.secretRef` / `spec.tls.peer.certManager`, and it is **not** the
-same thing as the [SAN-coverage caveat](#endpoint-compatibility) above (that is
-about explicit mTLS certs needing both DNS domains during rollover — a different
-scenario; don't conflate them).
+Старый оператор запускал etcd с `--peer-auto-tls` **безусловно**, если только вы
+не предоставляли собственный peer-Secret. Под этим флагом каждый член порождает
+собственный самоподписанный peer-сертификат, и общего CA **не существует**:
+трафик peer шифруется, но **не аутентифицируется** — любая нагрузка, умеющая
+TLS и достающая до `:2380` члена, может стать соседом кластера или выдать себя
+за члена. Это более слабая позиция, чем настоящий взаимный TLS, который нативный
+оператор предлагает через `spec.tls.peer.secretRef` и
+`spec.tls.peer.certManager`, и это **не** то же самое, что
+[оговорка про покрытие SAN](#совместимость-эндпоинтов) выше (та про явные
+mTLS-сертификаты, которым нужны оба домена DNS во время перекатки, — другой
+сценарий, не путайте их).
 
-The tool **detects this and carries it forward**, because it has to: with no CA
-in existence there is nothing to mint real mTLS certs from, so a replacement or
-scaled-up member running strict mTLS (or plaintext peer) could never rejoin the
-still-auto-tls members. Carry-forward keeps replacement/scale working.
+Инструмент **обнаруживает это и переносит дальше**, потому что вынужден: раз CA
+не существует вовсе, чеканить настоящие mTLS-сертификаты не из чего, а
+заменяющий или добавленный масштабированием член со строгим mTLS (или с открытым
+peer) никогда не смог бы вернуться к членам, оставшимся на auto-tls. Перенос
+сохраняет работоспособность замены и масштабирования.
 
-It is **not** exposed as a typed spec field — an unauthenticated peer plane must
-not be a discoverable, first-class option for new clusters. Instead the tool
-stamps a reserved cluster annotation:
+Типизированным полем спецификации это **не** сделано: неаутентифицированная
+peer plane не должна быть обнаружимым полноправным вариантом для новых
+кластеров. Вместо этого инструмент проставляет зарезервированную аннотацию на
+кластере:
 
 ```yaml
 metadata:
@@ -191,175 +202,184 @@ metadata:
     etcd-operator.cozystack.io/peer-auto-tls: "true"
 ```
 
-The operator reads it and propagates `--peer-auto-tls` to every member it builds
-for that cluster. It is superseded by an explicit `spec.tls.peer.secretRef` /
-`certManager` (real mTLS always wins). The dry-run plan flags the adoption with a
-loud `⚠️  SECURITY:` line, and the post-`--apply` summary re-surfaces it — you
-cannot complete a migration without being told you adopted an unauthenticated
-peer plane.
+Оператор читает её и передаёт `--peer-auto-tls` каждому члену, которого собирает
+для этого кластера. Её вытесняет явный `spec.tls.peer.secretRef` или
+`certManager` (настоящий mTLS всегда побеждает). План dry-run помечает такое
+присвоение громкой строкой `⚠️  SECURITY:`, а итог после `--apply` показывает её
+снова — завершить миграцию, не узнав, что вы присвоили неаутентифицированную
+peer plane, невозможно.
 
-**The only off-ramp to real mTLS is delete-and-recreate** (`spec.tls` is
-immutable), or a careful manual rolling restart onto BYO/cert-manager peer
-certs. Because strict-mTLS and auto-tls members **cannot peer with each other**,
-either route has a brief no-quorum window at the cutover — plan it like any
-peer-cert rotation.
+**Единственный съезд к настоящему mTLS — это удалить и создать заново**
+(`spec.tls` неизменяем) либо аккуратный ручной поочерёдный перезапуск на свои
+или выпущенные cert-manager peer-сертификаты. Поскольку члены со строгим mTLS и
+члены на auto-tls **не могут стать соседями**, у любого маршрута на переключении
+есть короткое окно без кворума — планируйте его как любую ротацию
+peer-сертификатов.
 
-### The safety backup
+### Страховочный бэкап
 
-Adoption rewires ownership of live storage, so the tool snapshots every
-cluster to the `--backup-s3-*`/`--backup-pvc-claim` destination **before any
-ownership/data-plane mutation** — the only step that precedes it is the
-auth-disable above, which the snapshot Job's anonymous dial depends on (a
-one-off Job running the operator image's snapshot agent —
-`--agent-image` overrides; by default the image is read from the new
-controller Deployment's spec, which works at replicas=0). Nothing is restored
-from the artifact — the data never moves — it exists purely for disaster
-recovery. A failed backup excludes that cluster from the apply. Skipping the
-backup requires an explicit `--skip-backup`.
+Присвоение переподключает владение живым хранилищем, поэтому инструмент снимает
+снапшот каждого кластера в назначение `--backup-s3-*` или `--backup-pvc-claim`
+**до любых изменений владения и data plane** — единственный шаг,
+предшествующий ему, это отключение аутентификации выше, от которого зависит
+анонимное обращение Job снапшота (разовый Job, запускающий агента снапшота из
+образа оператора; `--agent-image` переопределяет, а по умолчанию образ читается
+из спецификации Deployment нового контроллера, что работает и при replicas=0).
+Из артефакта ничего не восстанавливается — данные никуда не переезжают, — он
+существует исключительно ради аварийного восстановления. Неудавшийся бэкап
+исключает этот кластер из применения. Пропуск бэкапа требует явного
+`--skip-backup`.
 
-### Auth during migration
+### Аутентификация во время миграции
 
-The legacy operator provisioned the etcd `root` user with **NoPassword**
-(certificate-only identity). The new operator requires BYO root credentials
-(see [Authentication](#authentication-root-credentials-are-byo-and-required)
-below). The tool bridges this: it generates a `kubernetes.io/basic-auth`
-Secret (`<cluster>-root-credentials`, random password) per auth-enabled
-cluster — or references the one you name via `--auth-secret` — runs
-`auth disable` on the live etcd (authenticating with the legacy operator's
-client certificate), and lets the new operator re-enable auth with the
-Secret's password once it takes over. Mind the window: auth is off from that
-moment until the new operator latches `status.authEnabled`. Update consumers
-(e.g. a Kamaji `DataStore` `basicAuth`) to point at the Secret.
+Старый оператор заводил пользователя `root` в etcd с **NoPassword**
+(идентичность только по сертификату). Новый оператор требует собственных
+учётных данных root (см.
+[Аутентификация](#аутентификация-учётные-данные-root-свои-и-обязательны) ниже).
+Инструмент наводит мост: он генерирует Secret вида `kubernetes.io/basic-auth`
+(`<cluster>-root-credentials`, случайный пароль) на каждый кластер с включённой
+аутентификацией — или ссылается на тот, что вы назвали через `--auth-secret`, —
+выполняет `auth disable` на живой etcd (аутентифицируясь клиентским
+сертификатом старого оператора) и даёт новому оператору включить аутентификацию
+заново с паролем из Secret, когда тот примет управление. Помните про окно:
+аутентификация выключена с этого момента и до тех пор, пока новый оператор не
+зафиксирует `status.authEnabled`. Обновите потребителей (например, `basicAuth`
+у `DataStore` в Kamaji), чтобы они указывали на этот Secret.
 
-### Endpoint compatibility
+### Совместимость эндпоинтов
 
-The etcd cluster ID is preserved (it's an adoption, not a restore) and the pods
-keep their IPs, but the **client Service changes shape** because of a naming
-collision you must plan for.
+Cluster ID в etcd сохраняется (это присвоение, а не восстановление), и поды
+сохраняют свои IP, но **клиентский Service меняет форму** из-за коллизии имён, к
+которой надо подготовиться.
 
-The legacy operator names its **client** Service `<cluster>` and its headless
-Service `<cluster>-headless`. The native operator names its **headless** Service
-`<cluster>` and its client Service `<cluster>-client`. So the native headless
-Service collides with the legacy client Service on the name `<cluster>`. Since
-a Service's `clusterIP` is immutable, the collision cannot be reconciled in
-place — the tool deletes the legacy client Service and recreates `<cluster>` as
-a **headless** Service (step 7 above).
+Старый оператор называет свой **клиентский** Service `<cluster>`, а
+headless-Service — `<cluster>-headless`. Нативный оператор называет свой
+**headless**-Service `<cluster>`, а клиентский — `<cluster>-client`. Поэтому
+нативный headless-Service сталкивается со старым клиентским Service по имени
+`<cluster>`. Так как `clusterIP` у Service неизменяем, коллизию нельзя
+согласовать на месте — инструмент удаляет старый клиентский Service и
+пересоздаёт `<cluster>` уже как **headless**-Service (шаг 7 выше).
 
-What this means for consumers connecting to `<cluster>.<ns>.svc:2379`:
+Что это означает для потребителей, подключающихся к `<cluster>.<ns>.svc:2379`:
 
-- **The DNS name keeps resolving** and the server-cert SAN still covers it, so
-  clients that connect **by DNS name** (a normal etcd client with retries — a
-  Kamaji `DataStore`, for example) keep working across the cutover. The
-  recreate happens back-to-back, so the no-resolution window is minimal.
-- **The ClusterIP VIP disappears.** `<cluster>` is now headless (it returns
-  pod A-records directly instead of a single virtual IP), and it publishes
-  not-ready addresses. Any consumer that **depends on the ClusterIP/VIP
-  semantics** — a cached service IP, a NetworkPolicy keyed on the VIP, a
-  customized legacy client Service (`LoadBalancer`/`NodePort`/external-dns
-  annotations) — will break, and the customizations are lost.
+- **DNS-имя продолжает разрешаться**, и SAN серверного сертификата его
+  по-прежнему покрывает, поэтому клиенты, подключающиеся **по DNS-имени**
+  (обычный клиент etcd с повторами — например, `DataStore` в Kamaji),
+  переключение переживают. Пересоздание идёт вплотную, поэтому окно
+  неразрешимости минимально.
+- **Виртуальный IP (ClusterIP) исчезает.** `<cluster>` теперь headless (он
+  возвращает A-записи подов напрямую вместо одного виртуального IP) и публикует
+  адреса неготовых подов. Любой потребитель, **зависящий от семантики
+  ClusterIP/VIP** — закэшированный IP сервиса, NetworkPolicy, завязанная на VIP,
+  доработанный старый клиентский Service (`LoadBalancer`, `NodePort`, аннотации
+  external-dns), — сломается, а доработки будут потеряны.
 
-> **Prerequisite — repoint VIP-dependent consumers before cutover.** If any
-> consumer relies on ClusterIP/VIP behaviour rather than plain DNS, point it at
-> the operator's native **`<cluster>-client`** Service (a regular ClusterIP
-> Service the operator creates) before you run `--apply`. DNS-name consumers
-> need no change.
+> **Предпосылка: перенаправьте зависящих от VIP потребителей до переключения.**
+> Если какой-либо потребитель полагается на поведение ClusterIP/VIP, а не на
+> обычный DNS, направьте его на нативный Service оператора
+> **`<cluster>-client`** (обычный ClusterIP-Service, который создаёт оператор) до
+> запуска `--apply`. Потребителям, работающим по DNS-имени, менять ничего не
+> нужно.
 
-The legacy headless Service (`<cluster>-headless`) is **not** managed by the
-operator; it is owner-referenced to the adopted members and is garbage-collected
-automatically once the last adopted member is replaced (see step 5). The adopted
-pods remain reachable under it for their whole lifetime (their immutable
-`spec.subdomain` points at it); rolled/replacement members come up under the
-native `<cluster>` headless Service instead.
+Старый headless-Service (`<cluster>-headless`) оператором **не** управляется; он
+привязан владельческими ссылками к присвоенным членам и собирается автоматически,
+как только заменён последний присвоенный член (см. шаг 5). Присвоенные поды
+остаются доступны под ним всю свою жизнь (их неизменяемый `spec.subdomain`
+указывает на него); перекатанные и заменяющие члены поднимаются уже под нативным
+headless-Service `<cluster>`.
 
 ### TLS
 
-TLS is the sharpest edge of a migration, because the certificates are
-**externally issued** (the operator never mints server/peer certs — it only
-references them) and the new operator names members differently from the legacy
-one. Two things must be right *before* `--apply`, and the second is the one that
-silently bites later.
+TLS — самая острая грань миграции, потому что сертификаты **выпускаются
+снаружи** (оператор никогда не чеканит серверные и peer-сертификаты, он лишь
+ссылается на них), а новый оператор именует членов иначе, чем старый. Две вещи
+должны быть верны *до* `--apply`, и вторая — та, что кусает молча и позже.
 
-**CA location.** The legacy API kept CAs in separate Secrets
-(`serverTrustedCASecret`, `peerTrustedCASecret`); the new operator reads `ca.crt`
-from the server/peer Secret itself. Merge the CA into the referenced Secret
-before starting the new operator — the dry-run warns per cluster (with
-cert-manager-issued Secrets `ca.crt` is usually already there).
+**Расположение CA.** Старый API держал CA в отдельных Secret
+(`serverTrustedCASecret`, `peerTrustedCASecret`); новый оператор читает `ca.crt`
+из самого серверного или peer-Secret. Слейте CA в указанный Secret до запуска
+нового оператора — dry-run предупреждает об этом по каждому кластеру (у Secret,
+выпущенных cert-manager, `ca.crt` обычно уже на месте).
 
-**SAN coverage — check this before you migrate.** The server and peer certs must
-cover every DNS name a member is reached at. There are two domains in play, and
-they are needed for different lifetimes:
+**Покрытие SAN — проверьте это до миграции.** Серверный и peer-сертификаты
+обязаны покрывать каждое DNS-имя, по которому обращаются к члену. В игре два
+домена, и нужны они на разные сроки:
 
-- `*.<cluster>-headless.<ns>.svc` (+ the `.<cluster-domain>` FQDN form) — the
-  **adopted** members keep this legacy domain (their immutable Pod `subdomain`
-  points at it). **Transient**: needed only until every adopted member has been
-  rolled/replaced; drop it afterwards.
-- `*.<cluster>.<ns>.svc` (+ FQDN) — every member the new operator **creates**
-  (scale-up, and crucially *replacement*) comes up under the native domain.
-  **Permanent**: keep it for the life of the cluster.
+- `*.<cluster>-headless.<ns>.svc` (плюс форма FQDN с `.<cluster-domain>`) —
+  **присвоенные** члены сохраняют этот старый домен (их неизменяемый
+  `subdomain` у пода указывает на него). **Временно**: нужен только до тех пор,
+  пока не будет перекатан или заменён каждый присвоенный член; после этого
+  уберите.
+- `*.<cluster>.<ns>.svc` (плюс FQDN) — каждый член, которого **создаёт** новый
+  оператор (масштабирование и, что критично, *замена*), поднимается под нативным
+  доменом. **Постоянно**: держите его всю жизнь кластера.
 
-Both the server cert and the peer cert need both domains during the mixed
-window. The operator cannot synthesize any of this — coordinate it with whoever
-issues the certs.
+В смешанном окне оба домена нужны и серверному сертификату, и peer-сертификату.
+Оператор ничего из этого синтезировать не может — согласуйте это с тем, кто
+выпускает сертификаты.
 
-> **The wildcard is not optional — and many issuers don't use one.** Some setups
-> (including some Cozystack clusters) issue the etcd cert with **explicit,
-> enumerated per-pod SANs** — `etcd-0`, `etcd-1`, `etcd-2` under
-> `<cluster>-headless` — and **no wildcard**. That is enough to *adopt* (the
-> existing pod names match), so the migration appears to succeed — but the
-> operator replaces a lost member with a fresh one named by `generateName`
-> (a random suffix, e.g. `etcd-9q4xz`). That name is in no SAN and can never be
-> pre-listed, so its endpoint fails certificate verification **forever**.
-> Re-issue the certs with the `*.<cluster>.<ns>.svc` **wildcard** before the
-> first replacement (ideally before migrating at all).
+> **Подстановка не факультативна — и многие выпускающие её не используют.**
+> Некоторые конфигурации (в том числе часть кластеров Cozystack) выпускают
+> сертификат etcd с **явно перечисленными SAN на каждый под** — `etcd-0`,
+> `etcd-1`, `etcd-2` под `<cluster>-headless` — и **без подстановки**. Для
+> *присвоения* этого достаточно (имена существующих подов совпадают), поэтому
+> миграция выглядит удавшейся, — но потерянного члена оператор заменяет свежим,
+> названным через `generateName` (случайный суффикс, например `etcd-9q4xz`).
+> Этого имени нет ни в одном SAN, и перечислить его заранее невозможно, поэтому
+> его эндпоинт **навсегда** не проходит проверку сертификата. Перевыпустите
+> сертификаты с **подстановкой** `*.<cluster>.<ns>.svc` до первой замены (а
+> лучше вообще до миграции).
 
-**The failure mode is silent — the CR status will not show it.** An uncovered
-member still joins raft membership and its Pod reports Ready (the readiness probe
-dials `localhost`, which every cert covers). The operator only checks Pod
-readiness plus the member list, not per-member TLS reachability, so it reports
-`Available=True` / `Degraded=False` while the cluster is in fact running one
-member short — no fault tolerance, one failure from losing quorum. **Validate a
-TLS migration at the etcd level, not from the CR conditions.** From a pod that
-mounts the client cert + CA:
+**Отказ происходит молча — статус CR его не покажет.** Непокрытый член всё равно
+входит в состав raft, и его под сообщает Ready (проверка готовности обращается к
+`localhost`, который покрывает любой сертификат). Оператор проверяет лишь
+готовность пода и список членов, а не достижимость каждого члена по TLS, поэтому
+он сообщает `Available=True` и `Degraded=False`, в то время как кластер на самом
+деле работает на одного члена меньше — без запаса по отказам, в одном отказе от
+потери кворума. **Проверяйте миграцию с TLS на уровне etcd, а не по условиям
+CR.** Из пода, куда смонтированы клиентский сертификат и CA:
 
 ```
 etcdctl endpoint health --cluster
 etcdctl endpoint status --cluster -w table
 ```
 
-A member whose name isn't covered fails with, verbatim:
+Член, чьё имя не покрыто, падает дословно так:
 
 ```
 … transport: authentication handshake failed: tls: failed to verify certificate:
-x509: certificate is valid for <enumerated names…>, not <member>.<cluster>.<ns>.svc
+x509: certificate is valid for <перечисленные имена…>, not <member>.<cluster>.<ns>.svc
 ```
 
-That `not <member>.<cluster>.<ns>.svc` is the tell: the cert is missing the
-native-domain wildcard. Reissue the server **and** peer certs to include it.
+Это `not <member>.<cluster>.<ns>.svc` и есть признак: сертификату не хватает
+подстановки нативного домена. Перевыпустите **и** серверный, **и**
+peer-сертификат так, чтобы она была включена.
 
-### Final cleanup
+### Финальная уборка
 
-After `--apply` succeeds, **scale the new operator up** — it takes over the
-adopted clusters without touching the pods:
+После успешного `--apply` **отмасштабируйте новый оператор вверх** — он примет
+присвоенные кластеры, не трогая поды:
 
 ```sh
 kubectl -n etcd-operator-system scale deploy etcd-operator --replicas=1
 ```
 
-The tool deletes the migrated legacy **CRs** but never the **CRDs**. Once no
-`etcd.aenix.io` CRs remain (remember `EtcdBackupSchedule`s are left in
-place), remove them:
+Инструмент удаляет мигрированные старые **CR**, но никогда — **CRD**. Когда не
+останется ни одного CR `etcd.aenix.io` (помните, что `EtcdBackupSchedule`
+остаются на месте), уберите и их:
 
 ```sh
 kubectl delete crd etcdclusters.etcd.aenix.io etcdbackups.etcd.aenix.io etcdbackupschedules.etcd.aenix.io
 ```
 
-## Snapshot CRD renamed: `EtcdBackup` → `EtcdSnapshot`
+## CRD снапшота переименован: `EtcdBackup` → `EtcdSnapshot`
 
-The one-shot snapshot CRD was renamed from `EtcdBackup` to `EtcdSnapshot` (and
-its status field `status.snapshot` to `status.artifact`) to match upstream
-etcd's terminology (`etcdctl snapshot save` / `restore`). Nothing has shipped
-under the old name, so there is no stored-object migration — but if you applied
-an `EtcdBackup` from a pre-rename build, recreate it under the new kind:
+CRD разового снапшота переименован из `EtcdBackup` в `EtcdSnapshot` (а поле его
+статуса `status.snapshot` — в `status.artifact`), чтобы соответствовать
+терминологии самой etcd (`etcdctl snapshot save` и `restore`). Под старым именем
+ничего не выпускалось, поэтому миграции сохранённых объектов не требуется, — но
+если вы применяли `EtcdBackup` из сборки до переименования, пересоздайте его под
+новым видом:
 
 ```diff
  apiVersion: etcd-operator.cozystack.io/v1alpha2
@@ -374,19 +394,19 @@ an `EtcdBackup` from a pre-rename build, recreate it under the new kind:
      s3: { ... }
 ```
 
-The spec is otherwise unchanged (`spec.clusterRef`, `spec.destination`). The
-restore path (`spec.bootstrap.restore.source`) is unaffected — `restore` keeps
-its name.
+В остальном спецификация не изменилась (`spec.clusterRef`,
+`spec.destination`). Путь восстановления (`spec.bootstrap.restore.source`) не
+затронут — `restore` сохраняет своё имя.
 
-## `spec.options`: free-form map → typed fields
+## `spec.options`: свободная карта → типизированные поля
 
-The legacy operator's `spec.options` was a free-form `map[string]string` passed
-through as etcd flags. This operator keeps the `spec.options` path but types it
-as a closed struct covering exactly the keys Cozystack's etcd package set —
-arbitrary flag injection is no longer possible (see
-[concepts: etcd tuning options](concepts.md#etcd-tuning-options) for why).
+`spec.options` у старого оператора был свободной `map[string]string`,
+пробрасываемой как флаги etcd. Этот оператор сохраняет путь `spec.options`, но
+типизирует его закрытой структурой, покрывающей ровно те ключи, которые задавал
+пакет etcd в Cozystack, — подсунуть произвольный флаг больше нельзя (почему —
+см. [концепции: настройки тюнинга etcd](concepts.md#настройки-тюнинга-etcd)).
 
-The key mapping, using Cozystack's actual legacy values:
+Соответствие ключей на настоящих старых значениях из Cozystack:
 
 ```diff
  spec:
@@ -401,42 +421,43 @@ The key mapping, using Cozystack's actual legacy values:
 +    snapshotCount: 10000
 ```
 
-Note the value types: `quotaBackendBytes` and `snapshotCount` are integers, not
-quoted strings. `etcd-migrate` performs this mapping automatically. Any other
-key the legacy map accepted has no typed equivalent — the tool drops it with a
-warning; if you relied on one, file an issue: the flag gets a typed field, not
-a pass-through.
+Обратите внимание на типы значений: `quotaBackendBytes` и `snapshotCount` —
+целые числа, а не строки в кавычках. `etcd-migrate` выполняет это
+преобразование автоматически. Любой другой ключ, который принимала старая карта,
+типизированного эквивалента не имеет — инструмент отбрасывает его с
+предупреждением; если вы на такой опирались, заведите issue: флаг получит
+типизированное поле, а не сквозной проброс.
 
-## Authentication: root credentials are BYO and required
+## Аутентификация: учётные данные root свои и обязательны
 
-In the legacy operator, enabling auth provisioned a fixed `root:root` user
-implicitly. In this operator, `spec.auth.enabled` requires you to
-**bring your own** root credentials via a referenced Secret — nothing is
-hardcoded. Concretely, when `spec.auth.enabled: true`:
+В старом операторе включение аутентификации неявно заводило фиксированного
+пользователя `root:root`. В этом операторе `spec.auth.enabled` требует, чтобы вы
+**принесли собственные** учётные данные root через указанный Secret — ничего не
+зашито. Конкретно, при `spec.auth.enabled: true`:
 
-- `spec.tls.client` **must** be set (CEL-enforced) — credentials never cross a
-  plaintext wire.
-- `spec.auth.rootCredentialsSecretRef` **must** be set (CEL-enforced). It
-  names a `kubernetes.io/basic-auth` Secret in the cluster's namespace; the
-  operator reads its `password` key. The etcd user is always `root` (etcd
-  requires a user named `root` to enable auth), so the Secret's `username`
-  should be `root`.
+- `spec.tls.client` **обязателен** (проверяет CEL) — учётные данные никогда не
+  идут по открытому проводу.
+- `spec.auth.rootCredentialsSecretRef` **обязателен** (проверяет CEL). Он
+  называет Secret вида `kubernetes.io/basic-auth` в неймспейсе кластера;
+  оператор читает его ключ `password`. Пользователь в etcd всегда `root` (etcd
+  требует пользователя с именем `root`, чтобы включить аутентификацию), поэтому
+  `username` в Secret должен быть `root`.
 
-See [concepts: Authentication](concepts.md#authentication) for the full
-behaviour.
+Полное поведение см. в
+[концепции: Аутентификация](concepts.md#аутентификация).
 
-### Migration steps
+### Шаги миграции
 
-1. **Create the credentials Secret** in the cluster's namespace:
+1. **Создайте Secret с учётными данными** в неймспейсе кластера:
 
    ```sh
    kubectl create secret generic my-etcd-root \
      --type=kubernetes.io/basic-auth \
      --from-literal=username=root \
-     --from-literal=password='<choose-a-password>'
+     --from-literal=password='<выберите-пароль>'
    ```
 
-2. **Reference it on the cluster** alongside client TLS:
+2. **Сошлитесь на него в кластере** вместе с клиентским TLS:
 
    ```yaml
    spec:
@@ -448,37 +469,39 @@ behaviour.
        rootCredentialsSecretRef: { name: my-etcd-root }
    ```
 
-3. **Update consumers.** Any client that talks to the cluster must now
-   authenticate as `root`. For a Kamaji `DataStore`, point its `basicAuth` at
-   the same Secret (Cozystack's `packages/extra/etcd` chart needs this added —
-   it currently sets no `basicAuth`). Without this, tenant control planes lose
-   access the moment auth turns on.
+3. **Обновите потребителей.** Любой клиент, общающийся с кластером, теперь
+   обязан аутентифицироваться как `root`. Для `DataStore` в Kamaji направьте его
+   `basicAuth` на тот же Secret (в чарте `packages/extra/etcd` у Cozystack это
+   нужно добавить — сейчас он не задаёт `basicAuth` вовсе). Без этого
+   control plane дочерних кластеров теряют доступ в момент включения
+   аутентификации.
 
-### Gotchas — read before flipping auth on a cluster that has data
+### Тонкости — прочтите до включения аутентификации на кластере с данными
 
-- **Ordering.** The apiserver accepts the CR as soon as
-  `rootCredentialsSecretRef` is *set* (CEL checks the field, not the Secret's
-  existence). The operator then enables auth only once the cluster has converged
-  to a healthy quorum **and** the Secret exists with a non-empty `password` key;
-  until then it requeues without enabling. So you can create the Secret before
-  or just after the cluster, but `status.authEnabled` will not latch until the
-  Secret is present.
+- **Порядок действий.** Apiserver принимает CR, как только
+  `rootCredentialsSecretRef` *задан* (CEL проверяет поле, а не существование
+  Secret). Оператор же включает аутентификацию только после того, как кластер
+  сошёлся к здоровому кворуму **и** Secret существует с непустым ключом
+  `password`; до тех пор он просто ставит задачу в очередь заново, не включая.
+  Поэтому Secret можно создать и до кластера, и сразу после, но
+  `status.authEnabled` не зафиксируется, пока Secret не появится.
 
-- **Adopting an etcd that ALREADY has auth enabled (the critical one).** The
-  operator's enable step is idempotent: if etcd reports auth already on, it does
-  **not** reset the root password — it just latches `status.authEnabled=true` and
-  from then on dials as `root` with the password **from your Secret**. If that
-  password does not match the one already stored in etcd, every operator dial
-  (member discovery, scale, removal) fails and reconciliation stalls.
+- **Присвоение etcd, где аутентификация УЖЕ включена (самое важное).** Шаг
+  включения у оператора идемпотентен: если etcd сообщает, что аутентификация уже
+  включена, он **не** сбрасывает пароль root — он просто фиксирует
+  `status.authEnabled=true` и с этого момента обращается как `root` с паролем
+  **из вашего Secret**. Если этот пароль не совпадает с уже сохранённым в etcd,
+  каждое обращение оператора (обнаружение членов, масштабирование, удаление)
+  падает, и reconcile встаёт.
 
-  → When migrating data that already had a root password, the Secret's
-  `password` **must equal the existing one**. (Migrating from the legacy
-  operator's implicit `root:root`? Put `password: root` in the Secret to keep
-  working, then rotate later by recreating — see below.)
+  → При миграции данных, у которых уже был пароль root, `password` в Secret
+  **обязан совпадать с существующим**. (Переходите со старого оператора с его
+  неявным `root:root`? Положите `password: root` в Secret, чтобы всё работало, и
+  смените пароль позже пересозданием — см. ниже.)
 
-- **No in-place rotation.** `spec.auth` (including the Secret *reference*) is
-  immutable post-create, and the operator reads the password fresh on every
-  dial. Changing the Secret's *contents* after auth is enabled desyncs the
-  operator from etcd. Rotating the root password is therefore a recreate, not an
-  edit — a native `UserChangePassword` reconcile is a possible future
-  improvement.
+- **Ротации на месте нет.** `spec.auth` (включая саму *ссылку* на Secret)
+  неизменяем после создания, а оператор читает пароль заново при каждом
+  обращении. Изменение *содержимого* Secret после включения аутентификации
+  рассинхронизирует оператора с etcd. Поэтому ротация пароля root — это
+  пересоздание, а не правка; собственное reconcile через `UserChangePassword`
+  — возможное улучшение в будущем.

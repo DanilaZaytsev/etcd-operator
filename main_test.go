@@ -16,7 +16,14 @@ import (
 	"reflect"
 	"testing"
 
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/cozystack/etcd-operator/controllers"
 )
 
 func TestDiscoverClusterDomain(t *testing.T) {
@@ -151,14 +158,19 @@ func TestWatchNamespaceCacheOptions(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got := watchNamespaceCacheOptions(tc.raw)
 			if tc.want == nil {
-				// Zero value keeps the unset path identical to the old config.
-				if !reflect.DeepEqual(got, cache.Options{}) {
-					t.Fatalf("watchNamespaceCacheOptions(%q) = %+v; want zero cache.Options", tc.raw, got)
+				// No namespace scoping: watch everywhere. The per-object
+				// selectors below still apply — "all namespaces" must not mean
+				// "every Pod in the cluster".
+				if got.DefaultNamespaces != nil {
+					t.Fatalf("watchNamespaceCacheOptions(%q).DefaultNamespaces = %+v; want nil", tc.raw, got.DefaultNamespaces)
 				}
-				return
-			}
-			if !reflect.DeepEqual(got.DefaultNamespaces, tc.want) {
+			} else if !reflect.DeepEqual(got.DefaultNamespaces, tc.want) {
 				t.Fatalf("watchNamespaceCacheOptions(%q).DefaultNamespaces = %+v; want %+v", tc.raw, got.DefaultNamespaces, tc.want)
+			}
+			// The object selectors are not a function of the namespace list and
+			// must be present either way.
+			if len(got.ByObject) == 0 {
+				t.Fatalf("watchNamespaceCacheOptions(%q) left the cache unfiltered", tc.raw)
 			}
 		})
 	}
@@ -173,5 +185,54 @@ func TestOperatorImageError(t *testing.T) {
 		if err := operatorImageError(img); err != nil {
 			t.Errorf("operatorImageError(%q) = %v, want nil", img, err)
 		}
+	}
+}
+
+// The cache selectors decide how much of the cluster this operator holds in
+// memory. On a parent cluster where every namespace is a tenant control plane,
+// an unfiltered Pod cache is every tenant's apiserver, scheduler and
+// controller-manager Pod — a footprint that scales with the whole cluster
+// rather than with the number of etcd clusters.
+func TestOperatorOwnedCacheSelectors(t *testing.T) {
+	sel := operatorOwnedCacheSelectors()
+
+	// The map is keyed by client.Object values, so look entries up by type
+	// rather than by identity — two &corev1.Pod{} pointers are not equal.
+	byType := map[reflect.Type]cache.ByObject{}
+	for obj, cfg := range sel {
+		byType[reflect.TypeOf(obj)] = cfg
+	}
+
+	// The core types the operator creates, all of which carry its cluster
+	// label. Missing one here silently restores the unfiltered cache for it.
+	for _, obj := range []client.Object{
+		&corev1.Pod{},
+		&corev1.PersistentVolumeClaim{},
+		&corev1.Service{},
+		&policyv1.PodDisruptionBudget{},
+		&batchv1.Job{},
+	} {
+		byObj, ok := byType[reflect.TypeOf(obj)]
+		if !ok {
+			t.Fatalf("%T is cached unfiltered", obj)
+		}
+		if byObj.Label == nil {
+			t.Fatalf("%T has no label selector", obj)
+		}
+		// An object of ours matches; a foreign one does not.
+		if !byObj.Label.Matches(labels.Set{controllers.LabelCluster: "tenant-a"}) {
+			t.Fatalf("%T selector rejects an operator-owned object", obj)
+		}
+		if byObj.Label.Matches(labels.Set{"app": "kube-apiserver"}) {
+			t.Fatalf("%T selector admits a foreign object; the cache would hold the whole cluster", obj)
+		}
+	}
+
+	// Secrets must NOT be here: they are excluded from the cache entirely
+	// (client.CacheOptions.DisableFor), because user-provided TLS and S3
+	// Secrets carry no operator label to select on. A selector here would
+	// silently filter out every Secret the operator needs to read.
+	if _, ok := byType[reflect.TypeOf(&corev1.Secret{})]; ok {
+		t.Fatalf("Secrets have a cache selector; they are read live and would be filtered out entirely")
 	}
 }

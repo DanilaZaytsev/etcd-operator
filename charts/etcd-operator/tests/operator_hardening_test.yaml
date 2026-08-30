@@ -1,0 +1,188 @@
+suite: The operator Pod survives a busy parent cluster
+
+# In a parent cluster hosting tenant control planes the operator is the control
+# plane for every EtcdCluster on it. What these assert is not YAML shape but the
+# handful of properties that decide whether it stays up and keeps up: that it is
+# admissible under a restricted PodSecurity policy, that it is not the first
+# thing evicted under node pressure, that multiple replicas are actually spread,
+# and that its DNS suffix and reconcile concurrency are reachable as settings.
+
+templates:
+  - deployment.yaml
+  - poddisruptionbudget.yaml
+
+tests:
+  - it: is admissible under the restricted PodSecurity profile
+    # Without seccompProfile the operator's own Pod is rejected in a namespace
+    # that enforces restricted — while the etcd member Pods it emits comply.
+    template: deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.runAsNonRoot
+          value: true
+      - equal:
+          path: spec.template.spec.securityContext.seccompProfile.type
+          value: RuntimeDefault
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          value: false
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.capabilities.drop
+          value: ["ALL"]
+
+  - it: lets a cluster pin its own seccomp profile
+    template: deployment.yaml
+    set:
+      manager.seccompProfile:
+        type: Localhost
+        localhostProfile: profiles/etcd-operator.json
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.seccompProfile.localhostProfile
+          value: profiles/etcd-operator.json
+
+  - it: omits the seccomp profile entirely when set to null
+    # For a cluster that manages the profile out of band. Note `null`, not `{}`:
+    # Helm merges maps rather than replacing them, so an empty map leaves the
+    # default in place. The chart's values documentation says so for the same
+    # reason this test spells it out.
+    template: deployment.yaml
+    set:
+      manager.seccompProfile: null
+    asserts:
+      - notExists:
+          path: spec.template.spec.securityContext.seccompProfile
+
+  - it: is not the first thing evicted under node pressure
+    template: deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.priorityClassName
+          value: system-cluster-critical
+  - it: can drop the priority class
+    template: deployment.yaml
+    set:
+      priorityClassName: ""
+    asserts:
+      - notExists:
+          path: spec.template.spec.priorityClassName
+
+  # --cluster-domain auto-discovers from /etc/resolv.conf, which a hostNetwork
+  # or dnsPolicy:None Pod cannot see. The value ends up in the SANs of the
+  # cert-manager Certificates the operator emits, so a wrong suffix breaks peer
+  # TLS verification.
+  - it: passes the cluster domain when set
+    template: deployment.yaml
+    set:
+      manager.clusterDomain: cozy.local
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --cluster-domain=cozy.local
+  - it: leaves the cluster domain to auto-discovery by default
+    template: deployment.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --cluster-domain=
+
+  # At one worker a single unreachable cluster stalls every other cluster's
+  # reconcile behind its dial timeout.
+  - it: raises reconcile concurrency when asked
+    template: deployment.yaml
+    set:
+      manager.maxConcurrentReconciles: 8
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --max-concurrent-reconciles=8
+  - it: leaves the flag off at the default of one
+    # The operator's own default is 1; emitting the flag anyway would make the
+    # rendered command line imply a deliberate choice that was never made.
+    template: deployment.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --max-concurrent-reconciles=1
+
+  # The cache holds one entry per operator-owned object, so the footprint
+  # scales with the number of clusters. The old 128Mi ceiling was set when the
+  # chart assumed a handful.
+  - it: gives the manager room for a few hundred clusters
+    template: deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 256Mi
+
+  # The CPU request is the operator's guaranteed share when the node is
+  # contended, and it is the control plane for every EtcdCluster on the
+  # cluster. The scaffold's 10m starves it exactly when the cluster is busy.
+  - it: requests a meaningful CPU share
+    template: deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.cpu
+          value: 100m
+
+  - it: does not spread a single replica
+    template: deployment.yaml
+    asserts:
+      - notExists:
+          path: spec.template.spec.affinity
+
+  - it: spreads replicas across nodes once there is more than one
+    # Two standbys on one node give no failover at all when that node goes.
+    template: deployment.yaml
+    set:
+      replicaCount: 3
+    asserts:
+      - equal:
+          path: spec.template.spec.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].podAffinityTerm.topologyKey
+          value: kubernetes.io/hostname
+
+  - it: lets an explicit affinity win over the default spread
+    template: deployment.yaml
+    set:
+      replicaCount: 3
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: dedicated
+                    operator: In
+                    values: [control-plane]
+    asserts:
+      - notExists:
+          path: spec.template.spec.affinity.podAntiAffinity
+      - exists:
+          path: spec.template.spec.affinity.nodeAffinity
+
+  - it: creates no PodDisruptionBudget by default
+    template: poddisruptionbudget.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: creates a PodDisruptionBudget for a multi-replica install
+    template: poddisruptionbudget.yaml
+    set:
+      replicaCount: 3
+      podDisruptionBudget.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: spec.minAvailable
+          value: 1
+
+  # A budget over one replica is either inert or blocks every drain of its
+  # node, and a stuck drain is worse than a few seconds without a leader.
+  - it: refuses a PodDisruptionBudget over a single replica
+    template: poddisruptionbudget.yaml
+    set:
+      podDisruptionBudget.enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: "podDisruptionBudget.enabled requires replicaCount > 1: a budget over a single operator replica either does nothing or blocks every drain of its node"

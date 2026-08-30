@@ -190,6 +190,7 @@ type MemberDefragStatus struct {
 	FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
 }
 
+// +kubebuilder:resource:shortName=etcddf,categories=etcd
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Cluster",type=string,JSONPath=`.spec.clusterRef.name`

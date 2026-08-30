@@ -44,6 +44,11 @@ const (
 // kubelet actually pulled the mirror reference (side-loaded as IfNotPresent)
 // and the member joined quorum.
 func TestEtcdImageOverride(t *testing.T) {
+	// Each test owns its namespace and cluster names, so the suite is
+	// bound by the slowest test rather than their sum. Kept honest by the
+	// operator running with more than one reconcile worker in e2e — with a
+	// single worker these would just queue behind each other.
+	t.Parallel()
 	ctx := context.Background()
 
 	// TypeMeta is mandatory for server-side apply: the apiserver resolves the

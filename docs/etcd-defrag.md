@@ -1,32 +1,35 @@
-# Defragmentation (`EtcdDefrag`)
+# Дефрагментация (`EtcdDefrag`)
 
-etcd never reclaims backend disk on its own: compaction frees pages logically,
-but the file — and the space counted against `--quota-backend-bytes` — stays
-allocated until a **defragment** returns it. `EtcdDefrag` is how you ask the
-operator to do that, safely.
+etcd никогда не возвращает дисковое пространство бэкенда сам: компакция
+освобождает страницы логически, но файл — и место, засчитываемое в
+`--quota-backend-bytes`, — остаётся занятым, пока его не вернёт
+**дефрагментация**. `EtcdDefrag` — это способ попросить оператора сделать это
+безопасно.
 
-It is a one-shot, run-to-completion record, modeled on [`EtcdSnapshot`](concepts.md#snapshots--restore):
-the operator drives it through `status.phase` and it never re-runs.
+Это одноразовая запись, выполняемая до завершения, по образцу
+[`EtcdSnapshot`](concepts.md#снапшоты-и-восстановление): оператор ведёт её через
+`status.phase`, и она никогда не перезапускается.
 
-**Scheduling.** `EtcdDefrag` is the *run*; what *triggers* a run is separate.
-For recurring defragmentation, [`EtcdDefragPolicy`](#recurring-runs-etcddefragpolicy)
-stamps out `EtcdDefrag` objects on a cron schedule so the operator drives the
-cadence itself; you can also create `EtcdDefrag` objects from outside (a
-`CronJob`, a GitOps cron) if you prefer to own the schedule elsewhere.
+**Расписание.** `EtcdDefrag` — это *запуск*; то, что его *инициирует*, отделено.
+Для регулярной дефрагментации [`EtcdDefragPolicy`](#регулярные-запуски-etcddefragpolicy)
+создаёт объекты `EtcdDefrag` по расписанию cron, и оператор сам держит каденцию;
+можно также создавать объекты `EtcdDefrag` извне (`CronJob`, cron в GitOps),
+если расписание вы предпочитаете держать у себя.
 
-## Why in the operator (not a bare CronJob)
+## Почему в операторе, а не голым CronJob
 
-A defrag briefly blocks the member it runs on, so it must be sequenced. The
-operator already holds each cluster's TLS/auth material and endpoints, has the
-whole-cluster view, and runs under leader election, so it can defragment members
-**one at a time, followers before the leader, and only while the cluster is
-healthy** — deferring rather than forcing on a degraded cluster. A detached
-`CronJob` calling `etcdctl defrag` cannot make those guarantees.
+Дефрагментация ненадолго блокирует тот член, на котором выполняется, поэтому её
+надо упорядочивать. У оператора уже есть материал TLS и аутентификации каждого
+кластера и его эндпоинты, он видит кластер целиком и работает под лидерскими
+выборами, поэтому может дефрагментировать членов **по одному, сначала
+последователей, затем лидера, и только пока кластер здоров**, — откладывая, а не
+продавливая на деградировавшем кластере. Отдельный `CronJob`, вызывающий
+`etcdctl defrag`, таких гарантий дать не может.
 
-## Usage
+## Использование
 
-Defragment every member of a cluster once, now (`rule.all` — the explicit,
-unconditional form):
+Дефрагментировать каждого члена кластера один раз, прямо сейчас (`rule.all` —
+явная безусловная форма):
 
 ```yaml
 apiVersion: etcd-operator.cozystack.io/v1alpha2
@@ -41,9 +44,9 @@ spec:
     all: true
 ```
 
-Guarded run (skips members that aren't worth defragmenting; with
-`ttlSecondsAfterFinished` the controller GCs the record an hour after it
-finishes — useful for objects a scheduler stamps out):
+Запуск с условиями (пропускает членов, которых дефрагментировать не стоит; с
+`ttlSecondsAfterFinished` контроллер соберёт запись через час после завершения —
+удобно для объектов, которые штампует планировщик):
 
 ```yaml
 apiVersion: etcd-operator.cozystack.io/v1alpha2
@@ -53,12 +56,12 @@ spec:
     name: etcd
   ttlSecondsAfterFinished: 3600
   rule:
-    freeSpaceAbove: 200Mi   # reclaimable (DbSize - DbSizeInUse) worth reclaiming
-    quotaUsageAbove: 80%    # under quota pressure, take smaller wins too …
-    minReclaim: 32Mi        # … but never a no-op defrag
+    freeSpaceAbove: 200Mi   # возвращаемое (DbSize - DbSizeInUse), которое стоит вернуть
+    quotaUsageAbove: 80%    # под давлением квоты брать и меньший выигрыш…
+    minReclaim: 32Mi        # …но никогда не делать бессмысленную дефрагментацию
 ```
 
-Inspect progress and history:
+Посмотреть ход и историю:
 
 ```sh
 kubectl get etcddefrag.etcd-operator.cozystack.io -n team-a
@@ -69,93 +72,100 @@ kubectl get etcddefrag.etcd-operator.cozystack.io etcd-now -n team-a \
   -o jsonpath='{.status.members}' | jq
 ```
 
-## The rule
+## Правило
 
-A defrag can only reclaim `DbSize - DbSizeInUse`, so that reclaimable amount is
-the always-applied floor — this is what stops a full-but-unfragmented backend
-(`DbSize ≈ DbSizeInUse` near the quota) from being defragmented over and over
-for nothing.
+Дефрагментация может вернуть только `DbSize - DbSizeInUse`, поэтому этот
+возвращаемый объём и есть всегда действующая нижняя граница — именно она не даёт
+полному, но нефрагментированному бэкенду (`DbSize ≈ DbSizeInUse` у самой квоты)
+дефрагментироваться снова и снова впустую.
 
-| Field | Default | Meaning |
+| Поле | Умолчание | Значение |
 |---|---|---|
-| `all` | `false` | Defragment every member unconditionally. Mutually exclusive with the fields below. |
-| `freeSpaceAbove` | `200Mi` | Defragment a member whose reclaimable space exceeds this. |
-| `quotaUsageAbove` | unset | When `DbSize` exceeds this fraction of the backend quota, lower the reclaim floor to `minReclaim` so small wins are taken under pressure. |
-| `minReclaim` | `32Mi` | The floor for the quota arm (only meaningful with `quotaUsageAbove`, and must not exceed `freeSpaceAbove`) — never a no-op defrag. |
+| `all` | `false` | Дефрагментировать каждого члена безусловно. Взаимоисключимо с полями ниже. |
+| `freeSpaceAbove` | `200Mi` | Дефрагментировать члена, у которого возвращаемое место превышает это значение. |
+| `quotaUsageAbove` | не задано | Когда `DbSize` превышает эту долю квоты бэкенда, опустить нижнюю границу возврата до `minReclaim`, чтобы под давлением брать и малый выигрыш. |
+| `minReclaim` | `32Mi` | Граница для ветки по квоте (осмысленна только вместе с `quotaUsageAbove` и не должна превышать `freeSpaceAbove`) — чтобы дефрагментация никогда не была бессмысленной. |
 
-An **absent `rule`** is equivalent to an empty one: the default gate
-(`freeSpaceAbove: 200Mi`). Unconditional defragmentation is something you ask
-for explicitly with `rule.all: true`, never something you get by leaving a key
-out.
+**Отсутствующее `rule`** равнозначно пустому: действует умолчание
+(`freeSpaceAbove: 200Mi`). Безусловная дефрагментация — это то, что запрашивают
+явно через `rule.all: true`, и никогда не то, что достаётся пропуском ключа.
 
-> **Compaction is a prerequisite you own.** Defrag reclaims what compaction
-> freed. A cluster with no auto-compaction (`spec.options.autoCompactionMode` /
-> `autoCompactionRetention`) has `DbSizeInUse ≈ DbSize` and little to reclaim.
-> Set auto-compaction if you rely on defrag to hold the backend down.
+> **Компакция — предпосылка, за которую отвечаете вы.** Дефрагментация
+> возвращает то, что освободила компакция. У кластера без авто-компакции
+> (`spec.options.autoCompactionMode` и `autoCompactionRetention`) будет
+> `DbSizeInUse ≈ DbSize` и возвращать почти нечего. Настройте авто-компакцию,
+> если рассчитываете, что дефрагментация будет удерживать бэкенд в размере.
 
-## Safety model
+## Модель безопасности
 
-- **One member at a time, followers before the leader**, only while the whole
-  cluster is healthy. A defrag due on a not-fully-healthy cluster is **deferred**
-  — the object stays `Pending` with a condition explaining why — never forced,
-  so quorum is never at risk.
-- **Leadership is moved off the leader before it is defragmented.** A defrag
-  blocks the member it runs on, and a block outlasting the raft election timeout
-  costs an election and a brief write-availability gap — the one disruption that
-  doing the leader *last* does not bound. The operator hands leadership to a
-  voting follower first (learners are never chosen), so the pause lands on a
-  member that is no longer leading. Single-member clusters skip this, having
-  nowhere to move it to. The transfer is best-effort: if it fails the leader is
-  defragmented in place, which is simply the behaviour without this step, and a
-  `LeadershipTransferFailed` warning event records it.
-- **Serialized per cluster:** at most one `EtcdDefrag` runs against a given
-  `EtcdCluster` at a time; others wait in `Pending`.
-- Health is judged from more than "the member answered": a member replies to a
-  local status read while partitioned or alarmed, so the gate checks that every
-  desired member is present and reachable, that they agree on a single non-zero
-  leader, and that no member reports a blocking alarm. A `CORRUPT` alarm blocks;
-  a `NOSPACE` alarm does **not** — a backend at its quota is exactly what a defrag
-  relieves, so the run is admitted and the alarm is disarmed once space has been
-  reclaimed. Raft lag is not yet part of the gate.
+- **По одному члену за раз, сначала последователи, затем лидер**, и только пока
+  здоров весь кластер. Дефрагментация, наступившая на не полностью здоровом
+  кластере, **откладывается** — объект остаётся в `Pending` с условием,
+  объясняющим причину, — и никогда не продавливается, поэтому кворум ни разу не
+  оказывается под угрозой.
+- **Лидерство уводится с лидера до того, как его дефрагментируют.**
+  Дефрагментация блокирует тот член, на котором выполняется, а блокировка,
+  превышающая election timeout в raft, стоит выборов и короткого разрыва
+  доступности записи — единственное нарушение, которое не ограничивается тем,
+  что лидера обрабатывают *последним*. Оператор сначала передаёт лидерство
+  голосующему последователю (learner не выбираются никогда), поэтому пауза
+  приходится на члена, который уже не ведёт. Одночленные кластеры этот шаг
+  пропускают: передавать некому. Передача выполняется по возможности: если она
+  не удалась, лидер дефрагментируется на месте — то есть ровно так, как было бы
+  без этого шага, — и это фиксируется предупреждающим событием
+  `LeadershipTransferFailed`.
+- **Сериализуется на кластер:** против одного `EtcdCluster` одновременно
+  выполняется не более одного `EtcdDefrag`; остальные ждут в `Pending`.
+- Здоровье оценивается не только по «член ответил»: член отвечает на локальное
+  чтение статуса и будучи изолированным, и имея тревогу, поэтому гейт проверяет,
+  что каждый нужный член присутствует и достижим, что все они сходятся на одном
+  ненулевом лидере и что ни один не сообщает о блокирующей тревоге. Тревога
+  `CORRUPT` блокирует; тревога `NOSPACE` **нет** — бэкенд, упёршийся в квоту, это
+  ровно то, что дефрагментация и лечит, поэтому запуск допускается, а тревога
+  снимается, как только место возвращено. Отставание raft в гейт пока не входит.
 
-## Status
+## Статус
 
-`status.phase` moves `Pending → Running → Complete | Failed`; a `Pending` run
-waiting on cluster health carries a condition saying so. `status.members[]`
-records, per member (keyed by name), the role at processing time, the outcome
-(`Skipped` / `Defragmented` / `Failed`), the before/after `DbSize`, and the
-bytes reclaimed — the run's full history, not a single rolled-up condition.
+`status.phase` движется `Pending → Running → Complete | Failed`; запуск в
+`Pending`, ожидающий здоровья кластера, несёт условие, которое это объясняет.
+`status.members[]` записывает по каждому члену (по имени) роль на момент
+обработки, исход (`Skipped`, `Defragmented`, `Failed`), `DbSize` до и после и
+число возвращённых байт — полную историю запуска, а не единственное свёрнутое
+условие.
 
-## Timeouts and retries
+## Таймауты и повторы
 
-Following [`EtcdSnapshot`](concepts.md#snapshots--restore) — where the Job's
-deadlines are controller constants and terminal phases are sticky — this needs
-no `spec` knobs:
+Следуя [`EtcdSnapshot`](concepts.md#снапшоты-и-восстановление), где сроки Job —
+это константы контроллера, а терминальные фазы липкие, здесь не требуется ручек
+в `spec`:
 
-- **Per-member timeout** bounds each `Defragment` RPC (a stop-the-world call on a
-  large backend), so one wedged member can't consume the whole run; on expiry
-  that member is `Failed`.
-- **An overall active-deadline** bounds `Running` + waiting-while-`Pending`
-  together; on expiry the run is `Failed`. This also protects the per-cluster
-  serialization slot — a run stuck waiting on an unhealthy cluster can't block
-  the next one forever.
-- **Retry within a run:** a deferred `Pending` re-checks cluster health each pass
-  up to the deadline. A failed per-member `Defragment` RPC marks that member
-  `Failed` immediately, and any failed member fails the run — a partial sweep that
-  reclaimed space still disarms `NOSPACE` on the way out. (Per-member RPC retry is
-  a possible follow-up, not shipped here.)
-- **Retry across runs:** terminal phases (`Complete`/`Failed`) are sticky — an
-  `EtcdDefrag` never re-runs itself. A retry is a *new* `EtcdDefrag`: an
-  [`EtcdDefragPolicy`](#recurring-runs-etcddefragpolicy) tick for periodic use, or
-  a re-create for a one-shot. Each attempt is a discrete, auditable object (GC'd
-  via `ttlSecondsAfterFinished`) rather than hidden retry state.
+- **Таймаут на члена** ограничивает каждый RPC `Defragment` (вызов,
+  останавливающий мир на большом бэкенде), поэтому один зависший член не может
+  съесть весь запуск; по истечении этот член помечается `Failed`.
+- **Общий предельный срок активности** ограничивает `Running` вместе с
+  ожиданием в `Pending`; по истечении запуск помечается `Failed`. Это заодно
+  защищает слот сериализации на кластер: запуск, застрявший в ожидании
+  нездорового кластера, не может блокировать следующий вечно.
+- **Повтор внутри запуска:** отложенный `Pending` перепроверяет здоровье
+  кластера на каждом проходе вплоть до срока. Неудавшийся RPC `Defragment` по
+  члену помечает этого члена `Failed` немедленно, и любой неудавшийся член
+  роняет весь запуск, — при этом частичный проход, который всё же вернул место,
+  на выходе снимает `NOSPACE`. (Повтор RPC по конкретному члену — возможное
+  продолжение, здесь его нет.)
+- **Повтор между запусками:** терминальные фазы (`Complete`, `Failed`) липкие —
+  `EtcdDefrag` никогда не перезапускает сам себя. Повтор — это *новый*
+  `EtcdDefrag`: тик [`EtcdDefragPolicy`](#регулярные-запуски-etcddefragpolicy) для
+  периодического применения либо пересоздание для разового. Каждая попытка —
+  отдельный проверяемый объект (собираемый через `ttlSecondsAfterFinished`), а не
+  скрытое состояние повторов.
 
-## Recurring runs (`EtcdDefragPolicy`)
+## Регулярные запуски (`EtcdDefragPolicy`)
 
-`EtcdDefragPolicy` schedules `EtcdDefrag` runs on a cron cadence. Each tick
-stamps a new `EtcdDefrag` — owned by the policy (so it cascades on delete) — and
-the run then follows all the safety rules above. The policy only *triggers*
-runs; it never defragments directly.
+`EtcdDefragPolicy` планирует запуски `EtcdDefrag` по каденции cron. Каждый тик
+создаёт новый `EtcdDefrag`, принадлежащий политике (поэтому он каскадно
+удаляется вместе с ней), и дальше запуск следует всем правилам безопасности
+выше. Политика только *инициирует* запуски; сама она никогда ничего не
+дефрагментирует.
 
 ```yaml
 apiVersion: etcd-operator.cozystack.io/v1alpha2
@@ -167,68 +177,72 @@ spec:
   clusterRef:
     name: etcd
   schedule:
-    cron: "0 3 * * *"          # standard five-field cron
-    timezone: Europe/Moscow    # optional IANA zone; UTC when absent
-  concurrencyPolicy: Forbid    # skip a tick while a previous run is still active (default)
+    cron: "0 3 * * *"          # стандартный cron из пяти полей
+    timezone: Europe/Moscow    # необязательная зона IANA; при отсутствии UTC
+  concurrencyPolicy: Forbid    # пропустить тик, пока предыдущий запуск активен (умолчание)
   ttlSecondsAfterFinished: 3600
-  historyLimit: 3              # keep the last 3 finished runs
+  historyLimit: 3              # хранить последние 3 завершённых запуска
   rule:
     freeSpaceAbove: 200Mi
     quotaUsageAbove: 80%
     minReclaim: 32Mi
 ```
 
-- **`schedule.cron`** is a standard five-field cron expression (descriptors like
-  `@daily` are rejected). **`schedule.timezone`** is an IANA zone name it is read
-  in; absent means UTC.
-- **`concurrencyPolicy`** is `Forbid` (default — a tick is skipped while a
-  stamped run is still active) or `Allow` (stamp anyway; `EtcdDefrag`'s own
-  per-cluster serialization queues it behind the active run).
-- **`suspend: true`** pauses stamping without deleting the policy. On resume the
-  single most recent missed tick may be stamped (subject to
-  `startingDeadlineSeconds`); earlier missed ticks are never replayed.
-- **`startingDeadlineSeconds`** skips a tick that is already older than the
-  deadline (e.g. after the operator was down) instead of starting it late. With
-  no deadline the window is one schedule period, so a policy that fell far
-  behind resumes at its most recent tick instead of replaying the backlog.
-  Either way a skipped tick is reported as a `MissedSchedule` event.
-- **`historyLimit`** caps retained finished runs; `ttlSecondsAfterFinished` (per
-  run) is the other cleanup path.
-- **`rule`** / **`ttlSecondsAfterFinished`** are copied verbatim into each
-  stamped `EtcdDefrag`.
+- **`schedule.cron`** — стандартное выражение cron из пяти полей (сокращения
+  вроде `@daily` отклоняются). **`schedule.timezone`** — имя зоны IANA, в которой
+  оно читается; при отсутствии — UTC.
+- **`concurrencyPolicy`** — это `Forbid` (умолчание: тик пропускается, пока
+  созданный запуск ещё активен) либо `Allow` (создавать всё равно; собственная
+  сериализация `EtcdDefrag` на кластер поставит его в очередь за активным).
+- **`suspend: true`** приостанавливает создание, не удаляя политику. При
+  возобновлении может быть создан ровно один — самый недавний — пропущенный тик
+  (с учётом `startingDeadlineSeconds`); более ранние не воспроизводятся никогда.
+- **`startingDeadlineSeconds`** пропускает тик, который уже старше срока
+  (например, после того как оператор лежал), вместо того чтобы запускать его с
+  опозданием. Без срока окно равно одному периоду расписания, поэтому политика,
+  сильно отставшая, возобновляется на своём самом недавнем тике, а не
+  проигрывает накопившееся. В обоих случаях пропущенный тик сообщается событием
+  `MissedSchedule`.
+- **`historyLimit`** ограничивает число хранимых завершённых запусков;
+  `ttlSecondsAfterFinished` (на запуск) — второй путь очистки.
+- **`rule`** и **`ttlSecondsAfterFinished`** копируются в каждый создаваемый
+  `EtcdDefrag` как есть.
 
-`status.lastScheduleTime` anchors the next tick (so a tick is never acted on
-twice), `status.lastSuccessfulTime` records the last `Complete`, and
-`status.active` lists runs still in flight.
+`status.lastScheduleTime` привязывает следующий тик (поэтому один тик не
+отрабатывается дважды), `status.lastSuccessfulTime` записывает последний
+`Complete`, а `status.active` перечисляет запуски, ещё находящиеся в работе.
 
-Deleting a policy cascades to its runs. A run still `Running` when the policy is
-deleted is aborted mid-sweep; if it had already reclaimed space it never disarms
-a `NOSPACE` alarm, leaving the backend read-only. Suspend the policy (or delete
-with `--cascade=orphan`) to let an in-flight run finish first.
+Удаление политики каскадно удаляет её запуски. Запуск, находившийся в `Running`
+в момент удаления политики, прерывается посреди прохода; если он уже вернул
+место, он так и не снимет тревогу `NOSPACE`, оставив бэкенд только для чтения.
+Приостановите политику (или удаляйте с `--cascade=orphan`), чтобы дать
+незавершённому запуску сначала доработать.
 
-**Why a policy and not a CronJob.** The safety argument above is about the
-`EtcdDefrag` run; it holds whether that run is created by the operator or by a
-`kubectl create` in a CronJob. What a CronJob *cannot* express is the scheduling
-itself: its `concurrencyPolicy` governs overlapping Jobs, but `kubectl create`
-exits in milliseconds while the defrag it asked for runs for minutes, so it can
-never skip a tick because last night's sweep is still going — `EtcdDefragPolicy`
-gates on `EtcdDefrag.status.phase`, the thing actually still running. A Job also
-can't own the CR it created, so the CronJob route leaks `EtcdDefrag` objects;
-`historyLimit` plus the owner-ref cascade close that. And it saves a
-per-namespace ServiceAccount + Role granting `create` on `etcddefrags` (a
-privilege better not handed to a tenant) plus a pinned kubectl image to patch.
-The API is a deliberate subset of CronJob — one `historyLimit`, no `Replace`
-concurrency — not a clone.
+**Почему политика, а не CronJob.** Приведённый выше довод о безопасности
+относится к самому запуску `EtcdDefrag` и действует независимо от того, создан
+ли этот запуск оператором или через `kubectl create` в CronJob. Чего CronJob
+выразить *не может*, так это самого планирования: его `concurrencyPolicy`
+управляет перекрывающимися Job, но `kubectl create` завершается за миллисекунды,
+тогда как заказанная им дефрагментация идёт минутами, поэтому он никогда не
+сможет пропустить тик из-за того, что вчерашний проход ещё не закончился, —
+а `EtcdDefragPolicy` гейтится по `EtcdDefrag.status.phase`, то есть по тому, что
+действительно ещё выполняется. Job к тому же не может владеть созданным им CR,
+поэтому путь через CronJob течёт объектами `EtcdDefrag`; `historyLimit` вместе с
+каскадом по владельческой ссылке это закрывают. И это экономит ServiceAccount с
+Role на каждый неймспейс, дающие `create` на `etcddefrags` (привилегия, которую
+лучше не выдавать дочернему кластеру), плюс закреплённый образ kubectl, который надо
+обновлять. API намеренно является подмножеством CronJob — один `historyLimit`,
+без конкурентности `Replace`, — а не его копией.
 
-## Relationship to capacity metrics
+## Связь с метриками ёмкости
 
-The capacity metrics and alert rules that tell you *when* a defrag is worth
-running are tracked separately (see #357); `EtcdDefrag` records sizes in its own
-`status` during a run rather than as continuously-scraped gauges.
+Метрики ёмкости и правила алертинга, которые подсказывают, *когда* дефрагментация
+стоит того, отслеживаются отдельно (см. #357); `EtcdDefrag` записывает размеры в
+собственный `status` во время запуска, а не как непрерывно снимаемые датчики.
 
-A condition-triggered mode — a policy that stamps a run when observed
-fragmentation crosses a threshold, rather than on a clock — is contemplated once
-those metrics land: nothing observes fragmentation between runs today, so
-`schedule` is required for now. That mode would be a different feature, not a
-replacement for cron, and whether the two are exclusive or combinable ("nightly,
-or sooner if fragmentation trips") is left open here.
+Режим по условию — политика, которая создаёт запуск, когда наблюдаемая
+фрагментация переходит порог, а не по часам, — рассматривается после появления
+этих метрик: сегодня между запусками фрагментацию никто не наблюдает, поэтому
+`schedule` пока обязателен. Такой режим был бы отдельной возможностью, а не
+заменой cron, и вопрос о том, исключают ли они друг друга или сочетаются
+(«еженощно, но раньше, если фрагментация сработала»), здесь оставлен открытым.

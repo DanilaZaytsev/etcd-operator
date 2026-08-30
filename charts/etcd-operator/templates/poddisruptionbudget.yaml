@@ -1,0 +1,27 @@
+{{- /*
+PodDisruptionBudget для самого оператора — не путать с PDB на каждый кластер,
+которые оператор выпускает для членов etcd.
+
+Выключен по умолчанию и намеренно требует replicaCount > 1: бюджет над
+единственной репликой либо бездействует (minAvailable: 0), либо блокирует любой
+drain ноды, на которую он попал (minAvailable: 1), а зависший drain хуже
+нескольких секунд без лидера — резервная реплика всё равно ничего не делает,
+поэтому короткий разрыв лишь откладывает reconcile.
+*/ -}}
+{{- if and .Values.operator.enabled (.Values.podDisruptionBudget.enabled) }}
+{{- if le (int .Values.replicaCount) 1 }}
+{{- fail "podDisruptionBudget.enabled requires replicaCount > 1: a budget over a single operator replica either does nothing or blocks every drain of its node" }}
+{{- end }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "etcd-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "etcd-operator.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "etcd-operator.selectorLabels" . | nindent 6 }}
+{{- end }}

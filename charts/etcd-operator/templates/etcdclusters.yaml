@@ -1,0 +1,203 @@
+{{- /*
+EtcdCluster, которыми управляет этот релиз, — по одному на запись в
+.Values.clusters.
+
+Каждая запись наследует .Values.clusterDefaults и переопределяет то, что
+называет, поэтому родительский кластер со множеством дочерних держит один
+профиль настроек и перечисляет только различия. deepCopy перед слиянием важен:
+mergeOverwrite меняет свой первый аргумент, и без копии переопределения первого
+кластера утекли бы в умолчания, которые наследует каждый следующий.
+
+Большая часть — простой проброс значений. Проверки — нет: каждая из них стоит за
+спецификацией, законной с точки зрения apiserver и неверной так, что это
+проявится только потом.
+*/ -}}
+{{- range $cluster := .Values.clusters }}
+{{- $c := mergeOverwrite (deepCopy $.Values.clusterDefaults) $cluster }}
+{{- if not $c.name }}
+{{- fail "every entry in .Values.clusters needs a name" }}
+{{- end }}
+{{- $storage := $c.storage }}
+{{- $pools := $storage.pools | default list }}
+
+{{- if and (gt (len $pools) 0) $storage.storageClassName }}
+{{- fail (printf "cluster %q: storage.pools and storage.storageClassName are mutually exclusive: pools is the multi-array form of the same setting" $c.name) }}
+{{- end }}
+
+{{- if and (gt (int $c.replicas) 0) (eq (mod (int $c.replicas) 2) 0) }}
+{{- fail (printf "cluster %q: replicas must be odd (got %d): an even member count tolerates the same number of failures as the odd count below it while adding a member to every write quorum" $c.name (int $c.replicas)) }}
+{{- end }}
+
+{{- if gt (len $pools) 0 }}
+{{- $enabled := 0 }}
+{{- range $pools }}{{- if not .disabled }}{{ $enabled = add1 $enabled }}{{- end }}{{- end }}
+{{- if eq $enabled 0 }}
+{{- fail (printf "cluster %q: every storage pool is disabled; the cluster would have nowhere to place a member's PVC" $c.name) }}
+{{- end }}
+{{- /*
+Два намеренных сужения.
+
+Считается по ОБЪЯВЛЕННОМУ числу пулов, а не по включённому: кордон отказавшего
+массива уменьшает число включённых, и проверка кратности по нему уронила бы
+обновление ровно в тот момент, когда кордон и применяют, — посреди инцидента,
+когда PVC заменяющего члена застрял в Pending на мёртвом хранилище.
+
+И только когда членов БОЛЬШЕ, чем пулов. Членов меньше, чем массивов, — это не
+перекос, а недозаполнение: одночленный кластер, объявивший три пула, ставит
+своего члена на первый и оставляет остальные под будущее масштабирование, что и
+есть обычная форма дочернего кластера, начинающего с одной реплики.
+*/}}
+{{- if and (gt (int $c.replicas) (len $pools)) (ne (mod (int $c.replicas) (len $pools)) 0) }}
+{{- fail (printf "cluster %q: replicas (%d) is not a multiple of the %d storage pools: at least one array would hold more members than the others, so losing that array would cost quorum — the failure this layout exists to prevent" $c.name (int $c.replicas) (len $pools)) }}
+{{- end }}
+{{- end }}
+
+{{- if and $c.auth.enabled (not $c.auth.rootCredentialsSecretRef) }}
+{{- fail (printf "cluster %q: auth.enabled requires auth.rootCredentialsSecretRef" $c.name) }}
+{{- end }}
+{{- if and $c.auth.enabled (not $c.tls.spec.client) }}
+{{- fail (printf "cluster %q: auth.enabled requires tls.spec.client: auth credentials must not cross a plaintext connection" $c.name) }}
+{{- end }}
+{{- if and $c.restore.enabled (not $c.restore.source) }}
+{{- fail (printf "cluster %q: restore.enabled requires restore.source" $c.name) }}
+{{- end }}
+---
+apiVersion: etcd-operator.cozystack.io/v1alpha2
+kind: EtcdCluster
+metadata:
+  name: {{ $c.name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "etcd-operator.clusterLabels" $ | nindent 4 }}
+  {{- if include "etcd-operator.keepClusters" $ }}
+  annotations:
+    # Когда это включено и почему — см. хелпер etcd-operator.keepClusters.
+    helm.sh/resource-policy: keep
+  {{- end }}
+spec:
+  replicas: {{ int $c.replicas }}
+  version: {{ $c.version | quote }}
+  progressDeadlineSeconds: {{ int $c.progressDeadlineSeconds }}
+  storage:
+    size: {{ $storage.size }}
+    {{- if gt (len $pools) 0 }}
+    pools:
+      {{- toYaml $pools | nindent 6 }}
+    {{- else if not (kindIs "invalid" $storage.storageClassName) }}
+    {{- /*
+    Проверяется наличие, а не «истинность». CRD даёт пустой строке собственный
+    смысл — отключить динамический провижининг, привязаться только к подходящему
+    заранее созданному PV, — и это не то же самое, что отсутствие значения
+    (использовать StorageClass по умолчанию для неймспейса). Проверка на
+    «истинность» склеивает эти два случая и молча выдаёт кластеру, просящему том,
+    нарезанный руками, StorageClass по умолчанию. Отсутствие здесь — это `null`.
+    */}}
+    storageClassName: {{ $storage.storageClassName | quote }}
+    {{- end }}
+  {{- with $c.resources }}
+  resources:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- $options := dict }}
+  {{- range $k, $v := $c.options }}
+  {{- if not (kindIs "invalid" $v) }}{{- if ne (toString $v) "" }}{{ $_ := set $options $k $v }}{{- end }}{{- end }}
+  {{- end }}
+  {{- with $options }}
+  options:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- if $c.affinity }}
+  affinity:
+    {{- toYaml $c.affinity | nindent 4 }}
+  {{- else if ne $c.antiAffinity "none" }}
+  # Три члена на одной ноде — это три члена, потерянных вместе с ней. Оператор
+  # этого не проставляет, поэтому проставляет чарт.
+  affinity:
+    podAntiAffinity:
+      {{- if eq $c.antiAffinity "hard" }}
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - topologyKey: kubernetes.io/hostname
+        labelSelector:
+          matchLabels:
+            etcd-operator.cozystack.io/cluster: {{ $c.name }}
+      {{- else }}
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              etcd-operator.cozystack.io/cluster: {{ $c.name }}
+      {{- end }}
+  {{- end }}
+  {{- with $c.topologySpreadConstraints }}
+  topologySpreadConstraints:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $c.additionalMetadata }}
+  additionalMetadata:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $c.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $c.tls.spec }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- if $c.auth.enabled }}
+  auth:
+    enabled: true
+    rootCredentialsSecretRef:
+      name: {{ $c.auth.rootCredentialsSecretRef }}
+  {{- end }}
+  {{- if $c.restore.enabled }}
+  bootstrap:
+    restore:
+      {{- with $c.restore.checksum }}
+      checksum: {{ . | quote }}
+      {{- end }}
+      source:
+        {{- toYaml $c.restore.source | nindent 8 }}
+  {{- end }}
+{{- if $c.backup.enabled }}
+{{- if not $c.backup.destination }}
+{{- fail (printf "cluster %q: backup.enabled requires backup.destination (s3 or pvc): a policy with no destination would look like backup coverage and store nothing" $c.name) }}
+{{- end }}
+---
+apiVersion: etcd-operator.cozystack.io/v1alpha2
+kind: EtcdSnapshotPolicy
+metadata:
+  # Не длиннее 44: имя политики — голова цепочки. «<политика>-<тик>» даёт имя
+  # каждому создаваемому EtcdSnapshot, а «<снапшот>-snapshot» — имя его Job,
+  # которое apiserver отклоняет длиннее 63 символов. Политика находит свой
+  # кластер через clusterRef, поэтому имена совпадать не обязаны.
+  name: {{ $c.name | trunc 44 | trimSuffix "-" }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "etcd-operator.clusterLabels" $ | nindent 4 }}
+  {{- if include "etcd-operator.keepClusters" $ }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- end }}
+spec:
+  clusterRef:
+    name: {{ $c.name }}
+  schedule:
+    cron: {{ include "etcd-operator.backupSchedule" (dict "cluster" $c "namespace" $.Release.Namespace) | quote }}
+    {{- with $c.backup.timezone }}
+    timezone: {{ . | quote }}
+    {{- end }}
+  destination:
+    {{- toYaml $c.backup.destination | nindent 4 }}
+  suspend: {{ $c.backup.suspend }}
+  concurrencyPolicy: {{ $c.backup.concurrencyPolicy }}
+  {{- with $c.backup.startingDeadlineSeconds }}
+  startingDeadlineSeconds: {{ int . }}
+  {{- end }}
+  successfulHistoryLimit: {{ int $c.backup.successfulHistoryLimit }}
+  failedHistoryLimit: {{ int $c.backup.failedHistoryLimit }}
+  deleteArtifactOnPrune: {{ $c.backup.deleteArtifactOnPrune }}
+{{- end }}
+{{- end }}

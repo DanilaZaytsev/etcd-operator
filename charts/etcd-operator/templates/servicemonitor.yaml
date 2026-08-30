@@ -1,13 +1,13 @@
 {{- /*
-prometheus-operator ServiceMonitor for the metrics endpoint (folded in from the
-old config/prometheus). Off by default: it needs the monitoring.coreos.com CRDs
-installed, and it scrapes the kube-rbac-proxy https port, so it only makes sense
-when kubeRbacProxy is enabled.
+ServiceMonitor prometheus-operator для эндпоинта метрик. Выключен по умолчанию:
+ему нужны установленные CRD monitoring.coreos.com.
+
+Он снимает метрики в том режиме, в котором находится релиз, — либо https-порт
+kube-rbac-proxy с bearer-токеном, либо открытый порт менеджера напрямую. Раньше
+он жёстко падал без прокси, из-за чего у режима без прокси не оставалось ни
+одного поддерживаемого способа быть опрошенным.
 */ -}}
-{{- if .Values.metrics.serviceMonitor.enabled }}
-{{- if not .Values.kubeRbacProxy.enabled }}
-{{- fail "metrics.serviceMonitor.enabled requires kubeRbacProxy.enabled (the ServiceMonitor scrapes the proxy's https metrics port)" }}
-{{- end }}
+{{- if and .Values.operator.enabled (.Values.metrics.serviceMonitor.enabled) }}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
@@ -16,14 +16,39 @@ metadata:
   labels:
     {{- include "etcd-operator.labels" . | nindent 4 }}
     control-plane: controller-manager
+    {{- /* Prometheus-операторы обычно разворачивают с serviceMonitorSelector
+    (у kube-prometheus-stack это по умолчанию release: <имя>); без возможности
+    добавить такую метку ServiceMonitor создаётся и молча никогда не выбирается. */}}
+    {{- with .Values.metrics.serviceMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
   endpoints:
   - path: /metrics
+    {{- if .Values.kubeRbacProxy.enabled }}
     port: https
     scheme: https
     bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
     tlsConfig:
-      insecureSkipVerify: true
+      insecureSkipVerify: {{ .Values.metrics.serviceMonitor.insecureSkipVerify }}
+    {{- else }}
+    port: metrics
+    scheme: http
+    {{- end }}
+    {{- with .Values.metrics.serviceMonitor.interval }}
+    interval: {{ . }}
+    {{- end }}
+    {{- with .Values.metrics.serviceMonitor.scrapeTimeout }}
+    scrapeTimeout: {{ . }}
+    {{- end }}
+    {{- with .Values.metrics.serviceMonitor.metricRelabelings }}
+    metricRelabelings:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with .Values.metrics.serviceMonitor.relabelings }}
+    relabelings:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
   selector:
     matchLabels:
       {{- include "etcd-operator.selectorLabels" . | nindent 6 }}

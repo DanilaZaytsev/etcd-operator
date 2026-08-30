@@ -12,6 +12,8 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	hexencoding "encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -504,5 +506,95 @@ func TestRunRestore_PVCDirectorySourceFails(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "is a directory") {
 		t.Errorf("error did not mention the directory problem: %v", err)
+	}
+}
+
+// ── snapshot verification ────────────────────────────────────────────────
+//
+// This is the only integrity check on the restore path: runEtcdutlRestore has
+// to pass --skip-hash-check because a clientv3 Maintenance snapshot carries no
+// hash of its own. If verification is wrong, a corrupted snapshot becomes a
+// data directory that etcd starts on happily and that looks healthy until
+// someone reads the part that is missing.
+
+func writeSnapshotFile(t *testing.T, content string) (path, digest string) {
+	t.Helper()
+	path = filepath.Join(t.TempDir(), "snap.db")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(content))
+	return path, "sha256:" + hexencoding.EncodeToString(sum[:])
+}
+
+func TestVerifySnapshotChecksum_MatchPasses(t *testing.T) {
+	path, digest := writeSnapshotFile(t, "etcd snapshot bytes")
+	if err := verifySnapshotChecksum(path, digest); err != nil {
+		t.Fatalf("a matching checksum was rejected: %v", err)
+	}
+}
+
+func TestVerifySnapshotChecksum_MismatchFails(t *testing.T) {
+	path, _ := writeSnapshotFile(t, "etcd snapshot bytes")
+	_, otherDigest := writeSnapshotFile(t, "a different snapshot")
+
+	err := verifySnapshotChecksum(path, otherDigest)
+	if err == nil {
+		t.Fatalf("a corrupted snapshot passed verification")
+	}
+	// The message has to say what to conclude — an operator reading it mid-DR
+	// needs to know the snapshot is the problem, not the cluster.
+	if !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("unhelpful error: %v", err)
+	}
+}
+
+// Truncation is the realistic corruption for an interrupted upload, and the
+// one a size check alone would catch but a missing check would not.
+func TestVerifySnapshotChecksum_TruncationFails(t *testing.T) {
+	path, digest := writeSnapshotFile(t, "etcd snapshot bytes")
+	if err := os.WriteFile(path, []byte("etcd snap"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifySnapshotChecksum(path, digest); err == nil {
+		t.Fatalf("a truncated snapshot passed verification")
+	}
+}
+
+// No checksum means no verification: snapshots taken before the operator
+// recorded them, or copied in by hand, have nothing to check against.
+func TestVerifySnapshotChecksum_EmptySkips(t *testing.T) {
+	path, _ := writeSnapshotFile(t, "etcd snapshot bytes")
+	if err := verifySnapshotChecksum(path, ""); err != nil {
+		t.Fatalf("an absent checksum must skip verification, got: %v", err)
+	}
+}
+
+// A malformed expectation must fail rather than silently skip: a typo that
+// quietly disables the only integrity check is worse than a restore that
+// refuses to start.
+func TestVerifySnapshotChecksum_MalformedFails(t *testing.T) {
+	path, _ := writeSnapshotFile(t, "etcd snapshot bytes")
+	for _, bad := range []string{
+		"deadbeef",                             // no algorithm prefix
+		"md5:d41d8cd98f00b204e9800998ecf8427e", // wrong algorithm
+		"sha256:tooshort",
+	} {
+		if err := verifySnapshotChecksum(path, bad); err == nil {
+			t.Fatalf("malformed checksum %q was silently accepted, disabling verification", bad)
+		}
+	}
+}
+
+// Digests are compared case-insensitively: an uppercase hex digest copied from
+// another tool is the same digest.
+func TestVerifySnapshotChecksum_CaseInsensitive(t *testing.T) {
+	path, digest := writeSnapshotFile(t, "etcd snapshot bytes")
+	if err := verifySnapshotChecksum(path, strings.ToUpper(strings.TrimPrefix(digest, "sha256:"))); err == nil {
+		t.Fatalf("a digest with no sha256: prefix must be rejected")
+	}
+	upper := "sha256:" + strings.ToUpper(strings.TrimPrefix(digest, "sha256:"))
+	if err := verifySnapshotChecksum(path, upper); err != nil {
+		t.Fatalf("an uppercase hex digest was rejected: %v", err)
 	}
 }

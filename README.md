@@ -1,51 +1,93 @@
 # etcd-operator
 
-A Kubernetes operator for running [etcd](https://etcd.io/) clusters. Status: **early alpha** — API is `etcd-operator.cozystack.io/v1alpha2` and will likely change.
+Оператор Kubernetes для запуска кластеров [etcd](https://etcd.io/). Статус: **ранняя альфа** — API называется `etcd-operator.cozystack.io/v1alpha2` и, скорее всего, будет меняться.
 
-## What it does
+## Что он делает
 
-The operator manages etcd clusters via two custom resources:
+Оператор управляет кластерами etcd через два пользовательских ресурса:
 
-- **`EtcdCluster`** — what the user creates. Captures cluster-wide intent: replica count, etcd version, per-member storage size, a progress deadline.
-- **`EtcdMember`** — what the operator creates. One per etcd member. Owns its Pod and PVC. Operator-managed; users should not edit these directly.
+- **`EtcdCluster`** — то, что создаёт пользователь. Описывает намерение на уровне кластера: число реплик, версию etcd, размер хранилища на члена, предельный срок продвижения.
+- **`EtcdMember`** — то, что создаёт оператор. По одному на члена etcd. Владеет своим подом и PVC. Управляется оператором; пользователям править их напрямую не следует.
 
-There is no StatefulSet. Each member's Pod and PVC are reconciled independently so the operator can model protocol-aware lifecycle (learner-mode joins, member-id assignment, graceful removal, scale-to-zero pause/resume) without fighting StatefulSet's "all replicas are one workload" assumption.
+StatefulSet здесь нет. Под и PVC каждого члена обрабатываются независимо, чтобы оператор мог отражать жизненный цикл с учётом протокола (присоединение в режиме learner, назначение member-id, аккуратное удаление, пауза и возобновление через масштабирование в ноль), не сражаясь с допущением StatefulSet о том, что все реплики — одна нагрузка.
 
-The full design rationale is in [docs/concepts.md](docs/concepts.md).
+Полное обоснование устройства — в [docs/concepts.md](docs/concepts.md).
 
-## What's supported today
+## Как это работает
 
-- **Bootstrap** of new clusters. Single seed first, learner-mode adds afterwards.
-- **Scale up / down**: cluster controller adds members one at a time as learners and promotes them; scale-down picks the most-recently-created member, runs `MemberRemove` via a finalizer, then GCs the Pod and PVC.
-- **Scale to zero (pause/resume)**: `spec.replicas: 0` parks the surviving member via `spec.dormant=true`; the Pod is deleted, the PVC stays owned by the `EtcdMember`. Scaling back up to ≥ 1 flips `spec.dormant=false` on the same member; etcd resumes from the existing data dir with the same cluster ID and member ID.
-- **Pod restart / node failure**: data PVC is preserved, the new Pod reads the existing WAL and rejoins with the same member ID.
-- **Memory-backed storage (opt-in)**: `spec.storage.medium: Memory` switches each member's data dir to a tmpfs `emptyDir` whose lifetime is bound to the Pod. Members that lose their Pod (eviction, node failure) lose their data; the operator detects this, removes the member from etcd, and replaces it via the existing scale-up path. Suits scenarios where the etcd state is reconstructable and replication absorbs single-member losses. For production, set `spec.affinity` and `spec.resources.limits.memory` explicitly — neither is defaulted ([#16](https://github.com/lllamnyp/etcd-operator/issues/16)); see [docs/concepts.md](docs/concepts.md#storage).
-- **Apiserver-enforced validation**: CEL rules on the CRD (k8s 1.29+) reject `replicas: 0` with `storage.medium: Memory`, `storage.size: 0` with `storage.medium: Memory`, `storage.medium` changes after creation, and `storage.size` shrinks. No webhook / cert-manager dependency.
-- **PodDisruptionBudget**: per-cluster PDB selects voting members only (`role=voter`); `minAvailable` is the quorum of whichever is larger, the live voter count or the intended cluster size, so `kubectl drain` cannot voluntarily push the cluster below quorum — even while node churn shrinks live membership.
-- **TLS (BYO Secrets or cert-manager)**: `spec.tls.client` / `spec.tls.peer` enable TLS on each surface independently. Material comes from either user-provided Secrets (`serverSecretRef` / `operatorClientSecretRef` / `secretRef`) or operator-emitted `cert-manager.io/v1` Certificates (`certManager.{serverIssuerRef,operatorClientIssuerRef,issuerRef}`) — mutually exclusive per subtree, enforced by CEL. mTLS is the implicit mode when an operator-client source is supplied; server-TLS-only when it isn't. The whole `tls` subtree is CEL-locked immutable post-create. cert-manager-emitted certs auto-renew via cert-manager; Pod-side rotation is a manual one-at-a-time `kubectl delete pod` either way. See [docs/concepts.md](docs/concepts.md#tls).
-- **Resource sizing**: `spec.resources` (a `corev1.ResourceRequirements`) sets the etcd container's CPU/memory requests and limits. Unset uses a conservative 100m/128Mi-request default. Updates take effect on newly-created members; pair with a `VerticalPodAutoscaler` targeting the cluster for live recommendation/rollout.
-- **Scheduling & extra metadata**: `spec.affinity` and `spec.topologySpreadConstraints` pass through to every member Pod (anti-affinity is not defaulted — set it for production); `spec.additionalMetadata` merges user labels/annotations onto every object the operator creates (member Pods, data PVCs, Services, PDB, `EtcdMember` CRs), with operator-owned keys winning on collision. All three apply on object creation and are latched like the rest of the spec. See [docs/concepts.md](docs/concepts.md#pod-scheduling-and-additional-metadata).
-- **Monitoring / autoscaling hooks**: every member Pod always exposes a plaintext `metrics` container port at `2381` (etcd's `/health` + Prometheus `/metrics`) for `VMPodScrape` / `PodMonitor`. The `EtcdCluster` CRD exposes the `/scale` subresource with a populated `status.selector`, making it a valid target for `kubectl scale` and `VerticalPodAutoscaler.targetRef`.
-- **Locking pattern**: `status.observed` snapshots the in-flight target so mid-flight spec edits don't corrupt consensus; `progressDeadline` bounds how long the operator will spend trying to reach a target.
-- **Cluster deletion**: cascading owner refs clean up everything; finalizers detect "the whole cluster is going away" and skip etcd-side removal to avoid deadlock.
-- **Snapshots & restore**: `EtcdSnapshot` captures a one-shot snapshot of a cluster to S3 (or a PVC) via a Job running the operator image as a snapshot agent; `status.artifact` records the stored object's URI, size, and checksum. A new cluster restores from a snapshot at first bootstrap via `spec.bootstrap.restore.source` (the seed Pod runs a restore initContainer before etcd starts). TLS and `spec.auth` auth are honored automatically. No scheduled snapshots (`EtcdSnapshotSchedule` is intentionally out of scope) — drive recurring snapshots with a `CronJob`/`kubectl apply` from outside. See [docs/concepts.md](docs/concepts.md#snapshots--restore) and the [restore runbook](docs/operations.md#restoring-a-cluster-from-a-snapshot).
+Оператор не спрашивает кластер «как дела» — он на каждом проходе сравнивает желаемое состояние с фактическим и делает **один шаг** к их сближению.
 
-## What's not supported (yet)
+### Что запускает reconcile
 
-No multi-user / per-tenant RBAC inside etcd — single-user `root` auth is available via `spec.auth.enabled` (BYO credentials Secret; see [docs/concepts.md](docs/concepts.md#authentication)), but every authenticated client is `root`. No in-place version upgrades (changing `spec.version` only affects newly-created members). No PVC resizing — see [#2](https://github.com/lllamnyp/etcd-operator/issues/2). PVC-backed members auto-replace only on a *persistent crash-loop* (a lost or corrupt data dir whose etcd cannot boot) — quorum-gated, and far slower than the seconds-fast Pod-loss path memory-backed members get (tens of minutes, at the CrashLoopBackOff cap); a member that is merely slow or flapping is left alone. `status.brokenMembers` still reads 0 in practice — see [docs/concepts.md](docs/concepts.md#storage). One-shot snapshots and restore-on-bootstrap are supported (see above), but there is no *scheduled* snapshot CRD. No defragmentation scheduling. PodAntiAffinity is supported via `spec.affinity` but not applied by default (defaulting tracked in [#16](https://github.com/lllamnyp/etcd-operator/issues/16)). See the [issue tracker](https://github.com/lllamnyp/etcd-operator/issues) for the running follow-up list.
+Два источника, и второй существует не для подстраховки:
 
-## Quick start
+1. **События.** Контроллер кластера подписан на `EtcdCluster`, а также на принадлежащие ему `EtcdMember`, `Service` и `PodDisruptionBudget`. Изменение любого из них немедленно ставит владеющий кластер в очередь — через informer, а не опросом.
+2. **Периодическая перепроверка каждые 30 с.** Нужна потому, что **у etcd нет событий для Kubernetes**. Apiserver сообщит, что под упал, но не сообщит, что член выпал из raft или что кворум потерян. Это видно, только если сходить и спросить.
+
+### Два уровня ответственности
+
+**`EtcdClusterReconciler`** отвечает за состав кластера и **не создаёт поды**:
+
+1. Читает `EtcdCluster` и список его `EtcdMember` — из кэша informer, без обращения к apiserver.
+2. Обеспечивает Service, TLS-сертификаты, PDB.
+3. **Подключается к живой etcd и вызывает `MemberList`** — единственный сетевой вызов наружу за проход.
+4. Сравнивает три числа: сколько членов хочет spec, сколько объектов есть в Kubernetes, сколько членов видит сама etcd.
+5. Делает один шаг: добавить learner, повысить learner, убрать члена — или ничего.
+6. Пишет статус и просит вернуться через 30 с.
+
+**`EtcdMemberReconciler`** отвечает за один член: PVC → под → условие `MemberReady`. При удалении финализатор сначала убирает члена из etcd и только потом отпускает объект.
+
+Разделение означает, что «добавить члена» для контроллера кластера — это одна запись в API, а не оркестрация тома и пода.
+
+Шаг делается ровно один за проход: рост с 1 до 5 членов занимает несколько проходов, потому что каждый новый learner должен догнать данные и стать `Ready`, прежде чем добавится следующий.
+
+### Три независимых источника «здоровья»
+
+| Источник | Что показывает | Чего не видит |
+|---|---|---|
+| Готовность пода (kubelet) | процесс жив, порт отвечает | что член выпал из raft |
+| `MemberList` из etcd | состав raft, кто learner, кто voter | что под вот-вот умрёт |
+| `status.observed` | цель, которую оператор себе зафиксировал | текущую реальность |
+
+Третий — самый неочевидный и самый важный. Оператор фиксирует цель в `status.observed` и идёт к ней, даже если spec изменили на полпути; иначе правка посреди роста кластера оставила бы его полусобранным.
+
+Расхождение первых двух — реальный режим отказа: член с именем, не покрытым SAN сертификата, входит в raft и его под `Ready` (проба стучится в `localhost`, который покрыт любым сертификатом), но соседи до него не достучатся. Кластер выглядит здоровым, работая на одного члена меньше. Поэтому TLS-развёртывание проверяют `etcdctl endpoint health --cluster`, а не условиями CR.
+
+## Что поддерживается сегодня
+
+- **Бутстрап** новых кластеров. Сначала единственный сид, затем добавление в режиме learner.
+- **Масштабирование вверх и вниз**: контроллер кластера добавляет членов по одному как learner и повышает их; при уменьшении выбирается самый недавно созданный член, через финализатор выполняется `MemberRemove`, после чего собираются под и PVC.
+- **Масштабирование в ноль (пауза и возобновление)**: `spec.replicas: 0` паркует уцелевшего члена через `spec.dormant=true`; под удаляется, PVC остаётся во владении `EtcdMember`. Возврат к ≥ 1 переключает `spec.dormant=false` у того же члена; etcd продолжает работу с существующего data-dir с теми же cluster ID и member ID.
+- **Перезапуск пода и отказ ноды**: PVC с данными сохраняется, новый под читает существующий WAL и возвращается в кластер с тем же member ID.
+- **Хранилище в памяти (по явному выбору)**: `spec.storage.medium: Memory` переводит data-dir каждого члена в tmpfs `emptyDir`, живущий ровно столько, сколько под. Члены, потерявшие под (вытеснение, отказ ноды), теряют данные; оператор это замечает, удаляет члена из etcd и заменяет его через обычный путь масштабирования вверх. Подходит там, где состояние etcd восстановимо, а репликация переживает потерю одного члена. Для продакшена задавайте `spec.affinity` и `spec.resources.limits.memory` явно — ни то, ни другое не проставляется по умолчанию ([#16](https://github.com/lllamnyp/etcd-operator/issues/16)); см. [docs/concepts.md](docs/concepts.md#хранилище).
+- **Проверки на стороне apiserver**: правила CEL в CRD (k8s 1.29+) отклоняют `replicas: 0` вместе с `storage.medium: Memory`, `storage.size: 0` вместе с `storage.medium: Memory`, смену `storage.medium` после создания и уменьшение `storage.size`. Без webhook и без зависимости от cert-manager.
+- **PodDisruptionBudget**: PDB на кластер отбирает только голосующих членов (`role=voter`); `minAvailable` равен кворуму от большего из двух — живого числа голосующих или заданного размера кластера, — поэтому `kubectl drain` не может добровольно опустить кластер ниже кворума даже тогда, когда ротация нод сокращает живой состав.
+- **TLS (свои Secret или cert-manager)**: `spec.tls.client` и `spec.tls.peer` включают TLS на каждом plane независимо. Материал берётся либо из Secret пользователя (`serverSecretRef` / `operatorClientSecretRef` / `secretRef`), либо из сертификатов `cert-manager.io/v1`, которые выпускает оператор (`certManager.{serverIssuerRef,operatorClientIssuerRef,issuerRef}`), — взаимоисключимо в пределах поддерева, что проверяет CEL. mTLS включается неявно, когда указан источник клиентского сертификата оператора; без него — только серверный TLS. Всё поддерево `tls` заперто CEL как неизменяемое после создания. Сертификаты от cert-manager обновляются им же; ротация на стороне подов в обоих случаях — ручное `kubectl delete pod` по одному. См. [docs/concepts.md](docs/concepts.md#tls).
+- **Размеры ресурсов**: `spec.resources` (это `corev1.ResourceRequirements`) задаёт запросы и лимиты CPU и памяти для контейнера etcd. Незаданное даёт консервативное умолчание в 100m/128Mi запросов. Изменения действуют на вновь создаваемых членов; для живой выдачи рекомендаций и раскатки сочетайте с `VerticalPodAutoscaler`, нацеленным на кластер.
+- **Пулы хранения**: `spec.storage.pools` разносит членов кластера по нескольким `StorageClass` — по одному члену на пул, — чтобы массив хранения был доменом отказа, а не единой точкой отказа. Размещение идёт по правилу «наименее занятый пул» (члены именуются через `GenerateName`, так что порядкового номера, за который можно зацепиться, нет), и это делает сид бутстрапа детерминированным и возвращает замену на тот массив, который освободился; `pools[].disabled` ставит кордон на отказавший массив, и замена уходит на здоровый. См. [docs/concepts.md](docs/concepts.md#пулы-хранения-массив-как-домен-отказа).
+- **Планирование и дополнительные метаданные**: `spec.affinity` и `spec.topologySpreadConstraints` передаются каждому поду члена как есть (anti-affinity по умолчанию не проставляется — задайте её для продакшена); `spec.additionalMetadata` сливает пользовательские метки и аннотации на каждый объект, создаваемый оператором (поды членов, PVC с данными, Service, PDB, объекты `EtcdMember`), причём ключи, принадлежащие оператору, побеждают при столкновении. Все три применяются при создании объекта и фиксируются наравне с остальной спецификацией. См. [docs/concepts.md](docs/concepts.md#планирование-подов-и-дополнительные-метаданные).
+- **Метрики и точки подключения автомасштабирования**: каждый под члена всегда отдаёт открытый порт контейнера `metrics` на `2381` (`/health` etcd и `/metrics` в формате Prometheus) для `VMPodScrape` или `PodMonitor`. Сам оператор отдаёт на своём эндпоинте состояние каждого кластера, его членов и свежесть бэкапов — см. [метрики](docs/operations.md#метрики). CRD `EtcdCluster` предоставляет подресурс `/scale` с заполненным `status.selector`, что делает его допустимой целью для `kubectl scale` и `VerticalPodAutoscaler.targetRef`.
+- **Схема фиксации намерения**: `status.observed` снимает слепок цели, к которой идёт оператор, чтобы правки спецификации на полпути не портили консенсус; `progressDeadline` ограничивает, сколько оператор будет пытаться этой цели достичь.
+- **Удаление кластера**: каскадные владельческие ссылки убирают всё; финализаторы распознают, что уходит весь кластер, и пропускают удаление на стороне etcd, чтобы не получить взаимную блокировку.
+- **Снапшоты и восстановление**: `EtcdSnapshot` снимает одноразовый снапшот кластера в S3 (или на PVC) через Job, запускающий образ оператора как агента снапшота; `status.artifact` записывает URI, размер и контрольную сумму сохранённого объекта. `EtcdSnapshotPolicy` создаёт их по расписанию cron, с раздельными лимитами хранения для успехов и отказов и с необязательным удалением сохранённого артефакта при вычистке снапшота. Новый кластер восстанавливается из снапшота при первом бутстрапе через `spec.bootstrap.restore.source`, при желании предварительно сверив его с `bootstrap.restore.checksum` — единственной проверкой целостности на этом пути, потому что поток `Maintenance.Snapshot` в etcd не несёт собственного хэша. TLS и аутентификация из `spec.auth` учитываются автоматически. См. [docs/concepts.md](docs/concepts.md#снапшоты-и-восстановление), [порядок настройки бэкапов](docs/operations.md#регулярные-бэкапы) и [порядок аварийного восстановления](docs/operations.md#аварийное-восстановление-дочернего-кластера-на-месте).
+
+## Чего пока нет
+
+Нет многопользовательского RBAC внутри etcd — доступна однопользовательская аутентификация под `root` через `spec.auth.enabled` (со своим Secret учётных данных, см. [docs/concepts.md](docs/concepts.md#аутентификация)), но каждый аутентифицированный клиент оказывается `root`. Нет обновления версии на месте (смена `spec.version` действует только на вновь создаваемых членов). Нет изменения размера PVC — см. [#2](https://github.com/lllamnyp/etcd-operator/issues/2). Члены на PVC заменяются автоматически только при *устойчивом crash-loop* (потерянный или повреждённый data-dir, на котором etcd не стартует) — это гейтится кворумом и намного медленнее, чем секундная реакция на потерю пода у членов в памяти (десятки минут, до потолка CrashLoopBackOff); члена, который просто медленный или мигает, не трогают. `status.brokenMembers` на практике по-прежнему показывает 0 — см. [docs/concepts.md](docs/concepts.md#хранилище). Восстановление возможно только при бутстрапе: существующий кластер восстановить на месте нельзя, поэтому его возвращение к жизни означает удаление и создание заново (см. [порядок аварийного восстановления](docs/operations.md#аварийное-восстановление-дочернего-кластера-на-месте)). Пулы хранения не перебалансируются сами: пул, поставленный под кордон и затем снова включённый, остаётся недозаполненным, пока члены не будут заменены по другим причинам. PodAntiAffinity поддерживается через `spec.affinity`, но для членов etcd по умолчанию не применяется (умолчание отслеживается в [#16](https://github.com/lllamnyp/etcd-operator/issues/16)); а вот Deployment *самого оператора* её по умолчанию проставляет при числе реплик больше одной. Текущий список того, что ещё предстоит, — в [трекере задач](https://github.com/lllamnyp/etcd-operator/issues).
+
+## Быстрый старт
 
 ```sh
-# 1. Install the operator (CRDs + RBAC + manager) with Helm. Builds an image and
-#    pushes it to your registry; substitute IMG= for a prebuilt tag if you have
-#    one. The cluster must be able to pull from <your-registry> — for local
-#    clusters (kind / minikube / k3d) sideload the image or use an ephemeral
-#    registry such as ttl.sh, otherwise the Deployment sits in ImagePullBackOff.
-#    `make deploy` runs `helm upgrade --install` (needs helm v3.16+ on PATH).
+# 1. Установить оператора (CRD + RBAC + менеджер) через Helm. Собирает образ и
+#    отправляет его в ваш реестр; подставьте IMG= с готовым тегом, если он у вас
+#    уже есть. Кластер должен уметь загружать образ из <your-registry> — для
+#    локальных кластеров (kind / minikube / k3d) загрузите образ в узлы напрямую
+#    или используйте временный реестр вроде ttl.sh, иначе Deployment зависнет в
+#    ImagePullBackOff. `make deploy` выполняет `helm upgrade --install` (нужен
+#    helm v3.16+ в PATH).
 make docker-build docker-push deploy IMG=<your-registry>/etcd-operator:<tag>
 
-# 2. Create a cluster.
+# 2. Создать кластер.
 cat <<'EOF' | kubectl apply -f -
 apiVersion: etcd-operator.cozystack.io/v1alpha2
 kind: EtcdCluster
@@ -59,7 +101,7 @@ spec:
     size: 1Gi
 EOF
 
-# 3. Wait for ready and inspect.
+# 3. Дождаться готовности и посмотреть, что получилось.
 kubectl get etcdcluster.etcd-operator.cozystack.io my-etcd -w
 POD=$(kubectl get pod -l etcd-operator.cozystack.io/cluster=my-etcd \
   -o jsonpath='{.items[0].metadata.name}')
@@ -67,34 +109,142 @@ kubectl exec -it "$POD" -- etcdctl --endpoints=http://localhost:2379 \
   member list -w table
 ```
 
-Member names are apiserver-assigned (`GenerateName="<cluster>-"`) — don't hard-code them; use the cluster label selector.
+Имена членов назначает apiserver (`GenerateName="<cluster>-"`) — не зашивайте их в код, используйте селектор по метке кластера.
 
-For step-by-step setup, RBAC, image versions, and teardown see [docs/installation.md](docs/installation.md).
+Пошаговую настройку, RBAC, версии образов и порядок удаления см. в [docs/installation.md](docs/installation.md).
 
-## Documentation
+## Тюнинг
 
-- **[Installation](docs/installation.md)** — deploy the operator, create your first cluster, networking pitfalls, upgrades.
-- **[Concepts](docs/concepts.md)** — design rationale: locking pattern, single-seed bootstrap, GenerateName naming, scale-to-zero mechanics, conditions reference.
-- **[Operations](docs/operations.md)** — runbook for day-2: scaling, pausing/resuming, decoding conditions, escalating stuck reconciles, broken-member recovery.
-- **[Defragmentation](docs/etcd-defrag.md)** — the `EtcdDefrag` resource: reclaiming etcd backend disk, one-shot and driven from outside on a schedule, and its safety model.
-- **[Migration](docs/migration.md)** — moving onto this operator from the legacy aenix operator; tracks behavioural changes that need an explicit migration step — currently the BYO root-credentials requirement when enabling auth.
+Две независимые задачи: пропускная способность самого оператора и задержка etcd под нагрузкой.
 
-## Testing
+### Пропускная способность оператора
+
+Ручка одна — `manager.maxConcurrentReconciles` (флаг `--max-concurrent-reconciles`, умолчание **1**). Горизонтального масштабирования нет: включены лидерские выборы, поэтому работает всегда одна реплика, а дополнительные дают отказоустойчивость, но не производительность.
+
+Считать нужно по недоступным кластерам, а не по здоровым. Здоровый reconcile — это чтение из кэша плюс один RPC, единицы миллисекунд. **Недоступный кластер стоит 5 секунд** (dial timeout), повторяется каждые 10 с и потому постоянно занимает половину worker'а. Отсюда ёмкость:
+
+| `maxConcurrentReconciles` | Переваривает недоступных кластеров |
+|---|---|
+| 1 (умолчание) | 2 |
+| 4 | 8 |
+| **16** | **32** |
+| 32 | 64 |
+
+При умолчании **два** недоступных кластера из сотни останавливают обслуживание всех остальных: здоровые кластера исправны, просто очередь до них не доходит.
+
+```yaml
+manager:
+  maxConcurrentReconciles: 16
+  resources:
+    requests: {cpu: 500m, memory: 512Mi}
+    limits: {memory: 2Gi}      # CPU-лимит не ставить
+```
+
+CPU-лимит вреден: worker'ы почти всё время ждут сеть, но при рестарте оператора идёт reconcile всех кластеров сразу, и троттлинг растягивает сходимость на минуты.
+
+Чем измерять:
+
+```promql
+workqueue_depth{name="etcdcluster"}                       # растёт → worker'ов мало
+histogram_quantile(0.99, rate(workqueue_queue_duration_seconds_bucket{name="etcdcluster"}[5m]))
+histogram_quantile(0.99, rate(controller_runtime_reconcile_time_seconds_bucket{controller="etcdcluster"}[5m]))
+```
+
+Полка последней метрики ровно на 5 секундах означает, что в очереди сидят недоступные кластера. Время ожидания в очереди устойчиво выше 30 с — кластера обрабатываются реже, чем задумано.
+
+### Задержка etcd
+
+Сначала измерить, потом крутить:
+
+```promql
+histogram_quantile(0.99, rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m]))
+histogram_quantile(0.99, rate(etcd_disk_backend_commit_duration_seconds_bucket[5m]))
+```
+
+`fsync` p99 выше 25 мс означает, что упёрлись в хранилище, и `spec.options` только замаскирует проблему. Отдельно стоит следить за `etcd_server_leader_changes_seen_total`: ненулевой рост — это перевыборы лидера под обычной нагрузкой, о которых etcd не сообщает ошибкой.
+
+Ключевые поля `spec.options` (все необязательны, незаданное оставляет умолчание etcd):
+
+```yaml
+options:
+  # Умолчания etcd (100/1000 мс) рассчитаны на локальный SSD. На сетевом
+  # хранилище fsync медленнее на порядок, и последователи считают лидера
+  # мёртвым. Задавать только оба сразу — отношение 5:1 проверяет apiserver.
+  heartbeatIntervalMilliseconds: 500
+  electionTimeoutMilliseconds: 2500
+
+  # Компакция. Без неё история ревизий растёт до срабатывания квоты, после
+  # чего кластер уходит в NOSPACE и перестаёт принимать запись вовсе.
+  autoCompactionMode: periodic
+  autoCompactionRetention: "1h"
+
+  # Основной рычаг, когда commit определяется массивом, а не etcd: меньше
+  # обращений к хранилищу ценой задержки коммита.
+  backendBatchLimit: 5000
+  backendBatchIntervalMilliseconds: 100
+```
+
+Ресурсы контейнера etcd задаются в `spec.resources`. Встроенное умолчание — 100m CPU / 128Mi запросов **без лимитов** — рассчитано на проверку работоспособности; etcd под троттлингом CPU выглядит ровно как «медленный диск». Полный разбор — в [docs/concepts.md](docs/concepts.md#настройки-тюнинга-etcd).
+
+## Метрики и алерты
+
+Два независимых источника:
+
+- **Каждый под члена** всегда отдаёт открытый порт `metrics` на `2381` — это `/metrics` самой etcd (`etcd_disk_*`, `etcd_server_*`, `etcd_mvcc_*`) плюс `/health`. Снимается `PodMonitor` или `VMPodScrape`.
+- **Оператор** отдаёт на своём эндпоинте 16 метрик состояния кластеров. Читаются из объектов **в момент снятия**, а не накапливаются при reconcile, поэтому серия не переживает свой объект: удалённый кластер просто перестаёт появляться, и дашборд не зарастает теми, кого уже нет.
+
+| Семейство | Что отвечает |
+|---|---|
+| `etcd_operator_cluster_info`, `_bootstrapped` | кластер существует; сформировался ли он вообще |
+| `etcd_operator_cluster_members_desired`, `_ready` | задано против фактически готовых |
+| `etcd_operator_cluster_condition` | `Available` / `Progressing` / `Degraded` с причиной в метке |
+| `etcd_operator_member_ready`, `_voter` | по каждому члену: готов, голосующий или learner |
+| `etcd_operator_snapshot_last_success_{timestamp,age,size}` | когда снят последний успешный снапшот и какого размера |
+| `etcd_operator_snapshot_policy_*` | расписание, приостановка, время последнего запуска и успеха |
+
+Важная деталь семантики: `cluster_condition` равен 1 при `True`, 0 при `False` и **отсутствует** при `Unknown` — «оператор ещё не высказался» намеренно отличается от «сломано». А `snapshot_last_success_*` эмитится только для кластеров, у которых есть хотя бы один успешный снапшот, поэтому «ни разу не бэкапился» ловится через `unless`, а не сравнением с нулём.
+
+Чарт умеет ставить `ServiceMonitor` и `PrometheusRule` с восемью готовыми алертами (недоступность, потеря кворума, неполный состав, `Degraded`, несобравшийся кластер, устаревшие снапшоты, отсутствие снапшотов, забытая приостановка политики):
+
+```yaml
+metrics:
+  serviceMonitor:
+    enabled: true
+    additionalLabels: {release: kube-prometheus-stack}
+  prometheusRule:
+    enabled: true
+    additionalLabels: {release: kube-prometheus-stack}
+    snapshotMaxAgeSeconds: 86400
+```
+
+Метка обязательна: prometheus-оператор выбирает объекты по `serviceMonitorSelector` и `ruleSelector`, и без подходящей метки объект создастся и молча не будет подхвачен.
+
+Полное описание метрик — в [docs/operations.md](docs/operations.md#метрики).
+
+## Документация
+
+- **[Установка](docs/installation.md)** — развернуть оператора, создать первый кластер, подводные камни сети, обновления.
+- **[Концепции](docs/concepts.md)** — обоснование устройства: схема фиксации намерения, бутстрап через единственный сид, именование через GenerateName, механика масштабирования в ноль, справочник по условиям.
+- **[Эксплуатация](docs/operations.md)** — руководство на каждый день: масштабирование, пауза и возобновление, чтение условий, ускорение застрявших reconcile, восстановление сломанного члена.
+- **[Дефрагментация](docs/etcd-defrag.md)** — ресурс `EtcdDefrag`: возврат дискового пространства бэкенда etcd, разовый запуск и запуск по расписанию извне, а также модель безопасности.
+- **[Миграция](docs/migration.md)** — переход на этот оператор со старого оператора aenix; отслеживает изменения поведения, требующие явного шага миграции, — сейчас это требование собственного Secret с учётными данными root при включении аутентификации.
+
+## Тестирование
 
 ```sh
 go test ./controllers/...
 ```
 
-The suite uses controller-runtime's fake client and a fake etcd client; no envtest assets needed at the unit level. Pinned behaviours:
+Набор использует фейковый клиент controller-runtime и фейковый клиент etcd; на уровне модульных тестов файлы envtest не нужны. Зафиксированное поведение:
 
-- **Bootstrap** — single-seed creation, idempotent recovery, `GenerateName`-assigned names.
-- **Locking pattern** — `status.observed` / `progressDeadline` lock the in-flight target; bootstrap-deadline is terminal.
-- **Scale up** — learner-mode add, readiness gate before the next step, crash-recovery branches between `Create` / `MemberAddAsLearner` / `Patch(initialCluster)`.
-- **Scale down** — `CreationTimestamp` DESC (name DESC tiebreak) victim selection, finalizer-driven `MemberRemove`.
-- **Scale to zero** — 1→0 Patches `spec.dormant=true`; 0→1 flips it back; dormant member's Pod is gone but its PVC is preserved.
-- **Discovery** — seed found via `spec.bootstrap=true`; etcd client endpoints filtered to voters (`MemberReady=True`) so `MemberList` doesn't route to a learner.
-- **Status no-churn** — steady-state reconciles don't repeatedly mutate status.
+- **Бутстрап** — создание единственного сида, идемпотентное восстановление, имена, назначаемые через `GenerateName`.
+- **Схема фиксации намерения** — `status.observed` и `progressDeadline` фиксируют цель, к которой идёт оператор; истёкший срок бутстрапа терминален.
+- **Масштабирование вверх** — добавление в режиме learner, ожидание готовности перед следующим шагом, ветки восстановления после сбоя между `Create`, `MemberAddAsLearner` и `Patch(initialCluster)`.
+- **Масштабирование вниз** — выбор жертвы по `CreationTimestamp` по убыванию (при равенстве — по имени по убыванию), `MemberRemove` через финализатор.
+- **Масштабирование в ноль** — переход 1→0 патчит `spec.dormant=true`; 0→1 возвращает его обратно; под спящего члена удалён, но его PVC сохранён.
+- **Обнаружение** — сид находится по `spec.bootstrap=true`; эндпоинты клиента etcd отфильтрованы до голосующих (`MemberReady=True`), чтобы `MemberList` не попал на learner.
+- **Отсутствие дребезга в статусе** — reconcile в установившемся режиме не переписывают статус раз за разом.
 
-## License
+## Лицензия
 
-Apache 2.0. See `LICENSE`.
+Apache 2.0. См. `LICENSE`.
