@@ -47,8 +47,31 @@ mergeOverwrite меняет свой первый аргумент, и без к
 своего члена на первый и оставляет остальные под будущее масштабирование, что и
 есть обычная форма дочернего кластера, начинающего с одной реплики.
 */}}
-{{- if and (gt (int $c.replicas) (len $pools)) (ne (mod (int $c.replicas) (len $pools)) 0) }}
-{{- fail (printf "cluster %q: replicas (%d) is not a multiple of the %d storage pools: at least one array would hold more members than the others, so losing that array would cost quorum — the failure this layout exists to prevent" $c.name (int $c.replicas) (len $pools)) }}
+{{- if and (gt (int $c.replicas) (len $pools)) (gt (len $pools) 1) }}
+{{- /*
+Проверяется то, ради чего пулы и существуют: переживает ли кластер потерю
+ЦЕЛОГО массива. Раскладка round-robin, поэтому самый нагруженный массив держит
+ceil(replicas / pools) членов; кластер выживает, если оставшихся хватает на
+кворум.
+
+Прежняя проверка требовала кратности числа реплик числу пулов и была строже
+нужного: 5 членов на 3 массива — это 2+2+1, потеря худшего оставляет 3 при
+кворуме 3, то есть раскладка безопасна, а кратность её запрещала. Заодно
+запрещались 7 на 3 и 5 на 4. Ослабления здесь нет: всё, что кратность
+пропускала, проходит и по выживаемости, потому что чётные числа реплик
+отсекаются проверкой нечётности выше.
+
+Один объявленный пул исключён намеренно. Такая запись не заявляет
+устойчивости к потере массива вообще — это просто способ назвать StorageClass,
+и требовать от неё пережить потерю единственного массива значило бы придумать
+пользователю обязательство, которого он на себя не брал.
+*/}}
+{{- $worstPool := div (add (int $c.replicas) (sub (len $pools) 1)) (len $pools) }}
+{{- $survivors := sub (int $c.replicas) $worstPool }}
+{{- $quorum := add (div (int $c.replicas) 2) 1 }}
+{{- if lt $survivors $quorum }}
+{{- fail (printf "cluster %q: %d members over %d storage pools puts %d of them on one array; losing that array leaves %d, short of the %d needed for quorum — the failure this layout exists to prevent" $c.name (int $c.replicas) (len $pools) $worstPool $survivors $quorum) }}
+{{- end }}
 {{- end }}
 {{- end }}
 

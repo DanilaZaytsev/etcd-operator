@@ -234,6 +234,14 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	// Every path from here on can return early while the cluster is still
+	// converging, so refresh the "what is actually up" fields now rather
+	// than only at the tail of a completed pass. No-op once they are
+	// already correct, which is the steady-state case.
+	if err := r.refreshLiveness(ctx, cluster, running); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	desired := cluster.Status.Observed.Replicas
 
 	// ── Bootstrap ──────────────────────────────────────────────────────
@@ -1373,6 +1381,71 @@ func hasPendingBootstrap(members []lll.EtcdMember) bool {
 // including any dormant member. It extracts the running subset for the
 // per-condition accounting and uses the dormant member separately for
 // the Paused message's PVC name.
+// countReadyMembers counts the members reporting MemberReady=True. Both the
+// mid-pass refresh and the tail of updateStatus go through here so the two
+// cannot drift into reporting different numbers for the same member set.
+func countReadyMembers(members []lll.EtcdMember) int32 {
+	ready := int32(0)
+	for _, m := range members {
+		for _, c := range m.Status.Conditions {
+			if c.Type == lll.MemberReady && c.Status == metav1.ConditionTrue {
+				ready++
+				break
+			}
+		}
+	}
+	return ready
+}
+
+// applyLiveness writes the two status fields that describe what is actually
+// up right now, and reports whether either changed.
+//
+// Selector feeds the /scale subresource: the VPA admission controller
+// fetches it via Scales().Get() to know which Pods to inject resource
+// recommendations into. clusterLabels stamps LabelCluster on every Pod the
+// operator emits, so the minimal selector keyed on that label matches the
+// whole cluster's Pod set.
+func applyLiveness(cluster *lll.EtcdCluster, running []lll.EtcdMember) bool {
+	changed := false
+	if ready := countReadyMembers(running); cluster.Status.ReadyMembers != ready {
+		cluster.Status.ReadyMembers = ready
+		changed = true
+	}
+	if want := fmt.Sprintf("%s=%s", LabelCluster, cluster.Name); cluster.Status.Selector != want {
+		cluster.Status.Selector = want
+		changed = true
+	}
+	return changed
+}
+
+// refreshLiveness keeps ReadyMembers and Selector current on every reconcile
+// pass, including the passes that return early while the cluster is still
+// converging.
+//
+// updateStatus recomputes both, but a scale-up step and a member replacement
+// both requeue from inside the scale branch and never reach it. Left to
+// updateStatus alone, ReadyMembers holds whatever it read before the
+// disruption — and it held 3 on a live cluster while one of the three members
+// was not Ready. That is not merely a cosmetic lag: the member controller's
+// quorum gate reads this field to decide whether removing a member is safe,
+// so a stale optimistic count weakens the guard exactly when a disruption is
+// in progress, which is the only time the guard matters.
+//
+// Deliberately narrow. Conditions stay updateStatus's business: their reasons
+// encode which branch a completed pass settled into, and refreshing them from
+// a mid-flight pass would report a settled reason for a cluster that has not
+// settled.
+func (r *EtcdClusterReconciler) refreshLiveness(
+	ctx context.Context,
+	cluster *lll.EtcdCluster,
+	running []lll.EtcdMember,
+) error {
+	if !applyLiveness(cluster, running) {
+		return nil
+	}
+	return r.Status().Update(ctx, cluster)
+}
+
 func (r *EtcdClusterReconciler) updateStatus(
 	ctx context.Context,
 	cluster *lll.EtcdCluster,
@@ -1382,32 +1455,8 @@ func (r *EtcdClusterReconciler) updateStatus(
 	running := filterRunningMembers(members)
 	dormant := findDormantMember(members)
 
-	ready := int32(0)
-	for _, m := range running {
-		for _, c := range m.Status.Conditions {
-			if c.Type == lll.MemberReady && c.Status == metav1.ConditionTrue {
-				ready++
-				break
-			}
-		}
-	}
-
-	changed := false
-	if cluster.Status.ReadyMembers != ready {
-		cluster.Status.ReadyMembers = ready
-		changed = true
-	}
-
-	// /scale subresource: the VPA admission controller fetches this via
-	// Scales().Get() to know which Pods to inject resource recommendations
-	// into. clusterLabels stamps LabelCluster on every Pod the operator
-	// emits, so the minimal selector keyed on that label matches the
-	// whole cluster's Pod set.
-	wantSelector := fmt.Sprintf("%s=%s", LabelCluster, cluster.Name)
-	if cluster.Status.Selector != wantSelector {
-		cluster.Status.Selector = wantSelector
-		changed = true
-	}
+	ready := countReadyMembers(running)
+	changed := applyLiveness(cluster, running)
 
 	// "Paused" is a distinct steady state from "Reconciled with N healthy
 	// members". An empty cluster cannot serve a single request, so

@@ -159,13 +159,30 @@ docker-push: ## Push docker image with the manager.
 # - be able to push the image for your registry (i.e. if you do not inform a valid value via IMG=<myregistry/image:<tag>> then the export will fail)
 # To properly provided solutions that supports more than one platform you should use this option.
 PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
+
+# Registries that only speak Docker manifest v2-2 reject what buildx pushes by
+# default: the provenance attestation forces an OCI image index, and the push
+# dies at the manifest step with "Cannot read manifest data" — after the layers
+# have already uploaded, leaving an untagged image behind. Yandex Container
+# Registry is one such registry. BUILDX_COMPAT=1 drops the attestations and
+# pins Docker media types.
+#
+# Off by default: the attestations are the supply-chain metadata the release
+# pipeline is supposed to carry, so losing them is a deliberate trade for a
+# registry that cannot accept them, not a default.
+ifeq ($(BUILDX_COMPAT),1)
+BUILDX_FLAGS ?= --provenance=false --sbom=false --output type=image,oci-mediatypes=false,push=true
+else
+BUILDX_FLAGS ?= --push
+endif
+
 .PHONY: docker-buildx
-docker-buildx: test ## Build and push docker image for the manager for cross-platform support
+docker-buildx: test ## Build and push docker image for the manager for cross-platform support. BUILDX_COMPAT=1 for registries that reject OCI manifests.
 	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
 	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
 	- docker buildx create --name project-v3-builder
 	docker buildx use project-v3-builder
-	- docker buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	- docker buildx build $(BUILDX_FLAGS) --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
 	- docker buildx rm project-v3-builder
 	rm Dockerfile.cross
 
@@ -202,7 +219,25 @@ deploy: manifests require-helm ## Install/upgrade the operator (CRDs + RBAC + ma
 	# The chart renders image == OPERATOR_IMAGE, so there is no separate image-
 	# replacement step; CRDs are templated into the release so `helm upgrade`
 	# keeps them current. The IMG split into repository:tag handles registry ports.
-	img='$(IMG)'; $(HELM) upgrade --install $(HELM_RELEASE) charts/etcd-operator \
+	#
+	# Bootstrap pass. Helm builds every rendered object against the live API
+	# before it applies any of them, so a first install that renders both the
+	# CRDs and an EtcdCluster fails on the EtcdCluster: its kind does not exist
+	# yet. Hooks do not help — they run after that build. The chart keeps CRDs
+	# in templates/ on purpose (a chart that shipped them in crds/ would never
+	# update them on upgrade), so the install, not the chart, is what splits:
+	# one pass to land the CRDs, then the real one. Skipped once the CRD exists,
+	# which makes every later run a plain single-pass upgrade.
+	img='$(IMG)'; \
+	if ! $(HELM) get manifest $(HELM_RELEASE) --namespace $(NAMESPACE) >/dev/null 2>&1; then \
+		$(HELM) install $(HELM_RELEASE) charts/etcd-operator \
+			--namespace $(NAMESPACE) --create-namespace \
+			--set image.repository="$${img%:*}" --set image.tag="$${img##*:}" \
+			--set clusters=null \
+			$(HELM_EXTRA_ARGS) \
+			--wait --timeout 5m; \
+	fi; \
+	$(HELM) upgrade --install $(HELM_RELEASE) charts/etcd-operator \
 		--namespace $(NAMESPACE) --create-namespace \
 		--set image.repository="$${img%:*}" --set image.tag="$${img##*:}" \
 		$(HELM_EXTRA_ARGS) \

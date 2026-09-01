@@ -276,7 +276,42 @@ tests:
               - {name: array-b, storageClassName: san-b}
     asserts:
       - failedTemplate:
-          errorMessage: 'cluster "tenant-a": replicas (3) is not a multiple of the 2 storage pools: at least one array would hold more members than the others, so losing that array would cost quorum — the failure this layout exists to prevent'
+          errorMessage: 'cluster "tenant-a": 3 members over 2 storage pools puts 2 of them on one array; losing that array leaves 1, short of the 2 needed for quorum — the failure this layout exists to prevent'
+
+  - it: accepts five members over three arrays
+    # 2+2+1. Losing the worst array leaves 3, exactly the quorum of 5, so the
+    # layout survives an array outage and the chart must not refuse it — the
+    # earlier multiple-of-pools rule did, which left 3 and 9 as the only sizes
+    # a three-array cluster could take.
+    set:
+      clusters:
+        - name: tenant-a
+          replicas: 5
+          storage:
+            pools:
+              - {name: array-a, storageClassName: san-a}
+              - {name: array-b, storageClassName: san-b}
+              - {name: array-c, storageClassName: san-c}
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 5
+
+  - it: accepts three members over a single array
+    # One declared pool claims no array redundancy at all — it is a way to name
+    # a StorageClass. Demanding that it survive losing its only array would
+    # invent an obligation the author never took on.
+    set:
+      clusters:
+        - name: tenant-a
+          replicas: 3
+          storage:
+            pools:
+              - {name: array-a, storageClassName: san-a}
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 3
 
   - it: still renders while an array is cordoned
     # The evenness check counts DECLARED pools, not enabled ones: cordoning is
