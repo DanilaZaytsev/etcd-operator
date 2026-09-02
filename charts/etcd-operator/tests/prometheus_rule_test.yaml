@@ -112,6 +112,17 @@ tests:
           path: spec.groups[0].rules[5].expr
           pattern: "etcd_operator_cluster_observed_generation"
 
+  - it: alerts on a member that has a Pod and is not serving
+    set:
+      metrics.prometheusRule.enabled: true
+    asserts:
+      - equal:
+          path: spec.groups[0].rules[6].alert
+          value: EtcdClusterMembersBroken
+      - equal:
+          path: spec.groups[0].rules[6].for
+          value: 15m
+
   # Defrag had no metrics at all, so it had no alerts either; a policy that
   # silently stopped firing showed up only as db size months later. It gets its
   # own group because it is scheduled maintenance, not a backup.

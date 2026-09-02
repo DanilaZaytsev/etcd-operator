@@ -4170,3 +4170,92 @@ func findClusterCondition(cluster *lll.EtcdCluster, condType string) *metav1.Con
 	}
 	return nil
 }
+
+// brokenMembers exists to separate "the third member is still being created"
+// from "the third member has a Pod and it is failing". The two are identical in
+// members_ready, and only the second needs a human. Found on a load run, where
+// the field read 0 through a genuine member loss because the predicate behind
+// it was a stub for PVC-backed clusters.
+func TestIsBroken_SeparatesFailingFromNotYetCreated(t *testing.T) {
+	r := &EtcdClusterReconciler{}
+	ready := func(s metav1.ConditionStatus) []metav1.Condition {
+		return []metav1.Condition{{Type: lll.MemberReady, Status: s, Reason: "x", LastTransitionTime: metav1.Now()}}
+	}
+	cases := []struct {
+		name   string
+		member lll.EtcdMember
+		want   bool
+	}{
+		{
+			name:   "queued, no Pod yet",
+			member: lll.EtcdMember{Status: lll.EtcdMemberStatus{}},
+			want:   false,
+		},
+		{
+			name:   "has a Pod and is serving",
+			member: lll.EtcdMember{Status: lll.EtcdMemberStatus{PodUID: "u1", Conditions: ready(metav1.ConditionTrue)}},
+			want:   false,
+		},
+		{
+			name:   "has a Pod and is not serving",
+			member: lll.EtcdMember{Status: lll.EtcdMemberStatus{PodUID: "u1", Conditions: ready(metav1.ConditionFalse)}},
+			want:   true,
+		},
+		{
+			name:   "has a Pod, nothing has vouched for it yet",
+			member: lll.EtcdMember{Status: lll.EtcdMemberStatus{PodUID: "u1"}},
+			want:   true,
+		},
+		{
+			name: "memory member mid-loss keeps its own clause",
+			member: lll.EtcdMember{
+				Spec:   lll.EtcdMemberSpec{Storage: lll.StorageSpec{Medium: lll.StorageMediumMemory}},
+				Status: lll.EtcdMemberStatus{PodUID: "u1", PodName: "", Conditions: ready(metav1.ConditionTrue)},
+			},
+			want: true,
+		},
+	}
+	for _, tc := range cases {
+		if got := r.isBroken(tc.member); got != tc.want {
+			t.Errorf("%s: isBroken = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The count has to reach status, or the metric built on it reports nothing.
+func TestUpdateStatus_CountsBrokenMembers(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec:       lll.EtcdClusterSpec{Replicas: ptrInt32(3), Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}},
+		Status: lll.EtcdClusterStatus{
+			ClusterID: "abc", ClusterToken: "tok",
+			Observed: &lll.ObservedClusterSpec{Replicas: 3, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}},
+		},
+	}
+	mk := func(name, uid string, ready metav1.ConditionStatus) lll.EtcdMember {
+		return lll.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns", Labels: memberLabels("test", name)},
+			Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+			Status: lll.EtcdMemberStatus{
+				PodUID:     uid,
+				Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: ready, Reason: "x", LastTransitionTime: metav1.Now()}},
+			},
+		}
+	}
+	members := []lll.EtcdMember{
+		mk("m1", "u1", metav1.ConditionTrue),
+		mk("m2", "u2", metav1.ConditionTrue),
+		mk("m3", "u3", metav1.ConditionFalse), // had a Pod, now failing
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef))}
+
+	if _, err := r.updateStatus(ctx, cluster, members); err != nil {
+		t.Fatalf("updateStatus: %v", err)
+	}
+	got := mustGet(t, c, "test", "ns", &lll.EtcdCluster{})
+	if got.Status.BrokenMembers != 1 {
+		t.Fatalf("BrokenMembers = %d, want 1", got.Status.BrokenMembers)
+	}
+}

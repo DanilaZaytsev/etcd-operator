@@ -113,6 +113,22 @@ spec:
           15 минут. Спецификацию изменили, а оператор не довёл до конца ни
           одного прохода по ней: смотрите condition Progressing и его reason.
 
+    # Отличает «член ещё создаётся» от «у члена был Pod, и он не обслуживает».
+    # В members_ready это одно и то же число, но первое проходит само, а второе
+    # нет. 15 минут — чтобы обычный перезапуск пода (drain, обновление образа)
+    # сюда не попадал.
+    - alert: EtcdClusterMembersBroken
+      expr: etcd_operator_cluster_broken_members > 0
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: "У EtcdCluster {{ `{{ $labels.namespace }}/{{ $labels.cluster }}` }} member не обслуживает"
+        description: >-
+          {{ `{{ $value }}` }} member(ов) имеют Pod, но не обслуживают дольше
+          15 минут. Это не «member ещё создаётся» — само не пройдёт. Смотрите
+          Pod member'а и его перезапуски.
+
   - name: etcd-operator.snapshots
     rules:
     - alert: EtcdSnapshotTooOld

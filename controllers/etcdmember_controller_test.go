@@ -2317,10 +2317,11 @@ func TestUpdateStatus_MemoryMemberLeavesPVCNameEmpty(t *testing.T) {
 	}
 }
 
-// TestIsBroken_MemoryMemberWithLostPodIsBroken pins the predicate that
-// drives EtcdCluster.status.brokenMembers. A memory member whose Pod
-// UID was recorded but whose Pod is currently absent (Status.PodName
-// cleared by updateStatus's NotFound branch — or never set) is broken.
+// TestIsBroken_MemoryMemberWithLostPodIsBroken pins the predicate that drives
+// EtcdCluster.status.brokenMembers. A memory member whose Pod UID was recorded
+// but whose Pod is currently absent (Status.PodName cleared by updateStatus's
+// NotFound branch — or never set) is broken; PVC-backed members are now judged
+// on whether a member that HAS had a Pod is serving.
 func TestIsBroken_MemoryMemberWithLostPodIsBroken(t *testing.T) {
 	r := &EtcdClusterReconciler{}
 	cases := []struct {
@@ -2337,10 +2338,15 @@ func TestIsBroken_MemoryMemberWithLostPodIsBroken(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "memory, UID recorded, Pod present → healthy",
+			// The memory clause no longer decides this case on its own: the Pod
+			// is present, so the member falls through to the general rule and is
+			// judged on whether it is serving. Ready=True is the healthy shape.
+			name: "memory, UID recorded, Pod present and serving → healthy",
 			m: lll.EtcdMember{
-				Spec:   lll.EtcdMemberSpec{Storage: lll.StorageSpec{Medium: lll.StorageMediumMemory}},
-				Status: lll.EtcdMemberStatus{PodUID: "u", PodName: "p"},
+				Spec: lll.EtcdMemberSpec{Storage: lll.StorageSpec{Medium: lll.StorageMediumMemory}},
+				Status: lll.EtcdMemberStatus{PodUID: "u", PodName: "p", Conditions: []metav1.Condition{
+					{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: metav1.Now()},
+				}},
 			},
 			want: false,
 		},
@@ -2353,10 +2359,23 @@ func TestIsBroken_MemoryMemberWithLostPodIsBroken(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "PVC-backed, Pod missing → stub stays false",
+			// This used to assert the stub. A PVC-backed member that HAD a Pod
+			// and is not serving is exactly the case brokenMembers exists to
+			// name, so it now counts.
+			name: "PVC-backed, had a Pod and is not serving → broken",
 			m: lll.EtcdMember{
 				Spec:   lll.EtcdMemberSpec{Storage: lll.StorageSpec{Medium: lll.StorageMediumDefault}},
 				Status: lll.EtcdMemberStatus{PodUID: "u", PodName: ""},
+			},
+			want: true,
+		},
+		{
+			name: "PVC-backed, serving → not broken",
+			m: lll.EtcdMember{
+				Spec: lll.EtcdMemberSpec{Storage: lll.StorageSpec{Medium: lll.StorageMediumDefault}},
+				Status: lll.EtcdMemberStatus{PodUID: "u", PodName: "p", Conditions: []metav1.Condition{
+					{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: metav1.Now()},
+				}},
 			},
 			want: false,
 		},

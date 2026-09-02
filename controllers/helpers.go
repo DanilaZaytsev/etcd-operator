@@ -541,24 +541,46 @@ func deriveClusterToken(cluster *lll.EtcdCluster) string {
 	return fmt.Sprintf("%s-%s-%s", cluster.Namespace, cluster.Name, cluster.UID)
 }
 
-// isBroken decides whether a member should be treated as broken. In the
-// current implementation the field it drives — EtcdCluster.status.broken
-// Members — stays at 0 in practice, because the member controller
-// detects memory-backed Pod loss and self-deletes the EtcdMember in the
-// same reconcile pass; by the time updateStatus runs over the running
-// set the lost member is already Terminating and filtered out.
+// isBroken decides whether a member should be treated as broken rather than
+// merely absent. It draws one distinction, and the distinction is the whole
+// point of EtcdCluster.status.brokenMembers: "2 of 3 ready" reads identically
+// whether the third member is still being created or has a Pod that is failing,
+// yet the first resolves itself and the second does not.
 //
-// The predicate is left in place as a hook for future broken-member
-// detection policies that don't tear the member down immediately (e.g.
-// PVC corruption with a grace period, irrecoverable crashloop with a
-// retry budget). The "memory member with PodUID recorded but PodName
-// empty" condition would only arise if the member-controller's loss
-// path is delayed or fails after a partial Status write — defensive
-// rather than expected. For PVC-backed members the predicate stays a
-// stub.
+// A member counts as broken once it has HAD a Pod (Status.PodUID recorded) and
+// is currently not Ready. Before the Pod exists there is nothing to be broken
+// about — the member is queued, and members_desired minus members_ready already
+// says so.
+//
+// This is deliberately a snapshot, not a duration: a member restarting normally
+// (drain, node reboot, image update) passes through this state for a few
+// seconds. Consumers are expected to require it to persist — the chart's alert
+// asks for 15 minutes — which is also why the predicate does not try to
+// second-guess the cause. The member controller's own crash-loop self-heal
+// (dataLossRestartThreshold) still runs independently; brokenMembers reports
+// what is happening, it does not decide anything.
+//
+// Memory-backed members keep their own clause. A tmpfs data dir dies with the
+// Pod, so a recorded PodUID with the PodName already cleared means the member
+// controller's loss path has started but not finished — broken by definition,
+// and visible even in the window before the CR is deleted.
 func (r *EtcdClusterReconciler) isBroken(m lll.EtcdMember) bool {
-	if m.Spec.Storage.Medium == lll.StorageMediumMemory {
-		return m.Status.PodUID != "" && m.Status.PodName == ""
+	if m.Spec.Storage.Medium == lll.StorageMediumMemory && m.Status.PodUID != "" && m.Status.PodName == "" {
+		return true
+	}
+	if m.Status.PodUID == "" {
+		return false
+	}
+	return !memberIsReady(m)
+}
+
+// memberIsReady reports whether the member carries MemberReady=True. An absent
+// condition counts as not ready: nothing has vouched for the member yet.
+func memberIsReady(m lll.EtcdMember) bool {
+	for _, c := range m.Status.Conditions {
+		if c.Type == lll.MemberReady {
+			return c.Status == metav1.ConditionTrue
+		}
 	}
 	return false
 }

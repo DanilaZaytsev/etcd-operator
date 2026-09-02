@@ -115,12 +115,10 @@ func NewCollector(reader client.Reader) *Collector {
 
 		clusterBrokenMembers: prometheus.NewDesc(
 			"etcd_operator_cluster_broken_members",
-			"status.brokenMembers: members the operator considers broken rather than merely "+
-				"absent. NOTE: the predicate behind this field is currently a stub for "+
-				"PVC-backed clusters (see isBroken), so it reads 0 for them by construction. "+
-				"It is exported because it is part of the status API and will become "+
-				"meaningful if that predicate grows; do not write an alert against it today — "+
-				"use members_ready against members_desired instead.",
+			"status.brokenMembers: members that have HAD a Pod and are not serving, as "+
+				"opposed to members that simply have not been created yet. The two are the "+
+				"same number in members_ready, and only the first needs a human. A member "+
+				"restarting normally passes through this state, so require it to persist.",
 			cluster, nil),
 		clusterGeneration: prometheus.NewDesc(
 			"etcd_operator_cluster_generation",
