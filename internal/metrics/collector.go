@@ -53,6 +53,16 @@ type Collector struct {
 	clusterMembersDesired *prometheus.Desc
 	clusterMembersReady   *prometheus.Desc
 	clusterCondition      *prometheus.Desc
+	clusterBrokenMembers  *prometheus.Desc
+	clusterGeneration     *prometheus.Desc
+	clusterObservedGen    *prometheus.Desc
+
+	defragsByPhase        *prometheus.Desc
+	defragPolicyInfo      *prometheus.Desc
+	defragPolicySuspended *prometheus.Desc
+	defragPolicyLastSched *prometheus.Desc
+	defragPolicyLastOK    *prometheus.Desc
+	defragPolicyActive    *prometheus.Desc
 
 	memberReady *prometheus.Desc
 	memberVoter *prometheus.Desc
@@ -102,6 +112,53 @@ func NewCollector(reader client.Reader) *Collector {
 			"EtcdCluster status conditions: 1 when the condition is True, 0 when False, absent when Unknown. "+
 				"The reason label carries why.",
 			[]string{"namespace", "cluster", "condition", "reason"}, nil),
+
+		clusterBrokenMembers: prometheus.NewDesc(
+			"etcd_operator_cluster_broken_members",
+			"status.brokenMembers: members the operator considers broken rather than merely "+
+				"absent. NOTE: the predicate behind this field is currently a stub for "+
+				"PVC-backed clusters (see isBroken), so it reads 0 for them by construction. "+
+				"It is exported because it is part of the status API and will become "+
+				"meaningful if that predicate grows; do not write an alert against it today — "+
+				"use members_ready against members_desired instead.",
+			cluster, nil),
+		clusterGeneration: prometheus.NewDesc(
+			"etcd_operator_cluster_generation",
+			"metadata.generation of the EtcdCluster — the spec the user has asked for.",
+			cluster, nil),
+		clusterObservedGen: prometheus.NewDesc(
+			"etcd_operator_cluster_observed_generation",
+			"status.observedGeneration — the spec the operator has finished a reconcile pass for. "+
+				"Lagging behind cluster_generation means the operator has not caught up yet; "+
+				"lagging for long means it is stuck, and this is the signal to alert on.",
+			cluster, nil),
+
+		defragsByPhase: prometheus.NewDesc(
+			"etcd_operator_defrags",
+			"EtcdDefrag objects per cluster, by phase.",
+			[]string{"namespace", "cluster", "phase"}, nil),
+		defragPolicyInfo: prometheus.NewDesc(
+			"etcd_operator_defrag_policy_info",
+			"Static facts about an EtcdDefragPolicy. Always 1; read the labels.",
+			[]string{"namespace", "policy", "cluster", "schedule", "timezone"}, nil),
+		defragPolicySuspended: prometheus.NewDesc(
+			"etcd_operator_defrag_policy_suspended",
+			"1 when the defrag policy is suspended and will not fire, 0 when it is live. "+
+				"A suspended policy still exports its other series, so a paused schedule is "+
+				"visible rather than silently absent.",
+			[]string{"namespace", "policy"}, nil),
+		defragPolicyLastSched: prometheus.NewDesc(
+			"etcd_operator_defrag_policy_last_schedule_timestamp_seconds",
+			"Unix time the defrag policy last fired a tick.",
+			[]string{"namespace", "policy"}, nil),
+		defragPolicyLastOK: prometheus.NewDesc(
+			"etcd_operator_defrag_policy_last_success_timestamp_seconds",
+			"Unix time a defrag started by this policy last completed successfully.",
+			[]string{"namespace", "policy"}, nil),
+		defragPolicyActive: prometheus.NewDesc(
+			"etcd_operator_defrag_policy_active_defrags",
+			"EtcdDefrag objects this policy currently has in flight.",
+			[]string{"namespace", "policy"}, nil),
 
 		memberReady: prometheus.NewDesc(
 			"etcd_operator_member_ready",
@@ -168,7 +225,10 @@ func (c *Collector) Register() error {
 func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	for _, d := range []*prometheus.Desc{
 		c.clusterInfo, c.clusterBootstrapped, c.clusterMembersDesired, c.clusterMembersReady,
-		c.clusterCondition, c.memberReady, c.memberVoter,
+		c.clusterCondition, c.clusterBrokenMembers, c.clusterGeneration, c.clusterObservedGen,
+		c.memberReady, c.memberVoter,
+		c.defragsByPhase, c.defragPolicyInfo, c.defragPolicySuspended,
+		c.defragPolicyLastSched, c.defragPolicyLastOK, c.defragPolicyActive,
 		c.snapshotLastSuccessTime, c.snapshotLastSuccessAge, c.snapshotLastSuccessBytes, c.snapshotsByPhase,
 		c.policyInfo, c.policySuspended, c.policyLastScheduleTime, c.policyLastSuccessTime, c.policyActive,
 	} {
@@ -211,6 +271,18 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 			c.collectPolicy(ch, &policies.Items[i])
 		}
 	}
+
+	var defrags lll.EtcdDefragList
+	if err := c.client.List(ctx, &defrags); err == nil {
+		c.collectDefrags(ch, defrags.Items)
+	}
+
+	var defragPolicies lll.EtcdDefragPolicyList
+	if err := c.client.List(ctx, &defragPolicies); err == nil {
+		for i := range defragPolicies.Items {
+			c.collectDefragPolicy(ch, &defragPolicies.Items[i])
+		}
+	}
 }
 
 func (c *Collector) collectCluster(ch chan<- prometheus.Metric, cl *lll.EtcdCluster) {
@@ -241,6 +313,14 @@ func (c *Collector) collectCluster(ch chan<- prometheus.Metric, cl *lll.EtcdClus
 	}
 	gauge(ch, c.clusterMembersDesired, desired, ns, name)
 	gauge(ch, c.clusterMembersReady, float64(cl.Status.ReadyMembers), ns, name)
+
+	gauge(ch, c.clusterBrokenMembers, float64(cl.Status.BrokenMembers), ns, name)
+
+	// Exported as two series rather than one difference so the staleness alert
+	// can be written as a comparison the reader can verify against kubectl, and
+	// so a cluster whose spec never changed does not look stuck.
+	gauge(ch, c.clusterGeneration, float64(cl.Generation), ns, name)
+	gauge(ch, c.clusterObservedGen, float64(cl.Status.ObservedGeneration), ns, name)
 
 	for _, cond := range cl.Status.Conditions {
 		v, ok := conditionValue(cond.Status)
@@ -341,6 +421,54 @@ func (c *Collector) collectPolicy(ch chan<- prometheus.Metric, p *lll.EtcdSnapsh
 		gauge(ch, c.policyLastSuccessTime, float64(t.Unix()), ns, name)
 	}
 	gauge(ch, c.policyActive, float64(len(p.Status.Active)), ns, name)
+}
+
+// collectDefrags counts EtcdDefrag objects per cluster by phase. Defrag is the
+// one maintenance operation the operator performs against a live cluster, and
+// until now it exported nothing at all — a policy that stopped firing, or one
+// whose defrags kept failing, was invisible to monitoring while the snapshot
+// side of the same operator was fully instrumented.
+func (c *Collector) collectDefrags(ch chan<- prometheus.Metric, items []lll.EtcdDefrag) {
+	type clusterKey struct{ ns, cluster string }
+	counts := map[clusterKey]map[string]int{}
+
+	for i := range items {
+		d := &items[i]
+		key := clusterKey{d.Namespace, d.Spec.ClusterRef.Name}
+		phase := string(d.Status.Phase)
+		if phase == "" {
+			phase = "Pending"
+		}
+		if counts[key] == nil {
+			counts[key] = map[string]int{}
+		}
+		counts[key][phase]++
+	}
+
+	for key, byPhase := range counts {
+		for phase, n := range byPhase {
+			gauge(ch, c.defragsByPhase, float64(n), key.ns, key.cluster, phase)
+		}
+	}
+}
+
+func (c *Collector) collectDefragPolicy(ch chan<- prometheus.Metric, p *lll.EtcdDefragPolicy) {
+	ns, name := p.Namespace, p.Name
+	gauge(ch, c.defragPolicyInfo, 1, ns, name, p.Spec.ClusterRef.Name, p.Spec.Schedule.Cron, p.Spec.Schedule.Timezone)
+
+	suspended := 0.0
+	if p.Spec.Suspend != nil && *p.Spec.Suspend {
+		suspended = 1
+	}
+	gauge(ch, c.defragPolicySuspended, suspended, ns, name)
+
+	if t := p.Status.LastScheduleTime; t != nil {
+		gauge(ch, c.defragPolicyLastSched, float64(t.Unix()), ns, name)
+	}
+	if t := p.Status.LastSuccessfulTime; t != nil {
+		gauge(ch, c.defragPolicyLastOK, float64(t.Unix()), ns, name)
+	}
+	gauge(ch, c.defragPolicyActive, float64(len(p.Status.Active)), ns, name)
 }
 
 // completionTime is when a snapshot reached its terminal phase. EtcdSnapshot

@@ -399,3 +399,130 @@ func TestDeletedObjectsStopBeingReported(t *testing.T) {
 	ss = gather(t, newCollector(t))
 	absent(t, ss, "etcd_operator_cluster_info", inCluster("gone"))
 }
+
+// brokenMembers is computed by the cluster controller and was never exported.
+// It answers a question members_ready cannot: "ready 2 of 3" is the same number
+// whether the third member is still being created or is wedged in crash-loop.
+func TestClusterBrokenMembersIsExported(t *testing.T) {
+	cl := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "tenant-a", Generation: 4},
+		Spec:       lll.EtcdClusterSpec{Version: "3.6.11"},
+		Status: lll.EtcdClusterStatus{
+			ReadyMembers:       2,
+			BrokenMembers:      1,
+			ObservedGeneration: 4,
+			Observed:           &lll.ObservedClusterSpec{Replicas: 3},
+		},
+	}
+	ss := gather(t, newCollector(t, cl))
+	byCluster := map[string]string{"namespace": "tenant-a", "cluster": "c1"}
+
+	if got := find(t, ss, "etcd_operator_cluster_broken_members", byCluster).value; got != 1 {
+		t.Fatalf("broken_members = %v, want 1", got)
+	}
+}
+
+// The two generation series are what makes "the operator is stuck" alertable:
+// a spec the user changed that the operator has not finished acting on shows up
+// as observed_generation trailing generation for longer than a reconcile takes.
+func TestClusterGenerationLagIsVisible(t *testing.T) {
+	cl := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "tenant-a", Generation: 7},
+		Spec:       lll.EtcdClusterSpec{Version: "3.6.11"},
+		Status: lll.EtcdClusterStatus{
+			ObservedGeneration: 5,
+			Observed:           &lll.ObservedClusterSpec{Replicas: 3},
+		},
+	}
+	ss := gather(t, newCollector(t, cl))
+	byCluster := map[string]string{"namespace": "tenant-a", "cluster": "c1"}
+
+	gen := find(t, ss, "etcd_operator_cluster_generation", byCluster).value
+	obs := find(t, ss, "etcd_operator_cluster_observed_generation", byCluster).value
+	if gen != 7 || obs != 5 {
+		t.Fatalf("generation/observed = %v/%v, want 7/5", gen, obs)
+	}
+}
+
+// Defrag is the operator's one maintenance operation against a live cluster and
+// exported nothing at all, while the snapshot half of the same operator was
+// fully instrumented. These mirror the snapshot policy series exactly.
+func TestDefragPolicyMetrics(t *testing.T) {
+	suspend := true
+	p := &lll.EtcdDefragPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "c1-defrag", Namespace: "tenant-a"},
+		Spec: lll.EtcdDefragPolicySpec{
+			ClusterRef: corev1.LocalObjectReference{Name: "c1"},
+			Schedule:   lll.DefragSchedule{Cron: "0 3 * * *", Timezone: "Europe/Moscow"},
+			Suspend:    &suspend,
+		},
+		Status: lll.EtcdDefragPolicyStatus{
+			LastScheduleTime:   &metav1.Time{Time: epoch.Add(-2 * time.Hour)},
+			LastSuccessfulTime: &metav1.Time{Time: epoch.Add(-2 * time.Hour)},
+			Active:             []corev1.LocalObjectReference{{Name: "c1-defrag-1"}},
+		},
+	}
+
+	ss := gather(t, newCollector(t, p))
+	byPolicy := map[string]string{"namespace": "tenant-a", "policy": "c1-defrag"}
+
+	info := find(t, ss, "etcd_operator_defrag_policy_info", byPolicy)
+	if info.labels["schedule"] != "0 3 * * *" || info.labels["cluster"] != "c1" {
+		t.Fatalf("defrag policy info labels = %v", info.labels)
+	}
+	if got := find(t, ss, "etcd_operator_defrag_policy_suspended", byPolicy).value; got != 1 {
+		t.Fatalf("suspended = %v, want 1", got)
+	}
+	if got := find(t, ss, "etcd_operator_defrag_policy_active_defrags", byPolicy).value; got != 1 {
+		t.Fatalf("active = %v, want 1", got)
+	}
+	wantTS := float64(epoch.Add(-2 * time.Hour).Unix())
+	if got := find(t, ss, "etcd_operator_defrag_policy_last_success_timestamp_seconds", byPolicy).value; got != wantTS {
+		t.Fatalf("last success = %v, want %v", got, wantTS)
+	}
+}
+
+// A defrag policy that has never fired must not report a zero timestamp, for
+// the same reason the snapshot side does not: an absent series is a question,
+// a zero timestamp is a wrong answer that reads as 1970.
+func TestDefragPolicyWithNoHistoryEmitsNoTimestamps(t *testing.T) {
+	p := &lll.EtcdDefragPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "c1-defrag", Namespace: "tenant-a"},
+		Spec: lll.EtcdDefragPolicySpec{
+			ClusterRef: corev1.LocalObjectReference{Name: "c1"},
+			Schedule:   lll.DefragSchedule{Cron: "0 3 * * *"},
+		},
+	}
+	ss := gather(t, newCollector(t, p))
+	for _, s := range ss {
+		if s.name == "etcd_operator_defrag_policy_last_schedule_timestamp_seconds" ||
+			s.name == "etcd_operator_defrag_policy_last_success_timestamp_seconds" {
+			t.Fatalf("a policy that never fired must emit no timestamp; got %s = %v", s.name, s.value)
+		}
+	}
+}
+
+func TestDefragCountsByPhase(t *testing.T) {
+	mk := func(name string, phase lll.EtcdDefragPhase) *lll.EtcdDefrag {
+		return &lll.EtcdDefrag{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tenant-a"},
+			Spec:       lll.EtcdDefragSpec{ClusterRef: corev1.LocalObjectReference{Name: "c1"}},
+			Status:     lll.EtcdDefragStatus{Phase: phase},
+		}
+	}
+	ss := gather(t, newCollector(t,
+		mk("d1", lll.EtcdDefragPhaseComplete),
+		mk("d2", lll.EtcdDefragPhaseComplete),
+		mk("d3", lll.EtcdDefragPhaseFailed),
+	))
+	complete := find(t, ss, "etcd_operator_defrags",
+		map[string]string{"namespace": "tenant-a", "cluster": "c1", "phase": string(lll.EtcdDefragPhaseComplete)})
+	if complete.value != 2 {
+		t.Fatalf("complete defrags = %v, want 2", complete.value)
+	}
+	failed := find(t, ss, "etcd_operator_defrags",
+		map[string]string{"namespace": "tenant-a", "cluster": "c1", "phase": string(lll.EtcdDefragPhaseFailed)})
+	if failed.value != 1 {
+		t.Fatalf("failed defrags = %v, want 1", failed.value)
+	}
+}

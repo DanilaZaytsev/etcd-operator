@@ -98,3 +98,33 @@ tests:
       - equal:
           path: spec.groups[0].rules[1].labels.severity
           value: critical
+
+  # A parked cluster has healthy Pods and the same ready-member count as a good
+  # one; the generation lag is the only thing that separates them.
+  - it: alerts when the operator has not applied the spec
+    set:
+      metrics.prometheusRule.enabled: true
+    asserts:
+      - equal:
+          path: spec.groups[0].rules[5].alert
+          value: EtcdClusterSpecNotApplied
+      - matchRegex:
+          path: spec.groups[0].rules[5].expr
+          pattern: "etcd_operator_cluster_observed_generation"
+
+  # Defrag had no metrics at all, so it had no alerts either; a policy that
+  # silently stopped firing showed up only as db size months later. It gets its
+  # own group because it is scheduled maintenance, not a backup.
+  - it: alerts on a defrag policy that never succeeded
+    set:
+      metrics.prometheusRule.enabled: true
+    asserts:
+      - equal:
+          path: spec.groups[2].name
+          value: etcd-operator.maintenance
+      - equal:
+          path: spec.groups[2].rules[0].alert
+          value: EtcdDefragPolicyNotRunning
+      - matchRegex:
+          path: spec.groups[2].rules[0].expr
+          pattern: "unless on \\(namespace, policy\\)"

@@ -95,6 +95,24 @@ spec:
           (например, член попал в отключённый или мёртвый пул хранения) или
           под, не проходящий планирование из-за anti-affinity.
 
+    # Найдено на прогоне: кластер может стоять припаркованным с исправными
+    # подами, и по числу готовых членов это неотличимо от здорового. Отставание
+    # observedGeneration от generation — единственный сигнал, который ловит
+    # «оператор не доработал спецификацию до конца», не перечисляя причины.
+    - alert: EtcdClusterSpecNotApplied
+      expr: >-
+        etcd_operator_cluster_observed_generation
+          < on (namespace, cluster) etcd_operator_cluster_generation
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Оператор не применил спецификацию EtcdCluster {{ `{{ $labels.namespace }}/{{ $labels.cluster }}` }}"
+        description: >-
+          status.observedGeneration отстаёт от metadata.generation дольше
+          15 минут. Спецификацию изменили, а оператор не довёл до конца ни
+          одного прохода по ней: смотрите condition Progressing и его reason.
+
   - name: etcd-operator.snapshots
     rules:
     - alert: EtcdSnapshotTooOld
@@ -138,4 +156,25 @@ spec:
           suspend=true держится 24 часа. Приостановка обычно временная —
           забытая приостановка это и есть способ, которым бэкапы тихо
           прекращаются.
+
+  # Defrag — единственная операция обслуживания, которую оператор выполняет
+  # против живого кластера. До этого он не отдавал по ней ни одной метрики,
+  # поэтому политика, тихо переставшая срабатывать, проявлялась только ростом
+  # db size месяцы спустя.
+  - name: etcd-operator.maintenance
+    rules:
+    - alert: EtcdDefragPolicyNotRunning
+      expr: >-
+        etcd_operator_defrag_policy_info
+          unless on (namespace, policy)
+        etcd_operator_defrag_policy_last_success_timestamp_seconds
+      for: 48h
+      labels:
+        severity: info
+      annotations:
+        summary: "Defrag-политика {{ `{{ $labels.namespace }}/{{ $labels.policy }}` }} ни разу не отработала"
+        description: >-
+          Политика с расписанием {{ `{{ $labels.schedule }}` }} существует, но ни
+          один defrag по ней не завершался успешно. База etcd не отдаёт
+          освобождённые страницы обратно без defrag.
 {{- end }}
