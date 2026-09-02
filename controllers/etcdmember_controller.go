@@ -84,6 +84,11 @@ func (r *EtcdMemberReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 		return ctrl.Result{}, err
 	}
+	// The Pod UID as last persisted. ensurePod overwrites the in-memory
+	// field with the live Pod's UID before updateStatus runs, so this is the
+	// only place the previous value can still be captured; updateStatus uses
+	// it to tell a recreated Pod from a steady one.
+	storedPodUID := member.Status.PodUID
 
 	if !member.DeletionTimestamp.IsZero() {
 		return r.handleDeletion(ctx, member)
@@ -179,7 +184,7 @@ func (r *EtcdMemberReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	return r.updateStatus(ctx, member)
+	return r.updateStatus(ctx, member, storedPodUID)
 }
 
 // memoryMemberPodLost reports whether the Pod we previously recorded a
@@ -456,7 +461,7 @@ func (r *EtcdMemberReconciler) ensurePod(ctx context.Context, member *lll.EtcdMe
 	err := r.Get(ctx, types.NamespacedName{Namespace: member.Namespace, Name: member.Name}, pod)
 	if err == nil {
 		if !podOwnedBy(pod, member) {
-			return fmt.Errorf("Pod %q is owned by a different EtcdMember; awaiting GC before reuse", member.Name)
+			return fmt.Errorf("pod %q is owned by a different EtcdMember; awaiting GC before reuse", member.Name)
 		}
 		member.Status.PodName = pod.Name
 		member.Status.PodUID = string(pod.UID)
@@ -835,6 +840,7 @@ func (r *EtcdMemberReconciler) buildPod(member *lll.EtcdMember, clusterFormed bo
 			Subdomain:                 memberServiceName(member),
 			Affinity:                  member.Spec.Affinity,
 			TopologySpreadConstraints: member.Spec.TopologySpreadConstraints,
+			PriorityClassName:         member.Spec.PriorityClassName,
 			ImagePullSecrets:          member.Spec.ImagePullSecrets,
 			InitContainers:            initContainers,
 			// etcd and the restore agent never call the Kubernetes API, so
@@ -1093,7 +1099,10 @@ func (r *EtcdMemberReconciler) clusterHasQuorumWithout(ctx context.Context, memb
 
 // ── Status ───────────────────────────────────────────────────────────────
 
-func (r *EtcdMemberReconciler) updateStatus(ctx context.Context, member *lll.EtcdMember) (ctrl.Result, error) {
+// storedPodUID is member.Status.PodUID as it was persisted before this
+// reconcile touched the object (see Reconcile); a mismatch with the live Pod's
+// UID means the Pod was recreated since the last pass.
+func (r *EtcdMemberReconciler) updateStatus(ctx context.Context, member *lll.EtcdMember, storedPodUID string) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 	pod := &corev1.Pod{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: member.Namespace, Name: member.Name}, pod); err != nil {
@@ -1206,7 +1215,16 @@ func (r *EtcdMemberReconciler) updateStatus(ctx context.Context, member *lll.Etc
 	// actually runs diverges from the intended spec.version. Observation is
 	// best-effort (observeVersion never errors); the drift condition is
 	// informational — the operator does not act on it.
-	if ready {
+	//
+	// The observation is a dial plus a Status RPC against this member, and
+	// updateStatus runs every 30s for every Ready member, so on a parent
+	// cluster with hundreds of members it was the single largest source of
+	// etcd traffic from the operator — for a value that only changes when the
+	// Pod is replaced. Dial only when the answer can have changed: nothing
+	// recorded yet, the Pod is not the one the recorded value came from, or
+	// the recorded value still disagrees with spec.version (an upgrade or a
+	// drift in progress, where the next observation may resolve it).
+	if ready && versionObservationDue(member, storedPodUID) {
 		if v := r.observeVersion(ctx, member); v != member.Status.Version {
 			member.Status.Version = v
 			changed = true
@@ -1365,6 +1383,16 @@ func (r *EtcdMemberReconciler) etcdDialConfig(ctx context.Context, member *lll.E
 		return nil, "", "", err
 	}
 	return tlsCfg, user, pass, nil
+}
+
+// versionObservationDue reports whether observeVersion should dial this
+// reconcile. member.Status.PodUID already holds the live Pod's UID here (set
+// by ensurePod / updateStatus), so the comparison is against the value that
+// was persisted before this pass started.
+func versionObservationDue(member *lll.EtcdMember, storedPodUID string) bool {
+	return member.Status.Version == "" ||
+		member.Status.Version != member.Spec.Version ||
+		storedPodUID != member.Status.PodUID
 }
 
 // observeVersion reads the etcd version this member is actually running from

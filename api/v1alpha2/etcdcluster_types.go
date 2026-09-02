@@ -741,6 +741,18 @@ type EtcdClusterSpec struct {
 	// +optional
 	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
 
+	// PriorityClassName is passed straight through to each member Pod's
+	// spec.priorityClassName. On a parent cluster that hosts child control
+	// planes, an etcd member is the child's control plane: without a
+	// priority class it competes for a node under pressure on equal terms
+	// with any workload Pod and is evicted just as readily. Point this at a
+	// PriorityClass the parent reserves for tenant control planes.
+	//
+	// Updates take effect on newly-created members (scale-up, replacement);
+	// the operator does not roll existing Pods to apply a change in place.
+	// +optional
+	PriorityClassName string `json:"priorityClassName,omitempty"`
+
 	// Options carries etcd server tuning flags (backend quota,
 	// auto-compaction, raft snapshot count) passed to each member's
 	// command line. A closed typed set — see EtcdOptions for why there
@@ -814,6 +826,11 @@ type ObservedClusterSpec struct {
 	// for member Pods. Latched with the rest of the target spec.
 	// +optional
 	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
+
+	// PriorityClassName is the locked target priority class for member
+	// Pods. Latched with the rest of the target spec.
+	// +optional
+	PriorityClassName string `json:"priorityClassName,omitempty"`
 
 	// AdditionalMetadata is the locked target extra labels/annotations
 	// stamped onto objects created for this cluster. Latched with the rest
@@ -913,6 +930,16 @@ type EtcdClusterStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
+// The operator names the cluster's headless Service after metadata.name and
+// its client Service "<name>-client". A Service name is a DNS-1035 label: it
+// must start with a letter, so a cluster whose name starts with a digit (a
+// tenant namespace like "36carcn" in kube-in-kube) is accepted by the CRD but
+// wedges the controller in an un-fixable "failed to ensure services" loop.
+// Reject the name at admission instead, where the message reaches the user.
+// The 56-char cap keeps "<name>-client" within the 63-char label limit.
+// (generateName leaves metadata.name empty at admission time; allow that so
+// the server-assigned name is validated on the actual create.)
+// +kubebuilder:validation:XValidation:rule="self.metadata.name.size() == 0 || (self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$') && self.metadata.name.size() <= 56)",message="metadata.name must be a DNS-1035 label of at most 56 characters: start with a lower-case letter, then lower-case letters, digits or '-'. The operator derives the cluster's Service names from it, and a Service name cannot start with a digit."
 // +kubebuilder:resource:shortName=etcdc,categories=etcd
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status

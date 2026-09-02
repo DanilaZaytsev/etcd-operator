@@ -146,7 +146,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if changed {
 			if err := r.Status().Update(ctx, cluster); err != nil {
 				if errors.IsConflict(err) {
-					return ctrl.Result{Requeue: true}, nil
+					return ctrl.Result{RequeueAfter: requeueShortly}, nil
 				}
 				return ctrl.Result{}, err
 			}
@@ -201,7 +201,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if err := r.Status().Update(ctx, cluster); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: requeueShortly}, nil
 	}
 
 	// ── Subsequent spec-change handling ───────────────────────────────
@@ -218,7 +218,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	complete := reconciliationComplete(cluster, running)
 
 	if !complete && deadlineExpired(cluster, now) {
-		return r.handleDeadlineExceeded(ctx, cluster, now)
+		return r.handleDeadlineExceeded(ctx, cluster, active, now)
 	}
 
 	if complete && !specEqualsObserved(cluster) {
@@ -231,7 +231,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if err := r.Status().Update(ctx, cluster); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: requeueShortly}, nil
 	}
 
 	// Every path from here on can return early while the cluster is still
@@ -469,6 +469,7 @@ func (r *EtcdClusterReconciler) bootstrap(
 				AdditionalMetadata:        cluster.Status.Observed.AdditionalMetadata,
 				Affinity:                  storagePoolAffinity(cluster.Status.Observed.Storage, seedPool, cluster.Status.Observed.Affinity),
 				TopologySpreadConstraints: cluster.Status.Observed.TopologySpreadConstraints,
+				PriorityClassName:         cluster.Status.Observed.PriorityClassName,
 				Options:                   cluster.Status.Observed.Options,
 				ImagePullSecrets:          cluster.Status.Observed.ImagePullSecrets,
 				Bootstrap:                 true,
@@ -582,7 +583,7 @@ func (r *EtcdClusterReconciler) tryDiscoverCluster(
 			fmt.Sprintf("seed member %q has no Pod yet", seed.Name)) {
 			if upErr := r.Status().Update(ctx, cluster); upErr != nil {
 				if errors.IsConflict(upErr) {
-					return ctrl.Result{Requeue: true}, nil
+					return ctrl.Result{RequeueAfter: requeueShortly}, nil
 				}
 				return ctrl.Result{}, upErr
 			}
@@ -685,7 +686,7 @@ func (r *EtcdClusterReconciler) surfaceDiscoveryError(
 		if changed {
 			if upErr := r.Status().Update(ctx, cluster); upErr != nil {
 				if errors.IsConflict(upErr) {
-					return ctrl.Result{Requeue: true}, nil
+					return ctrl.Result{RequeueAfter: requeueShortly}, nil
 				}
 				return ctrl.Result{}, upErr
 			}
@@ -712,7 +713,7 @@ func (r *EtcdClusterReconciler) surfaceDiscoveryError(
 		if changed {
 			if upErr := r.Status().Update(ctx, cluster); upErr != nil {
 				if errors.IsConflict(upErr) {
-					return ctrl.Result{Requeue: true}, nil
+					return ctrl.Result{RequeueAfter: requeueShortly}, nil
 				}
 				return ctrl.Result{}, upErr
 			}
@@ -724,7 +725,7 @@ func (r *EtcdClusterReconciler) surfaceDiscoveryError(
 	if setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "ClusterUnreachable", msg) {
 		if upErr := r.Status().Update(ctx, cluster); upErr != nil {
 			if errors.IsConflict(upErr) {
-				return ctrl.Result{Requeue: true}, nil
+				return ctrl.Result{RequeueAfter: requeueShortly}, nil
 			}
 			return ctrl.Result{}, upErr
 		}
@@ -884,6 +885,7 @@ func (r *EtcdClusterReconciler) scaleUp(
 			AdditionalMetadata:        cluster.Status.Observed.AdditionalMetadata,
 			Affinity:                  storagePoolAffinity(cluster.Status.Observed.Storage, newPool, cluster.Status.Observed.Affinity),
 			TopologySpreadConstraints: cluster.Status.Observed.TopologySpreadConstraints,
+			PriorityClassName:         cluster.Status.Observed.PriorityClassName,
 			Options:                   cluster.Status.Observed.Options,
 			ImagePullSecrets:          cluster.Status.Observed.ImagePullSecrets,
 			Bootstrap:                 false,
@@ -1016,7 +1018,7 @@ func tryPromoteLearner(
 			return &ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		log.Info("promoted learner", "learner_id", fmt.Sprintf("%016x", m.ID))
-		return &ctrl.Result{Requeue: true}, nil
+		return &ctrl.Result{RequeueAfter: requeueShortly}, nil
 	}
 	return nil, nil
 }
@@ -1257,17 +1259,17 @@ func (r *EtcdClusterReconciler) reconcileAuth(ctx context.Context, cluster *lll.
 // reconcile dials with credentials. A conflicting status write is retried.
 func (r *EtcdClusterReconciler) latchAuthEnabled(ctx context.Context, cluster *lll.EtcdCluster) (*ctrl.Result, error) {
 	if cluster.Status.AuthEnabled {
-		return &ctrl.Result{Requeue: true}, nil
+		return &ctrl.Result{RequeueAfter: requeueShortly}, nil
 	}
 	orig := cluster.DeepCopy()
 	cluster.Status.AuthEnabled = true
 	if err := r.Status().Patch(ctx, cluster, client.MergeFrom(orig)); err != nil {
 		if errors.IsConflict(err) {
-			return &ctrl.Result{Requeue: true}, nil
+			return &ctrl.Result{RequeueAfter: requeueShortly}, nil
 		}
 		return nil, err
 	}
-	return &ctrl.Result{Requeue: true}, nil
+	return &ctrl.Result{RequeueAfter: requeueShortly}, nil
 }
 
 // etcd returns these as gRPC status errors; clientv3 surfaces the server-side
@@ -2061,25 +2063,77 @@ func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 func (r *EtcdClusterReconciler) handleDeadlineExceeded(
 	ctx context.Context,
 	cluster *lll.EtcdCluster,
+	members []lll.EtcdMember,
 	now metav1.Time,
 ) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
 	if cluster.Status.ClusterID == "" {
-		// Bootstrap terminal state. Idempotent: only persist if conditions
-		// actually changed; once parked, return ctrl.Result{} and let the
-		// watch wake us up if the user deletes (or edits, which won't
-		// recover but will at least re-trigger reconcile).
+		// The deadline expiring before the cluster formed does not mean the
+		// cluster CANNOT form. It routinely means something outside the
+		// cluster was slow: a StorageClass that binds late, an exhausted
+		// cloud disk quota, an image pull from a cold registry. If the seed
+		// is up and serving, discovery is one MemberList away from latching
+		// ClusterID, and tryDiscoverCluster does exactly that on the next
+		// pass — so extend the window instead of parking.
+		//
+		// This is safe because bootstrap uses a SINGLE seed whose
+		// --initial-cluster names only itself (see bootstrap()). There is no
+		// second bootstrapping member whose flag could disagree, so there is
+		// no consensus to corrupt by trying again. The unconditional
+		// terminal state this replaces predates single-seed bootstrap.
+		//
+		// A seed that never becomes Ready still parks below: readiness is
+		// the evidence that retrying can achieve anything, so a genuinely
+		// unformable cluster cannot extend its deadline forever.
+		if seedIsServing(members) {
+			log.Info("bootstrap deadline exceeded but the seed is serving; extending the window and retrying discovery",
+				"observed", cluster.Status.Observed)
+			setProgressDeadline(cluster, now)
+			setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionTrue, "BootstrapRetrying",
+				"bootstrap deadline exceeded while the seed was still coming up; the seed is serving now, so discovery is being retried")
+			if err := r.Status().Update(ctx, cluster); err != nil {
+				if errors.IsConflict(err) {
+					return ctrl.Result{RequeueAfter: requeueShortly}, nil
+				}
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: requeueShortly}, nil
+		}
+
+		// A spec edit is the user's intervention here too. Re-adopting a
+		// target before the cluster has formed is safe for the same
+		// single-seed reason, and it spares the user a delete-and-recreate
+		// (which loses the namespace's PVCs) for what may be a one-character
+		// fix, such as a storageClassName that does not exist.
+		if !specEqualsObserved(cluster) {
+			log.Info("bootstrap deadline exceeded but spec was updated; retrying bootstrap with the new target",
+				"observed", cluster.Status.Observed, "spec", cluster.Spec)
+			snapshotSpecIntoObserved(cluster)
+			setProgressDeadline(cluster, now)
+			setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionTrue, "RetryAfterDeadline",
+				"adopting updated spec after the bootstrap deadline")
+			if err := r.Status().Update(ctx, cluster); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: requeueShortly}, nil
+		}
+
+		// Bootstrap terminal state: the seed is not serving and the spec has
+		// not changed, so nothing this controller can do moves the cluster
+		// forward. Idempotent: only persist if conditions actually changed;
+		// once parked, return ctrl.Result{} and let a watch event (a seed
+		// that finally becomes Ready, or a spec edit) wake us.
 		changed := setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionFalse, "BootstrapFailed",
-			"bootstrap deadline exceeded; delete the cluster and recreate to recover")
+			"bootstrap deadline exceeded and the seed is not serving; fix the seed (see its EtcdMember and Pod), edit the spec to retry, or delete the cluster")
 		changed = setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "BootstrapFailed",
 			fmt.Sprintf("could not bootstrap %d-member cluster within deadline", cluster.Status.Observed.Replicas)) || changed
 		if changed {
-			log.Error(nil, "bootstrap deadline exceeded; delete and recreate to recover",
+			log.Error(nil, "bootstrap deadline exceeded and the seed is not serving",
 				"observed", cluster.Status.Observed)
 			if err := r.Status().Update(ctx, cluster); err != nil {
 				if errors.IsConflict(err) {
-					return ctrl.Result{Requeue: true}, nil
+					return ctrl.Result{RequeueAfter: requeueShortly}, nil
 				}
 				return ctrl.Result{}, err
 			}
@@ -2099,7 +2153,7 @@ func (r *EtcdClusterReconciler) handleDeadlineExceeded(
 				"observed", cluster.Status.Observed)
 			if err := r.Status().Update(ctx, cluster); err != nil {
 				if errors.IsConflict(err) {
-					return ctrl.Result{Requeue: true}, nil
+					return ctrl.Result{RequeueAfter: requeueShortly}, nil
 				}
 				return ctrl.Result{}, err
 			}
@@ -2118,7 +2172,31 @@ func (r *EtcdClusterReconciler) handleDeadlineExceeded(
 	if err := r.Status().Update(ctx, cluster); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{RequeueAfter: requeueShortly}, nil
+}
+
+// seedIsServing reports whether the bootstrap seed exists, has a Pod, and
+// that Pod is Ready. Member readiness is driven by the Pod's readiness probe,
+// which hits etcd's own /health — so a Ready seed is an etcd that will answer
+// the MemberList discovery makes. It is the evidence that retrying bootstrap
+// can accomplish something, as opposed to spinning on a seed that will never
+// come up.
+func seedIsServing(members []lll.EtcdMember) bool {
+	for i := range members {
+		if !members[i].Spec.Bootstrap {
+			continue
+		}
+		if members[i].Status.PodName == "" {
+			return false
+		}
+		for _, c := range members[i].Status.Conditions {
+			if c.Type == lll.MemberReady && c.Status == metav1.ConditionTrue {
+				return true
+			}
+		}
+		return false
+	}
+	return false
 }
 
 // warnUnevenStoragePools emits an advisory Event when the target replica
@@ -2151,6 +2229,7 @@ func snapshotSpecIntoObserved(cluster *lll.EtcdCluster) {
 		Resources:                 cluster.Spec.Resources,
 		Affinity:                  cluster.Spec.Affinity,
 		TopologySpreadConstraints: cluster.Spec.TopologySpreadConstraints,
+		PriorityClassName:         cluster.Spec.PriorityClassName,
 		AdditionalMetadata:        cluster.Spec.AdditionalMetadata,
 		Options:                   cluster.Spec.Options,
 		ImagePullSecrets:          cluster.Spec.ImagePullSecrets,
@@ -2179,6 +2258,7 @@ func specEqualsObserved(cluster *lll.EtcdCluster) bool {
 		equality.Semantic.DeepEqual(o.Resources, cluster.Spec.Resources) &&
 		equality.Semantic.DeepEqual(o.Affinity, cluster.Spec.Affinity) &&
 		equality.Semantic.DeepEqual(o.TopologySpreadConstraints, cluster.Spec.TopologySpreadConstraints) &&
+		o.PriorityClassName == cluster.Spec.PriorityClassName &&
 		equality.Semantic.DeepEqual(o.AdditionalMetadata, cluster.Spec.AdditionalMetadata) &&
 		equality.Semantic.DeepEqual(o.Options, cluster.Spec.Options) &&
 		equality.Semantic.DeepEqual(o.ImagePullSecrets, cluster.Spec.ImagePullSecrets)

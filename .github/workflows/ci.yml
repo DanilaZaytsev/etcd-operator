@@ -103,14 +103,12 @@ jobs:
         # means this operator is affected rather than that some dependency
         # published an advisory. That is what makes it cheap enough to gate on.
         #
-        # Not gating yet, deliberately. The module-level findings this check
-        # first surfaced are fixed (grpc, x/net, x/text were bumped in the same
-        # change); what remains is the Go standard library shipped by the
-        # toolchain pinned in go.mod. Flip continue-on-error off in the same
-        # commit that bumps `toolchain` in go.mod and the golang base image in
-        # the Dockerfile to a patched release — a gate that is red on arrival
-        # teaches everyone to ignore it.
-        continue-on-error: true
+        # Gating. The module-level findings this check first surfaced were
+        # fixed by bumping grpc, x/net and x/text; the standard-library ones
+        # went with the toolchain bump to go1.26.8 (go.mod `toolchain` and the
+        # Dockerfile base image move together — the binary in the image is
+        # what actually ships). A fresh finding here means this operator calls
+        # a vulnerable symbol: bump the module or the toolchain, do not mute.
         uses: golang/govulncheck-action@v1
         with:
           go-version-file: go.mod

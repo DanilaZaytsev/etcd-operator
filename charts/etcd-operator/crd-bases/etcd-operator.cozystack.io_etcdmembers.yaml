@@ -1176,6 +1176,12 @@ spec:
                     to be set alongside it: etcd''s default election timeout is 1000ms,
                     so any heartbeat above 200ms would silently break the 5x ratio'
                   rule: '!has(self.heartbeatIntervalMilliseconds) || has(self.electionTimeoutMilliseconds)'
+              priorityClassName:
+                description: |-
+                  PriorityClassName mirrors EtcdCluster.spec.priorityClassName at the
+                  time this member was created. Passed straight to the Pod's
+                  spec.priorityClassName at build time.
+                type: string
               replicas:
                 default: 1
                 description: |-

@@ -93,11 +93,11 @@ func (r *EtcdSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		snapshot.Status.Phase = lll.EtcdSnapshotStatusPhasePending
 		if err := r.Status().Update(ctx, snapshot); err != nil {
 			if apierrors.IsConflict(err) {
-				return ctrl.Result{Requeue: true}, nil
+				return ctrl.Result{RequeueAfter: requeueShortly}, nil
 			}
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: requeueShortly}, nil
 	}
 
 	// The snapshot Job runs the operator's own image. Without it the Job would
@@ -295,7 +295,7 @@ func (r *EtcdSnapshotReconciler) setPhase(ctx context.Context, snapshot *lll.Etc
 	})
 	if err := r.Status().Update(ctx, snapshot); err != nil {
 		if apierrors.IsConflict(err) {
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{RequeueAfter: requeueShortly}, nil
 		}
 		return ctrl.Result{}, err
 	}

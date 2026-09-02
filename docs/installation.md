@@ -11,7 +11,7 @@
 | Kubernetes | Рекомендуется 1.29+: проверки CEL в CRD вышли в GA в 1.29, а расширение CEL `quantity()` (его используют два правила проверки оператора) добавлено в 1.28. На 1.28 *может* работать на практике, потому что гейт CEL был включён как бета с 1.25, но CI это не покрывает. |
 | `StorageClass` по умолчанию | PVC каждого члена берёт `StorageClass` по умолчанию для неймспейса. Переопределяется на кластер через `spec.storage.storageClassName` (строка с именем конкретного `StorageClass` либо `""`, чтобы полностью отключить динамический провижининг). Неизменяем после создания — PVC в Kubernetes не позволяют поменять StorageClass на месте. |
 | Go (только для сборки из исходников) | 1.25+, соответствует директиве `toolchain` в `go.mod`. |
-| Docker / buildx (только для сборки из исходников) | Для получения образа оператора. Dockerfile использует `golang:1.25.10` для сборки и `gcr.io/distroless/static:nonroot` для запуска. |
+| Docker / buildx (только для сборки из исходников) | Для получения образа оператора. Dockerfile использует `golang:1.26.8` для сборки и `gcr.io/distroless/static:nonroot` для запуска. |
 
 Со стороны нагрузки: каждый под etcd работает под UID 65532 с `runAsNonRoot=true`, `allowPrivilegeEscalation=false`, сброшенными capabilities и `seccompProfile=RuntimeDefault`. Поды соответствуют профилю PodSecurity `restricted`. Если в вашем кластере действует более строгая политика, посмотрите точный контекст безопасности, который выпускает оператор, в `buildPod` из `controllers/etcdmember_controller.go`, и скорректируйте её.
 
@@ -78,6 +78,7 @@ CRD **рендерятся шаблонами** в состав релиза (а
 | `manager.watchNamespaces` | `[]` | Неймспейсы, за которыми следит менеджер. Пусто — за всеми (см. [RBAC](#rbac)). |
 | `imagePullSecrets` | `[]` | Секреты для загрузки **собственного образа оператора** (зеркало приватного реестра). |
 | `manager.clusterDomain` | `""` (автоопределение) | DNS-суффикс кластера (`--cluster-domain`). Определяется автоматически по `/etc/resolv.conf` пода оператора; задайте явно для подов с `hostNetwork` или `dnsPolicy: None`, а также для любого суффикса, отличного от `cluster.local`. Значение попадает в SAN сертификатов cert-manager, которые выпускает оператор, поэтому неверный суффикс ломает peer TLS. |
+| `manager.logging.development` / `manager.logging.level` | `false` / `info` | Режим и уровень логов менеджера (`--zap-devel`, `--zap-log-level`). Сам бинарь по умолчанию логирует в development-режиме со stacktrace на каждый error; чарт переключает на JSON и уровень `info`. Включайте `development: true` только на время отладки. |
 | `manager.maxConcurrentReconciles` | `1` | Сколько `EtcdCluster` и `EtcdMember` обрабатываются одновременно. Поднимите на родительском кластере со множеством кластеров: почти каждое reconcile делает RPC к etcd с dial timeout, поэтому при 1 один недоступный кластер задерживает за собой все остальные. |
 | `manager.seccompProfile` | `{type: RuntimeDefault}` | Профиль seccomp для пода оператора, требуется профилем PodSecurity `restricted`. Поставьте `null`, чтобы убрать поле (`{}` его **не** уберёт — Helm сливает словари). |
 | `priorityClassName` | `system-cluster-critical` | Не даёт оператору выселяться одним из первых при давлении на ноду. `""` оставляет обычный приоритет. |
@@ -399,7 +400,7 @@ EKU серверного сертификата **обязан включать 
 
 | Компонент | Версия |
 |---|---|
-| Go | 1.25.10 |
+| Go | 1.26.8 |
 | controller-runtime | v0.21 |
 | k8s.io/api, k8s.io/client-go | v0.33 |
 | controller-gen | v0.18.0 |

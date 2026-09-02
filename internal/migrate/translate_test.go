@@ -85,6 +85,7 @@ func TestTranslateCluster_KitchenSink(t *testing.T) {
 			Spec: corev1.PodSpec{
 				Affinity:                  aff,
 				TopologySpreadConstraints: tsc,
+				PriorityClassName:         "tenant-control-plane",
 				NodeSelector:              map[string]string{"disk": "ssd"},
 				Containers: []corev1.Container{
 					{Name: "etcd", Image: "quay.io/coreos/etcd:v3.5.21", Resources: res,
@@ -144,6 +145,9 @@ func TestTranslateCluster_KitchenSink(t *testing.T) {
 	}
 	if !equality.Semantic.DeepEqual(out.Spec.TopologySpreadConstraints, tsc) {
 		t.Errorf("topologySpreadConstraints not mapped: %+v", out.Spec.TopologySpreadConstraints)
+	}
+	if out.Spec.PriorityClassName != "tenant-control-plane" {
+		t.Errorf("priorityClassName not mapped: %q", out.Spec.PriorityClassName)
 	}
 	if !equality.Semantic.DeepEqual(out.Spec.Resources, res) {
 		t.Errorf("resources not mapped: %+v", out.Spec.Resources)

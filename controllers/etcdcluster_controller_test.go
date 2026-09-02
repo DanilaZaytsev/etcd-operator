@@ -54,7 +54,7 @@ func reconcileUntilStable(t *testing.T, r *EtcdClusterReconciler, c client.Clien
 			t.Fatalf("Reconcile iter %d: %v", i, err)
 		}
 		last = res
-		if !res.Requeue && res.RequeueAfter == 0 {
+		if res.RequeueAfter == 0 {
 			return last
 		}
 	}
@@ -235,10 +235,15 @@ func TestObservedSpec_LocksMidFlight(t *testing.T) {
 // the cluster from ever forming. Recovery is delete-and-recreate.
 func TestDeadlineExceeded_BootstrapTerminal(t *testing.T) {
 	ctx := context.Background()
+	// No seed exists to serve and the spec matches observed, so nothing the
+	// controller can do moves this cluster forward — the one case that is
+	// still terminal. (A serving seed, or an edited spec, now recovers:
+	// see TestDeadlineExceeded_BootstrapRetriesWhileSeedIsServing and
+	// TestDeadlineExceeded_BootstrapAdoptsEditedSpec.)
 	cluster := &lll.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
 		Spec: lll.EtcdClusterSpec{
-			Replicas: ptrInt32(5), // user already tried to "fix"
+			Replicas: ptrInt32(3),
 			Version:  "3.5.17",
 			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
@@ -1741,7 +1746,7 @@ func TestDeadlineExceeded_NoChurnWhenSteady(t *testing.T) {
 			},
 			ProgressDeadline: &past,
 			Conditions: []metav1.Condition{
-				{Type: lll.ClusterProgressing, Status: metav1.ConditionFalse, Reason: "BootstrapFailed", Message: "bootstrap deadline exceeded; delete the cluster and recreate to recover", LastTransitionTime: now},
+				{Type: lll.ClusterProgressing, Status: metav1.ConditionFalse, Reason: "BootstrapFailed", Message: "bootstrap deadline exceeded and the seed is not serving; fix the seed (see its EtcdMember and Pod), edit the spec to retry, or delete the cluster", LastTransitionTime: now},
 				{Type: lll.ClusterAvailable, Status: metav1.ConditionFalse, Reason: "BootstrapFailed", Message: "could not bootstrap 3-member cluster within deadline", LastTransitionTime: now},
 			},
 		},
@@ -1754,7 +1759,7 @@ func TestDeadlineExceeded_NoChurnWhenSteady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != 0 || res.Requeue {
+	if res.RequeueAfter != 0 {
 		t.Fatalf("terminal state must return no requeue; got %+v", res)
 	}
 	rvAfter := mustGet(t, c, "test", "ns", &lll.EtcdCluster{}).ResourceVersion
@@ -2938,6 +2943,7 @@ func TestBootstrap_PropagatesSchedulingAndMetadataToSeed(t *testing.T) {
 			Storage:                   lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			Affinity:                  aff,
 			TopologySpreadConstraints: tsc,
+			PriorityClassName:         "tenant-control-plane",
 			AdditionalMetadata: &lll.AdditionalMetadata{
 				Labels:      map[string]string{"cozystack.io/tenant": "foo"},
 				Annotations: map[string]string{"example.com/note": "bar"},
@@ -2959,6 +2965,9 @@ func TestBootstrap_PropagatesSchedulingAndMetadataToSeed(t *testing.T) {
 	if !equality.Semantic.DeepEqual(got.Status.Observed.TopologySpreadConstraints, tsc) {
 		t.Errorf("Observed.TopologySpreadConstraints = %+v; want %+v", got.Status.Observed.TopologySpreadConstraints, tsc)
 	}
+	if got.Status.Observed.PriorityClassName != "tenant-control-plane" {
+		t.Errorf("Observed.PriorityClassName = %q; want tenant-control-plane", got.Status.Observed.PriorityClassName)
+	}
 	if got.Status.Observed.AdditionalMetadata == nil ||
 		got.Status.Observed.AdditionalMetadata.Labels["cozystack.io/tenant"] != "foo" {
 		t.Errorf("Observed.AdditionalMetadata not latched: %+v", got.Status.Observed.AdditionalMetadata)
@@ -2977,6 +2986,9 @@ func TestBootstrap_PropagatesSchedulingAndMetadataToSeed(t *testing.T) {
 	}
 	if !equality.Semantic.DeepEqual(seed.Spec.TopologySpreadConstraints, tsc) {
 		t.Errorf("seed Spec.TopologySpreadConstraints = %+v; want %+v", seed.Spec.TopologySpreadConstraints, tsc)
+	}
+	if seed.Spec.PriorityClassName != "tenant-control-plane" {
+		t.Errorf("seed Spec.PriorityClassName = %q; want tenant-control-plane", seed.Spec.PriorityClassName)
 	}
 	if seed.Spec.AdditionalMetadata == nil || seed.Spec.AdditionalMetadata.Labels["cozystack.io/tenant"] != "foo" {
 		t.Errorf("seed Spec.AdditionalMetadata not propagated: %+v", seed.Spec.AdditionalMetadata)
@@ -4011,4 +4023,150 @@ func TestUpdateStatus_ObservedGenerationLagsUntilPassCompletes(t *testing.T) {
 	if fresh.Status.ObservedGeneration != 8 {
 		t.Fatalf("after the second pass ObservedGeneration = %d, want 8", fresh.Status.ObservedGeneration)
 	}
+}
+
+// A bootstrap deadline that expires while the seed is still coming up must not
+// be terminal. Found on a real 8-node cluster: a cloud disk quota held every
+// PVC Pending past the deadline, so clusters whose seed later came up healthy
+// were parked in BootstrapFailed forever, one MemberList away from being
+// latched. Single-seed bootstrap has no cross-member consensus to corrupt, so
+// retrying is safe.
+func TestDeadlineExceeded_BootstrapRetriesWhileSeedIsServing(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(3), Version: "3.5.17",
+			Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "tok",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3, Version: "3.5.17",
+				Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
+			},
+		},
+	}
+	// A seed whose Pod is up and Ready.
+	seed := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-seed", Namespace: "ns", Labels: memberLabels("test", "test-seed")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Bootstrap: true},
+		Status: lll.EtcdMemberStatus{
+			PodName:    "test-seed",
+			Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: metav1.Now()}},
+		},
+	}
+	c, _ := newTestClient(t, cluster, seed)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef))}
+
+	now := metav1.Now()
+	res, err := r.handleDeadlineExceeded(ctx, cluster, []lll.EtcdMember{*seed}, now)
+	if err != nil {
+		t.Fatalf("handleDeadlineExceeded: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatalf("a serving seed must be retried, got no requeue: %+v", res)
+	}
+	got := mustGet(t, c, "test", "ns", &lll.EtcdCluster{})
+	prog := findClusterCondition(got, lll.ClusterProgressing)
+	if prog == nil || prog.Status != metav1.ConditionTrue || prog.Reason != "BootstrapRetrying" {
+		t.Fatalf("want Progressing=True/BootstrapRetrying, got %+v", prog)
+	}
+	if got.Status.ProgressDeadline == nil {
+		t.Fatalf("the retry must arm a fresh progress deadline")
+	}
+}
+
+// The escape hatch must stay closed for a seed that never comes up, or a
+// genuinely unformable cluster would extend its deadline forever and never
+// surface a terminal condition.
+func TestDeadlineExceeded_BootstrapParksWhenSeedIsNotServing(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(3), Version: "3.5.17",
+			Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "tok",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3, Version: "3.5.17",
+				Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
+			},
+		},
+	}
+	seed := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-seed", Namespace: "ns", Labels: memberLabels("test", "test-seed")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Bootstrap: true},
+		Status: lll.EtcdMemberStatus{
+			PodName:    "test-seed",
+			Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionFalse, Reason: "PodNotReady", LastTransitionTime: metav1.Now()}},
+		},
+	}
+	c, _ := newTestClient(t, cluster, seed)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef))}
+
+	res, err := r.handleDeadlineExceeded(ctx, cluster, []lll.EtcdMember{*seed}, metav1.Now())
+	if err != nil {
+		t.Fatalf("handleDeadlineExceeded: %v", err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Fatalf("a non-serving seed must park, got requeue: %+v", res)
+	}
+	got := mustGet(t, c, "test", "ns", &lll.EtcdCluster{})
+	prog := findClusterCondition(got, lll.ClusterProgressing)
+	if prog == nil || prog.Reason != "BootstrapFailed" {
+		t.Fatalf("want Progressing BootstrapFailed, got %+v", prog)
+	}
+}
+
+// A spec edit is the user's intervention before the cluster has formed too:
+// the old code told the user to delete and recreate, which throws away the
+// namespace's PVCs over what is often a one-character fix.
+func TestDeadlineExceeded_BootstrapAdoptsEditedSpec(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(1), // edited away from observed
+			Version:  "3.5.17",
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "tok",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3, Version: "3.5.17",
+				Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
+			},
+		},
+	}
+	seed := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-seed", Namespace: "ns", Labels: memberLabels("test", "test-seed")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Bootstrap: true},
+		Status:     lll.EtcdMemberStatus{PodName: ""},
+	}
+	c, _ := newTestClient(t, cluster, seed)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef))}
+
+	res, err := r.handleDeadlineExceeded(ctx, cluster, []lll.EtcdMember{*seed}, metav1.Now())
+	if err != nil {
+		t.Fatalf("handleDeadlineExceeded: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatalf("an edited spec must be retried, got no requeue: %+v", res)
+	}
+	got := mustGet(t, c, "test", "ns", &lll.EtcdCluster{})
+	if got.Status.Observed.Replicas != 1 {
+		t.Fatalf("the edited spec must be adopted into observed; got replicas=%d", got.Status.Observed.Replicas)
+	}
+}
+
+func findClusterCondition(cluster *lll.EtcdCluster, condType string) *metav1.Condition {
+	for i := range cluster.Status.Conditions {
+		if cluster.Status.Conditions[i].Type == condType {
+			return &cluster.Status.Conditions[i]
+		}
+	}
+	return nil
 }

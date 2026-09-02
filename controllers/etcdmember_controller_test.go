@@ -620,7 +620,7 @@ func TestUpdateStatus_NoMemberIDKeepsReadyFalse(t *testing.T) {
 		EtcdClientFactory: factoryReturning(fe),
 	}
 
-	if _, err := r.updateStatus(ctx, member); err != nil {
+	if _, err := r.updateStatus(ctx, member, member.Status.PodUID); err != nil {
 		t.Fatalf("updateStatus: %v", err)
 	}
 
@@ -673,7 +673,7 @@ func TestUpdateStatus_PopulatesMemberIDAndFlipsReady(t *testing.T) {
 		EtcdClientFactory: factoryReturning(fe),
 	}
 
-	if _, err := r.updateStatus(ctx, member); err != nil {
+	if _, err := r.updateStatus(ctx, member, member.Status.PodUID); err != nil {
 		t.Fatalf("updateStatus: %v", err)
 	}
 
@@ -726,7 +726,7 @@ func readyMemberWithFake(t *testing.T, specVersion, statusVersion string, status
 	fe.statusVersion = statusVersion
 	fe.statusErr = statusErr
 	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
-	if _, err := r.updateStatus(ctx, member); err != nil {
+	if _, err := r.updateStatus(ctx, member, member.Status.PodUID); err != nil {
 		t.Fatalf("updateStatus: %v", err)
 	}
 	return mustGet(t, c, "test-0", "ns", member)
@@ -817,7 +817,7 @@ func TestUpdateStatus_VersionDriftResolves(t *testing.T) {
 	fe := newFakeEtcd(0xdeadbeef)
 	fe.statusVersion = "3.6.4" // member has caught up to intent
 	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
-	if _, err := r.updateStatus(ctx, member); err != nil {
+	if _, err := r.updateStatus(ctx, member, member.Status.PodUID); err != nil {
 		t.Fatalf("updateStatus: %v", err)
 	}
 	member = mustGet(t, c, "test-0", "ns", member)
@@ -854,7 +854,7 @@ func TestUpdateStatus_VersionObservationErrorIsNonFatal(t *testing.T) {
 	fe := newFakeEtcd(0xdeadbeef)
 	fe.statusErr = errors.New("dial timeout")
 	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
-	if _, err := r.updateStatus(ctx, member); err != nil {
+	if _, err := r.updateStatus(ctx, member, member.Status.PodUID); err != nil {
 		t.Fatalf("updateStatus: %v", err)
 	}
 	member = mustGet(t, c, "test-0", "ns", member)
@@ -964,7 +964,7 @@ func TestUpdateStatus_ReplacesStuckMember(t *testing.T) {
 	clusterWithReady(t, c, "test", "ns", 2) // 2/3 ready → quorum without test-1
 
 	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
-	if _, err := r.updateStatus(ctx, member); err != nil {
+	if _, err := r.updateStatus(ctx, member, member.Status.PodUID); err != nil {
 		t.Fatalf("updateStatus: %v", err)
 	}
 
@@ -991,7 +991,7 @@ func TestUpdateStatus_ReplacesStuckMemoryMember(t *testing.T) {
 	clusterWithReady(t, c, "test", "ns", 2) // 2/3 ready → quorum without test-1
 
 	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
-	if _, err := r.updateStatus(ctx, member); err != nil {
+	if _, err := r.updateStatus(ctx, member, member.Status.PodUID); err != nil {
 		t.Fatalf("updateStatus: %v", err)
 	}
 
@@ -1018,7 +1018,7 @@ func TestUpdateStatus_KeepsStuckMemberWithoutQuorum(t *testing.T) {
 	clusterWithReady(t, c, "test", "ns", 1) // only 1/3 ready → no quorum
 
 	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
-	if _, err := r.updateStatus(ctx, member); err != nil {
+	if _, err := r.updateStatus(ctx, member, member.Status.PodUID); err != nil {
 		t.Fatalf("updateStatus: %v", err)
 	}
 
@@ -1047,7 +1047,7 @@ func TestUpdateStatus_ReplacesStuckSeedAfterBootstrap(t *testing.T) {
 	clusterWithReady(t, c, "test", "ns", 2)
 
 	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
-	if _, err := r.updateStatus(ctx, member); err != nil {
+	if _, err := r.updateStatus(ctx, member, member.Status.PodUID); err != nil {
 		t.Fatalf("updateStatus: %v", err)
 	}
 
@@ -1078,7 +1078,7 @@ func TestUpdateStatus_KeepsStuckSeedDuringBootstrap(t *testing.T) {
 	clusterWithReady(t, c, "test", "ns", 0)
 
 	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
-	if _, err := r.updateStatus(ctx, member); err != nil {
+	if _, err := r.updateStatus(ctx, member, member.Status.PodUID); err != nil {
 		t.Fatalf("updateStatus: %v", err)
 	}
 
@@ -1111,7 +1111,7 @@ func TestUpdateStatus_KeepsStuckSoleMember(t *testing.T) {
 	clusterWithReady(t, c, "test", "ns", 1) // stale-high: still counts test-0
 
 	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
-	if _, err := r.updateStatus(ctx, member); err != nil {
+	if _, err := r.updateStatus(ctx, member, member.Status.PodUID); err != nil {
 		t.Fatalf("updateStatus: %v", err)
 	}
 
@@ -1144,7 +1144,7 @@ func TestUpdateStatus_KeepsStuckMemberWhenStaleReadyCountIncludesIt(t *testing.T
 	clusterWithReady(t, c, "test", "ns", 2) // stale-high: still counts test-1
 
 	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
-	if _, err := r.updateStatus(ctx, member); err != nil {
+	if _, err := r.updateStatus(ctx, member, member.Status.PodUID); err != nil {
 		t.Fatalf("updateStatus: %v", err)
 	}
 
@@ -1245,7 +1245,7 @@ func TestUpdateStatus_PodNotReadyKeepsReadyFalse(t *testing.T) {
 		EtcdClientFactory: failingFactory(errors.New("must not be called")),
 	}
 
-	if _, err := r.updateStatus(ctx, member); err != nil {
+	if _, err := r.updateStatus(ctx, member, member.Status.PodUID); err != nil {
 		t.Fatalf("updateStatus: %v", err)
 	}
 
@@ -1343,6 +1343,7 @@ func TestBuildPod_AppliesSchedulingAndMetadata(t *testing.T) {
 			Version:                   "3.5.17",
 			Affinity:                  aff,
 			TopologySpreadConstraints: tsc,
+			PriorityClassName:         "tenant-control-plane",
 			AdditionalMetadata: &lll.AdditionalMetadata{
 				Labels: map[string]string{
 					"cozystack.io/tenant": "foo",
@@ -1359,6 +1360,9 @@ func TestBuildPod_AppliesSchedulingAndMetadata(t *testing.T) {
 	}
 	if !equality.Semantic.DeepEqual(pod.Spec.TopologySpreadConstraints, tsc) {
 		t.Errorf("pod topologySpreadConstraints = %+v, want %+v", pod.Spec.TopologySpreadConstraints, tsc)
+	}
+	if pod.Spec.PriorityClassName != "tenant-control-plane" {
+		t.Errorf("pod priorityClassName = %q, want tenant-control-plane", pod.Spec.PriorityClassName)
 	}
 	if got := pod.Labels["cozystack.io/tenant"]; got != "foo" {
 		t.Errorf("additional label not merged: cozystack.io/tenant = %q, want foo", got)
@@ -1743,7 +1747,7 @@ func TestUpdateStatus_NoChurnInSteadyState(t *testing.T) {
 	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
 
 	rvBefore := mustGet(t, c, "test-0", "ns", &lll.EtcdMember{}).ResourceVersion
-	if _, err := r.updateStatus(ctx, member); err != nil {
+	if _, err := r.updateStatus(ctx, member, member.Status.PodUID); err != nil {
 		t.Fatalf("updateStatus: %v", err)
 	}
 	rvAfter := mustGet(t, c, "test-0", "ns", &lll.EtcdMember{}).ResourceVersion
@@ -3249,5 +3253,34 @@ func TestEnsurePod_FormedClusterGivesSeedExistingState(t *testing.T) {
 	}
 	if state := podClusterState(t, pod); state != "existing" {
 		t.Fatalf("seed Pod re-created after the cluster formed must get --initial-cluster-state=existing, got %q", state)
+	}
+}
+
+// TestVersionObservationDue: the version dial is the operator's steadiest
+// source of etcd traffic, so it must fire only when the answer can have
+// changed — never on a settled member whose Pod is the one already observed.
+func TestVersionObservationDue(t *testing.T) {
+	mk := func(specV, statusV, podUID string) *lll.EtcdMember {
+		return &lll.EtcdMember{
+			Spec:   lll.EtcdMemberSpec{Version: specV},
+			Status: lll.EtcdMemberStatus{Version: statusV, PodUID: podUID},
+		}
+	}
+	cases := []struct {
+		name   string
+		member *lll.EtcdMember
+		stored string
+		want   bool
+	}{
+		{"settled member, same pod", mk("3.5.17", "3.5.17", "uid-1"), "uid-1", false},
+		{"nothing observed yet", mk("3.5.17", "", "uid-1"), "uid-1", true},
+		{"pod recreated", mk("3.5.17", "3.5.17", "uid-2"), "uid-1", true},
+		{"first pod ever", mk("3.5.17", "3.5.17", "uid-1"), "", true},
+		{"drift still open", mk("3.6.4", "3.5.17", "uid-1"), "uid-1", true},
+	}
+	for _, tc := range cases {
+		if got := versionObservationDue(tc.member, tc.stored); got != tc.want {
+			t.Errorf("%s: versionObservationDue = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

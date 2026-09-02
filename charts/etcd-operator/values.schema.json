@@ -236,6 +236,23 @@
           ],
           "description": "null omits the field; an empty object does NOT, because Helm merges maps rather than replacing them."
         },
+        "logging": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "development": {
+              "type": "boolean"
+            },
+            "level": {
+              "type": "string",
+              "enum": [
+                "debug",
+                "info",
+                "error"
+              ]
+            }
+          }
+        },
         "maxConcurrentReconciles": {
           "type": "integer",
           "minimum": 1
@@ -462,6 +479,9 @@
         },
         "topologySpreadConstraints": {
           "type": "array"
+        },
+        "priorityClassName": {
+          "type": "string"
         },
         "additionalMetadata": {
           "type": "object"
@@ -744,6 +764,9 @@
           },
           "topologySpreadConstraints": {
             "type": "array"
+          },
+          "priorityClassName": {
+            "type": "string"
           },
           "additionalMetadata": {
             "type": "object"

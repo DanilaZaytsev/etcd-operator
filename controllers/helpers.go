@@ -5,6 +5,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -750,6 +751,14 @@ func withStoragePoolLabel(l map[string]string, pool string) map[string]string {
 // one worker, and a negative value — which the flag parser cannot reject on its
 // own — is treated the same rather than being passed through to panic at
 // startup.
+// requeueShortly is the delay for "run again as soon as the write we just
+// made has landed": after a Status write that the next pass must observe, or
+// after an optimistic-lock conflict, where the cached object is stale and the
+// watch event carrying the fresh one is already on its way. It replaces the
+// deprecated Result.Requeue, whose rate-limiter-driven delay was never meant
+// for anything but error retries.
+const requeueShortly = time.Second
+
 func workerCount(configured int) int {
 	if configured < 1 {
 		return 1

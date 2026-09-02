@@ -1364,6 +1364,18 @@ spec:
                     to be set alongside it: etcd''s default election timeout is 1000ms,
                     so any heartbeat above 200ms would silently break the 5x ratio'
                   rule: '!has(self.heartbeatIntervalMilliseconds) || has(self.electionTimeoutMilliseconds)'
+              priorityClassName:
+                description: |-
+                  PriorityClassName is passed straight through to each member Pod's
+                  spec.priorityClassName. On a parent cluster that hosts child control
+                  planes, an etcd member is the child's control plane: without a
+                  priority class it competes for a node under pressure on equal terms
+                  with any workload Pod and is evicted just as readily. Point this at a
+                  PriorityClass the parent reserves for tenant control planes.
+
+                  Updates take effect on newly-created members (scale-up, replacement);
+                  the operator does not roll existing Pods to apply a change in place.
+                type: string
               progressDeadlineSeconds:
                 default: 600
                 description: |-
@@ -4200,6 +4212,11 @@ spec:
                         1000ms, so any heartbeat above 200ms would silently break
                         the 5x ratio'
                       rule: '!has(self.heartbeatIntervalMilliseconds) || has(self.electionTimeoutMilliseconds)'
+                  priorityClassName:
+                    description: |-
+                      PriorityClassName is the locked target priority class for member
+                      Pods. Latched with the rest of the target spec.
+                    type: string
                   replicas:
                     description: Replicas is the locked target replica count.
                     format: int32
@@ -5608,6 +5625,13 @@ spec:
                 type: string
             type: object
         type: object
+        x-kubernetes-validations:
+        - message: 'metadata.name must be a DNS-1035 label of at most 56 characters:
+            start with a lower-case letter, then lower-case letters, digits or ''-''.
+            The operator derives the cluster''s Service names from it, and a Service
+            name cannot start with a digit.'
+          rule: self.metadata.name.size() == 0 || (self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$')
+            && self.metadata.name.size() <= 56)
     served: true
     storage: true
     subresources:

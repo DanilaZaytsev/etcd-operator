@@ -893,7 +893,7 @@ kubectl get pvc -l etcd-operator.cozystack.io/cluster=my-mem-etcd -n default
              topologyKey: kubernetes.io/hostname
    ```
 
-   Доступен и `spec.topologySpreadConstraints` для разноса по зонам и нодам. Оба действуют на вновь создаваемых членов; чтобы применить изменение, перекатывайте существующие поды по одному.
+   Доступен и `spec.topologySpreadConstraints` для разноса по зонам и нодам, а `spec.priorityClassName` не даёт членам выселяться с ноды под давлением первыми (см. [концепции](concepts.md#specpriorityclassname)). Все три действуют на вновь создаваемых членов; чтобы применить изменение, перекатывайте существующие поды по одному.
 
 2. **Лимит памяти контейнера** — задайте `spec.resources.limits.memory` на кластере, чтобы записи в tmpfs учитывались в cgroup пода, а не в памяти ноды:
 

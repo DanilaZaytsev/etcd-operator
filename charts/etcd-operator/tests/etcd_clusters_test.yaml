@@ -667,3 +667,23 @@ tests:
       - equal:
           path: spec.storage.storageClassName
           value: local-nvme
+
+  # A child control plane's etcd is evicted like any workload Pod unless it
+  # carries a priority class; the chart passes one through untouched and never
+  # invents one.
+  - it: passes the member priority class through
+    set:
+      clusters:
+        - name: tenant-a
+          priorityClassName: tenant-control-plane
+    asserts:
+      - equal:
+          path: spec.priorityClassName
+          value: tenant-control-plane
+  - it: leaves the priority class unset unless asked
+    set:
+      clusters:
+        - name: tenant-a
+    asserts:
+      - notExists:
+          path: spec.priorityClassName

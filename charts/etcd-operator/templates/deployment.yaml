@@ -59,6 +59,8 @@ spec:
         - --metrics-bind-address=:8080
         {{- end }}
         - --leader-elect
+        - --zap-devel={{ .Values.manager.logging.development }}
+        - --zap-log-level={{ .Values.manager.logging.level }}
         {{- with .Values.manager.clusterDomain }}
         - --cluster-domain={{ . }}
         {{- end }}

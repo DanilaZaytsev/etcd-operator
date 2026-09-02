@@ -4,7 +4,7 @@
 # GOARCH=${TARGETARCH} below. Without this, buildx instantiates the builder as
 # the target arch and `go build` runs under emulation — which fails the arm64
 # leg on an amd64 runner that has no binfmt registered.
-FROM --platform=$BUILDPLATFORM golang:1.25.10 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.8 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 

@@ -86,6 +86,32 @@ tests:
           path: spec.template.spec.containers[0].args
           content: --cluster-domain=
 
+  # The binary's own default is development logging: console output and a
+  # stack trace on every error-level line. An unreachable child etcd emits one
+  # of those every 10s, so on a parent cluster the chart must ship production
+  # logging without being asked.
+  - it: ships production logging by default
+    template: deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --zap-devel=false
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --zap-log-level=info
+  - it: lets debugging turn development logging back on
+    template: deployment.yaml
+    set:
+      manager.logging.development: true
+      manager.logging.level: debug
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --zap-devel=true
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --zap-log-level=debug
+
   # At one worker a single unreachable cluster stalls every other cluster's
   # reconcile behind its dial timeout.
   - it: raises reconcile concurrency when asked

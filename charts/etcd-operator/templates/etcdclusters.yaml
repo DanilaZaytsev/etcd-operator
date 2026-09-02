@@ -157,6 +157,9 @@ spec:
   topologySpreadConstraints:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+  {{- with $c.priorityClassName }}
+  priorityClassName: {{ . | quote }}
+  {{- end }}
   {{- with $c.additionalMetadata }}
   additionalMetadata:
     {{- toYaml . | nindent 4 }}

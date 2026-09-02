@@ -231,11 +231,13 @@ func main() {
 		// speeds up voluntary leader transitions as the new leader don't have to wait
 		// LeaseDuration time first.
 		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
+		// main returns the moment mgr.Start does, with no cleanup after it, so
+		// releasing the lease on shutdown is safe here. Without it a rolling
+		// update of the operator leaves every EtcdCluster unattended until the
+		// old lease expires (LeaseDuration, 15s by default) — on a parent
+		// cluster hosting many control planes that is a real gap, not a
+		// cosmetic one.
+		LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
